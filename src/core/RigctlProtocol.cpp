@@ -3,21 +3,25 @@
 #include "models/SliceModel.h"
 #include "models/TransmitModel.h"
 
+#include <QByteArray>
 #include <QLocale>
 #include <QMetaObject>
 #include <QStringList>
 #include <QtGlobal>
 
+#include <cmath>
+
 namespace AetherSDR {
 
 namespace {
 
-constexpr quint64 kRigLevelRfPower           = (1ULL << 13);
+constexpr quint64 kRigLevelRfPower           = (1ULL << 12);
 constexpr quint64 kRigLevelKeyspd            = (1ULL << 14);
 constexpr quint64 kRigLevelSwr               = (1ULL << 28);
 constexpr quint64 kRigLevelRfPowerMeter      = (1ULL << 32);
 constexpr quint64 kRigLevelRfPowerMeterWatts = (1ULL << 39);
 constexpr qint64  kTxMeterFreshMs            = 1500;
+constexpr int     kHamlibSmartSdrSliceAModel = 23005;
 constexpr quint64 kRigGetLevelMask = kRigLevelRfPower
                                    | kRigLevelKeyspd
                                    | kRigLevelSwr
@@ -25,6 +29,30 @@ constexpr quint64 kRigGetLevelMask = kRigLevelRfPower
                                    | kRigLevelRfPowerMeterWatts;
 constexpr quint64 kRigSetLevelMask = kRigLevelRfPower
                                    | kRigLevelKeyspd;
+
+QStringList rigModeTokens()
+{
+    return {
+        QStringLiteral("USB"),
+        QStringLiteral("LSB"),
+        QStringLiteral("CW"),
+        QStringLiteral("CWR"),
+        QStringLiteral("AM"),
+        QStringLiteral("FM"),
+        QStringLiteral("RTTY"),
+        QStringLiteral("AMS"),
+        QStringLiteral("PKTUSB"),
+        QStringLiteral("PKTLSB"),
+    };
+}
+
+QStringList rigVfoTokens()
+{
+    return {
+        QStringLiteral("VFOA"),
+        QStringLiteral("VFOB"),
+    };
+}
 
 QStringList rigGetLevelTokens()
 {
@@ -43,6 +71,17 @@ QStringList rigSetLevelTokens()
         QStringLiteral("RFPOWER"),
         QStringLiteral("KEYSPD"),
     };
+}
+
+quint32 hamlibCrc32(const QByteArray& data)
+{
+    quint32 crc = 0xffffffffU;
+    for (const uchar byte : data) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc & 1U) ? (crc >> 1) ^ 0xedb88320U : (crc >> 1);
+    }
+    return ~crc;
 }
 
 QString formatRigLevelValue(double value)
@@ -119,6 +158,38 @@ SliceModel* RigctlProtocol::currentSlice() const
     }
     // Fallback to first slice
     return slices.isEmpty() ? nullptr : slices.first();
+}
+
+SliceModel* RigctlProtocol::sliceForVfo(const QString& vfo) const
+{
+    auto* current = currentSlice();
+    const QString token = vfo.trimmed().toUpper();
+    if (token.isEmpty() || token == "VFOA" || token == "VFO"
+        || token == "CURRVFO" || token == "MAIN" || token == "RX") {
+        return current;
+    }
+
+    if (token == "VFOB" || token == "SUB" || token == "TX") {
+        auto* tx = findTxSlice();
+        if (tx && (token == "TX" || tx != current))
+            return tx;
+
+        if (!m_model || !m_model->isConnected())
+            return current;
+
+        const int preferredOtherSlice = (m_sliceIndex == 0) ? 1 : 0;
+        for (auto* s : m_model->slices()) {
+            if (s && s->sliceId() == preferredOtherSlice)
+                return s;
+        }
+        for (auto* s : m_model->slices()) {
+            if (s && s != current)
+                return s;
+        }
+        return current;
+    }
+
+    return nullptr;
 }
 
 QString RigctlProtocol::rprt(int code) const
@@ -198,9 +269,12 @@ QString RigctlProtocol::processCommand(const QString& cmd)
         if (name == "set_mode")       return cmdSetMode(args);
         if (name == "get_vfo")        return cmdGetVfo();
         if (name == "set_vfo")        return cmdSetVfo(args);
+        if (name == "get_vfo_info")   return cmdGetVfoInfo(args);
+        if (name == "get_vfo_list")   return cmdGetVfoList();
         if (name == "get_ptt")        return cmdGetPtt();
         if (name == "set_ptt")        return cmdSetPtt(args);
         if (name == "get_info")       return cmdGetInfo();
+        if (name == "get_rig_info")   return cmdGetRigInfo();
         if (name == "get_split_vfo")  return cmdGetSplitVfo();
         if (name == "set_split_vfo")  return cmdSetSplitVfo(args);
         if (name == "get_split_freq") return cmdGetSplitFreq();
@@ -209,6 +283,10 @@ QString RigctlProtocol::processCommand(const QString& cmd)
         if (name == "set_split_mode") return cmdSetSplitMode(args);
         if (name == "get_level")      return cmdGetLevel(args);
         if (name == "set_level")      return cmdSetLevel(args);
+        if (name == "set_func")       return cmdSetFunc(args);
+        if (name == "vfo_op")         return cmdVfoOp(args);
+        if (name == "set_trn")        return cmdSetTrn(args);
+        if (name == "get_trn")        return cmdGetTrn();
         if (name == "dump_state")     return cmdDumpState();
         if (name == "quit")           return {};  // caller handles disconnect
         if (name == "chk_vfo")        return QStringLiteral("0\n");  // VFO mode disabled
@@ -229,6 +307,9 @@ QString RigctlProtocol::processCommand(const QString& cmd)
     case 'M': return cmdSetMode(args);
     case 'v': return cmdGetVfo();
     case 'V': return cmdSetVfo(args);
+    case 'G': return cmdVfoOp(args);
+    case 'A': return cmdSetTrn(args);
+    case 'a': return cmdGetTrn();
     case 't': return cmdGetPtt();
     case 'T': return cmdSetPtt(args);
     case '_': return cmdGetInfo();
@@ -297,13 +378,20 @@ QString RigctlProtocol::cmdGetMode()
 
 QString RigctlProtocol::cmdSetMode(const QString& args)
 {
-    auto* slice = currentSlice();
-    if (!slice) return rprt(-8);
-
     QStringList parts = args.split(' ', Qt::SkipEmptyParts);
     if (parts.isEmpty()) return rprt(-1);
 
     QString hamlibMode = parts[0].toUpper();
+    if (hamlibMode == "?") {
+        const QString supported = rigModeTokens().join(' ');
+        if (m_extended)
+            return QStringLiteral("set_mode:\nModes: %1\n").arg(supported) + rprt(0);
+        return supported + "\n";
+    }
+
+    auto* slice = currentSlice();
+    if (!slice) return rprt(-8);
+
     QString sdrMode = hamlibToSmartSDR(hamlibMode);
 
     QMetaObject::invokeMethod(slice, [slice, sdrMode]() {
@@ -367,9 +455,64 @@ QString RigctlProtocol::cmdSetVfo(const QString& arg)
     // by the VFO command.  WSJT-X sends "V VFOB" during init which would
     // otherwise force all instances onto Slice B (#1621).
     QString vfo = arg.trimmed().toUpper();
+    if (vfo == "?") {
+        const QString supported = rigVfoTokens().join(' ');
+        if (m_extended)
+            return QStringLiteral("set_vfo:\nVFO: %1\n").arg(supported) + rprt(0);
+        return supported + "\n";
+    }
     if (vfo == "VFOA" || vfo == "MAIN" || vfo == "VFOB" || vfo == "SUB")
         return rprt(0);
     return rprt(-1);
+}
+
+QString RigctlProtocol::cmdGetVfoInfo(const QString& arg)
+{
+    const QString requested = arg.trimmed().isEmpty()
+        ? QStringLiteral("VFOA")
+        : arg.trimmed().toUpper();
+
+    if (requested == "?") {
+        const QString supported = rigVfoTokens().join(' ');
+        if (m_extended)
+            return QStringLiteral("get_vfo_info:\nVFO: %1\n").arg(supported) + rprt(0);
+        return supported + "\n";
+    }
+
+    auto* slice = sliceForVfo(requested);
+    if (!slice) return rprt(-1);
+
+    const auto hz = static_cast<long long>(std::round(slice->frequency() * 1e6));
+    const QString mode = smartsdrToHamlib(slice->mode());
+    const int width = qAbs(slice->filterHigh() - slice->filterLow());
+    auto* rxSlice = currentSlice();
+    auto* txSlice = findTxSlice();
+    const bool split = rxSlice && txSlice && txSlice != rxSlice;
+    constexpr int satMode = 0;
+
+    if (m_extended) {
+        return QStringLiteral("get_vfo_info:\nFreq: %1\nMode: %2\nWidth: %3\nSplit: %4\nSatMode: %5\n")
+            .arg(hz)
+            .arg(mode)
+            .arg(width)
+            .arg(split ? 1 : 0)
+            .arg(satMode)
+            + rprt(0);
+    }
+    return QStringLiteral("%1\n%2\n%3\n%4\n%5\n")
+        .arg(hz)
+        .arg(mode)
+        .arg(width)
+        .arg(split ? 1 : 0)
+        .arg(satMode);
+}
+
+QString RigctlProtocol::cmdGetVfoList()
+{
+    const QString supported = rigVfoTokens().join(' ');
+    if (m_extended)
+        return QStringLiteral("get_vfo_list:\nVFOs: %1\n").arg(supported) + rprt(0);
+    return supported + "\n";
 }
 
 QString RigctlProtocol::cmdGetPtt()
@@ -408,6 +551,50 @@ QString RigctlProtocol::cmdGetInfo()
         return QStringLiteral("AetherSDR\n");
     return QStringLiteral("%1 %2 v%3\n")
         .arg(m_model->name(), m_model->model(), m_model->version());
+}
+
+QString RigctlProtocol::cmdGetRigInfo()
+{
+    auto formatVfoLine = [](const QString& vfoName, SliceModel* slice, bool rx, bool tx) {
+        const auto hz = slice
+            ? static_cast<long long>(std::round(slice->frequency() * 1e6))
+            : 0LL;
+        const QString mode = slice ? RigctlProtocol::smartsdrToHamlib(slice->mode())
+                                   : QStringLiteral("None");
+        const int width = slice ? qAbs(slice->filterHigh() - slice->filterLow()) : 0;
+        return QStringLiteral("VFO=%1 Freq=%2 Mode=%3 Width=%4 RX=%5 TX=%6\n")
+            .arg(vfoName)
+            .arg(hz)
+            .arg(mode)
+            .arg(width)
+            .arg(rx ? 1 : 0)
+            .arg(tx ? 1 : 0);
+    };
+
+    auto* vfoA = sliceForVfo(QStringLiteral("VFOA"));
+    auto* vfoB = sliceForVfo(QStringLiteral("VFOB"));
+    auto* txSlice = findTxSlice();
+    const bool split = vfoA && txSlice && txSlice != vfoA;
+    constexpr int satMode = 0;
+
+    QString body;
+    body += formatVfoLine(QStringLiteral("VFOA"), vfoA, true, !split);
+    body += formatVfoLine(QStringLiteral("VFOB"), vfoB, false, split);
+    body += QStringLiteral("Split=%1 SatMode=%2\n").arg(split ? 1 : 0).arg(satMode);
+    body += QStringLiteral("Rig=%1\n").arg(
+        (m_model && !m_model->model().trimmed().isEmpty())
+            ? m_model->model().trimmed()
+            : QStringLiteral("AetherSDR"));
+    body += QStringLiteral("App=AetherSDR\n");
+    body += QStringLiteral("Version=20241103 1.1.0\n");
+    body += QStringLiteral("Model=%1\n").arg(kHamlibSmartSdrSliceAModel + qBound(0, m_sliceIndex, 7));
+
+    const quint32 crc = hamlibCrc32(body.toUtf8());
+    body += QStringLiteral("CRC=0x%1\n").arg(crc, 8, 16, QLatin1Char('0'));
+
+    if (m_extended)
+        return QStringLiteral("get_rig_info:\n") + body + rprt(0);
+    return body;
 }
 
 // Find the TX slice (may differ from the RX slice in split mode)
@@ -590,6 +777,57 @@ QString RigctlProtocol::cmdSetLevel(const QString& args)
         return rprt(0);
     }
     return rprt(-11);  // RIG_ENAVAIL
+}
+
+QString RigctlProtocol::cmdSetFunc(const QString& args)
+{
+    const QString func = args.section(' ', 0, 0).trimmed().toUpper();
+    if (func.isEmpty())
+        return rprt(-1);
+    if (func == "?") {
+        if (m_extended)
+            return QStringLiteral("set_func:\nFunctions: \n") + rprt(0);
+        return QStringLiteral("\n");
+    }
+    return rprt(-11);  // RIG_ENAVAIL
+}
+
+QString RigctlProtocol::cmdVfoOp(const QString& args)
+{
+    const QString op = args.section(' ', 0, 0).trimmed().toUpper();
+    if (op.isEmpty())
+        return rprt(-1);
+    if (op == "?") {
+        if (m_extended)
+            return QStringLiteral("vfo_op:\nMem/VFO Ops: \n") + rprt(0);
+        return QStringLiteral("\n");
+    }
+    return rprt(-11);  // RIG_ENAVAIL
+}
+
+QString RigctlProtocol::cmdSetTrn(const QString& args)
+{
+    const QString trn = args.section(' ', 0, 0).trimmed().toUpper();
+    if (trn.isEmpty())
+        return rprt(-1);
+    if (trn == "?") {
+        if (m_extended)
+            return QStringLiteral("set_trn:\nTransceive: 0\n") + rprt(0);
+        return QStringLiteral("0\n");
+    }
+
+    bool ok = false;
+    const int mode = trn.toInt(&ok);
+    if (!ok)
+        return rprt(-1);
+    return mode == 0 ? rprt(0) : rprt(-11);
+}
+
+QString RigctlProtocol::cmdGetTrn()
+{
+    if (m_extended)
+        return QStringLiteral("get_trn:\nTransceive: 0\n") + rprt(0);
+    return QStringLiteral("0\n");
 }
 
 QString RigctlProtocol::cmdDumpState()

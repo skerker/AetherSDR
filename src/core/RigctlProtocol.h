@@ -40,9 +40,12 @@ private:
     QString cmdSetMode(const QString& args);
     QString cmdGetVfo();
     QString cmdSetVfo(const QString& arg);
+    QString cmdGetVfoInfo(const QString& arg);
+    QString cmdGetVfoList();
     QString cmdGetPtt();
     QString cmdSetPtt(const QString& arg);
     QString cmdGetInfo();
+    QString cmdGetRigInfo();
     QString cmdGetSplitVfo();
     QString cmdSetSplitVfo(const QString& args);
     QString cmdGetSplitFreq();
@@ -51,6 +54,10 @@ private:
     QString cmdSetSplitMode(const QString& args);
     QString cmdGetLevel(const QString& arg);
     QString cmdSetLevel(const QString& args);
+    QString cmdSetFunc(const QString& args);
+    QString cmdVfoOp(const QString& args);
+    QString cmdSetTrn(const QString& args);
+    QString cmdGetTrn();
     QString cmdDumpState();
     QString cmdSendMorse(const QString& text);  // b <text> / \send_morse
     QString cmdStopMorse();                     // \stop_morse
@@ -58,6 +65,7 @@ private:
 
     // Helpers
     SliceModel* currentSlice() const;
+    SliceModel* sliceForVfo(const QString& vfo) const;
     SliceModel* findTxSlice() const;
     QString rprt(int code) const;
 
