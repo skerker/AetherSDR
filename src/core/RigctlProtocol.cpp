@@ -608,8 +608,6 @@ QString RigctlProtocol::cmdGetVfoInfo(const QString& arg)
     }
 
     auto* rxSlice = currentSlice();
-    if (m_catSplitEnabled)
-        ensureCatSplitTxSlice(false);
     auto* txSlice = findTxSlice();
     const bool wantsTxVfo = isTxVfoToken(requested);
     const bool split = m_catSplitEnabled || (rxSlice && txSlice && txSlice != rxSlice);
@@ -769,8 +767,6 @@ SliceModel* RigctlProtocol::findTxSlice() const
 QString RigctlProtocol::cmdGetSplitVfo()
 {
     auto* rxSlice = currentSlice();
-    if (m_catSplitEnabled)
-        ensureCatSplitTxSlice(false);
     auto* txSlice = findTxSlice();
     bool split = m_catSplitEnabled || (rxSlice && txSlice && rxSlice != txSlice);
     // Report TX VFO as VFOB when split (TX on a different slice), VFOA otherwise.
@@ -816,7 +812,7 @@ QString RigctlProtocol::cmdSetSplitVfo(const QString& args)
 
 QString RigctlProtocol::cmdGetSplitFreq()
 {
-    auto* txSlice = m_catSplitEnabled ? ensureCatSplitTxSlice(false) : findTxSlice();
+    auto* txSlice = findTxSlice();
     long long hz = 0;
     if (txSlice) {
         hz = static_cast<long long>(std::round(txSlice->frequency() * 1e6));
@@ -857,7 +853,7 @@ QString RigctlProtocol::cmdSetSplitFreq(const QString& args)
 
 QString RigctlProtocol::cmdGetSplitMode()
 {
-    auto* txSlice = m_catSplitEnabled ? ensureCatSplitTxSlice(false) : findTxSlice();
+    auto* txSlice = findTxSlice();
     if (!txSlice && !m_catSplitEnabled) return rprt(-1);
     auto* rxSlice = currentSlice();
     if (!txSlice && !rxSlice) return rprt(-1);
