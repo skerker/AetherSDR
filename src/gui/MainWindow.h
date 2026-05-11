@@ -435,6 +435,7 @@ private:
     QPointer<QDialog> m_networkDiagnosticsDialog;
     QPointer<QDialog> m_propDashboardDialog;
     QPointer<QDialog> m_memoryDialog;
+    QPointer<QDialog> m_profileManagerDialog;
     QPointer<WhatsNewDialog> m_whatsNewDialog;
     QPointer<QDialog> m_dspDialog;
 #ifdef HAVE_MIDI

@@ -19,11 +19,18 @@ class ProfileManagerDialog : public QDialog {
 public:
     explicit ProfileManagerDialog(RadioModel* model, QWidget* parent = nullptr);
 
+protected:
+    void closeEvent(QCloseEvent* ev) override;
+    void moveEvent(QMoveEvent* ev) override;
+    void resizeEvent(QResizeEvent* ev) override;
+
 private:
     QWidget* buildProfileTab(const QString& type, const QStringList& profiles,
                              const QString& active);
     QWidget* buildAutoSaveTab();
     void refreshTab(const QString& type);
+    void saveGeometryToSettings();
+    void restoreGeometryFromSettings();
 
     RadioModel* m_model;
     QTabWidget* m_tabs;
@@ -39,6 +46,7 @@ private:
     QMap<QString, TabWidgets> m_tabWidgets;
 
     QCheckBox* m_autoSaveTx{nullptr};
+    bool       m_restoring{false};
 };
 
 } // namespace AetherSDR

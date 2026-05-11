@@ -1,7 +1,11 @@
 #include "ProfileManagerDialog.h"
+#include "core/AppSettings.h"
 #include "models/RadioModel.h"
 #include "models/TransmitModel.h"
 
+#include <QCloseEvent>
+#include <QMoveEvent>
+#include <QResizeEvent>
 #include <QTabWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -86,6 +90,44 @@ ProfileManagerDialog::ProfileManagerDialog(RadioModel* model, QWidget* parent)
     connect(&model->transmitModel(), &TransmitModel::micProfileListChanged, this, [this] {
         refreshTab("mic");
     });
+
+    restoreGeometryFromSettings();
+}
+
+void ProfileManagerDialog::saveGeometryToSettings()
+{
+    auto& s = AppSettings::instance();
+    s.setValue("ProfileManagerDialogGeometry", saveGeometry().toBase64());
+}
+
+void ProfileManagerDialog::restoreGeometryFromSettings()
+{
+    auto& s = AppSettings::instance();
+    const QByteArray geom = QByteArray::fromBase64(
+        s.value("ProfileManagerDialogGeometry", "").toByteArray());
+    if (!geom.isEmpty()) {
+        m_restoring = true;
+        restoreGeometry(geom);
+        m_restoring = false;
+    }
+}
+
+void ProfileManagerDialog::closeEvent(QCloseEvent* ev)
+{
+    saveGeometryToSettings();
+    QDialog::closeEvent(ev);
+}
+
+void ProfileManagerDialog::moveEvent(QMoveEvent* ev)
+{
+    QDialog::moveEvent(ev);
+    if (!m_restoring) saveGeometryToSettings();
+}
+
+void ProfileManagerDialog::resizeEvent(QResizeEvent* ev)
+{
+    QDialog::resizeEvent(ev);
+    if (!m_restoring) saveGeometryToSettings();
 }
 
 QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
