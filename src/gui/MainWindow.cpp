@@ -10678,7 +10678,11 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         // no longer changes mode on click, so auto-mode is the only path.
         if (AppSettings::instance().value("SpotAutoSwitchMode", "True").toString() != "True")
             return;
-        auto* s = activeSlice();
+        // Resolve the slice on the *clicked* pan, not whichever slice happens
+        // to be globally active (#2359). The radio-side `spot trigger N pan=…`
+        // above retunes the slice on this pan; the client-side mode auto-
+        // switch must land on the same slice or it corrupts an unrelated one.
+        auto* s = preferredMemorySlice(applet->panId());
         if (!s) return;
 
         // FreeDV spots imply RADE — activate the RADE engine on this slice
