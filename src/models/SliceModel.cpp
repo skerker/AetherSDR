@@ -294,19 +294,36 @@ void SliceModel::setSquelch(bool on, int level)
 
 void SliceModel::setRit(bool on, int hz)
 {
+    const bool onChanged   = (m_ritOn != on);
+    const bool freqChanged = (m_ritFreq != hz);
+
     m_ritOn   = on;
     m_ritFreq = hz;
-    sendCommand(QString("slice set %1 rit_on=%2 rit_freq=%3")
-                    .arg(m_id).arg(on ? 1 : 0).arg(hz));
+
+    // FlexLib sends these as separate radio commands (Slice.cs RITOn / RITFreq).
+    // Match that pattern so partial-rejection scenarios surface per-field.
+    if (onChanged)
+        sendCommand(QString("slice set %1 rit_on=%2").arg(m_id).arg(on ? 1 : 0));
+    if (freqChanged)
+        sendCommand(QString("slice set %1 rit_freq=%2").arg(m_id).arg(hz));
+
     emit ritChanged(on, hz);
 }
 
 void SliceModel::setXit(bool on, int hz)
 {
+    const bool onChanged   = (m_xitOn != on);
+    const bool freqChanged = (m_xitFreq != hz);
+
     m_xitOn   = on;
     m_xitFreq = hz;
-    sendCommand(QString("slice set %1 xit_on=%2 xit_freq=%3")
-                    .arg(m_id).arg(on ? 1 : 0).arg(hz));
+
+    // FlexLib sends these as separate radio commands (Slice.cs XITOn / XITFreq).
+    if (onChanged)
+        sendCommand(QString("slice set %1 xit_on=%2").arg(m_id).arg(on ? 1 : 0));
+    if (freqChanged)
+        sendCommand(QString("slice set %1 xit_freq=%2").arg(m_id).arg(hz));
+
     emit xitChanged(on, hz);
 }
 
