@@ -431,6 +431,11 @@ signals:
     void globalProfilesChanged();
     void profileDatabaseImportingChanged(bool importing);
     void profileDatabaseExportingChanged(bool exporting);
+    // Emitted when the radio reports a change to the global Auto-Save
+    // profile setting (radio status field "auto_save").  UI consumers
+    // should react rather than poll — out-of-band mutators (TCI, a
+    // second SmartSDR client, profile load) all surface through here.
+    void autoSaveChanged(bool autoSave);
     // Emitted on each successful ping response from the radio.
     void pingReceived();
     // Generic status relay — for dialogs that need to listen for specific objects.

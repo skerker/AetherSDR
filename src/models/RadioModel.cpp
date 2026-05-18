@@ -4182,7 +4182,14 @@ void RadioModel::handleRadioStatus(const QMap<QString, QString>& kvs)
         changed = true;
     }
     if (kvs.contains("auto_save")) {
-        m_autoSave = kvs["auto_save"] == "1";
+        // Compare-then-store-then-emit: the surrounding `info` block
+        // re-broadcasts on unrelated changes (binaural_rx, full_duplex,
+        // etc.), so a naive emit would fire spuriously.
+        const bool newAutoSave = kvs["auto_save"] == "1";
+        if (m_autoSave != newAutoSave) {
+            m_autoSave = newAutoSave;
+            emit autoSaveChanged(newAutoSave);
+        }
         changed = true;
     }
     if (kvs.contains("freq_error_ppb")) {
