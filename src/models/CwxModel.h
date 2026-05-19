@@ -50,6 +50,13 @@ signals:
     void transmissionRequested(const QString& text, int wpm);
     void transmissionCancelled();        // erase / clearBuffer / interrupt
     void queueEmpty();                   // radio CWX buffer drained — TX teardown required
+    // Emitted from buffered CWX transmissions (send / sendMacro) immediately
+    // before the cwx command is queued, so RadioModel can engage MOX up front.
+    // On some Flex firmwares (e.g. 6700 / 4.1.5, #2878) the synccwx-auto-engaged
+    // TX1 RCA only pulses ~40 ms, which trips amplifiers; mirroring the working
+    // manual MOX-then-macro workflow asserts TX1 cleanly before RF. Not emitted
+    // for sendChar (live keying) where per-keystroke MOX would defeat QSK.
+    void pttEngageRequested();
 
 private:
     int     m_speed{20};

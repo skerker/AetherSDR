@@ -20,6 +20,9 @@ void CwxModel::send(const QString& text)
     // Encode spaces as DEL (0x7f) per FlexLib protocol
     QString encoded = text;
     encoded.replace(' ', QChar(0x7f));
+    // Engage MOX before the cwx command so the radio's TX1 RCA / serial PTT
+    // sequencer asserts cleanly (matches manual MOX-then-CWX workflow). (#2878)
+    emit pttEngageRequested();
     emit commandReady(QString("cwx send \"%1\" %2").arg(encoded).arg(m_nextBlock++));
     emit transmissionRequested(text, m_speed);
 }
@@ -36,6 +39,9 @@ void CwxModel::sendChar(const QString& ch)
 void CwxModel::sendMacro(int idx)
 {
     if (idx < 1 || idx > 12) return;
+    // Engage MOX before the cwx command so the radio's TX1 RCA / serial PTT
+    // sequencer asserts cleanly (matches manual MOX-then-CWX workflow). (#2878)
+    emit pttEngageRequested();
     emit commandReady(QString("cwx macro send %1").arg(idx));
     // Macro text lives in m_macros (0-based); fire local keyer with it
     // so sidetone matches the radio's expansion.

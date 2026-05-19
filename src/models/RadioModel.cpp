@@ -385,6 +385,20 @@ RadioModel::RadioModel(QObject* parent)
             m_cwxActive = false;
         sendCmd(cmd);
     });
+    // Engage MOX before a buffered CWX transmission. On some Flex firmwares
+    // (e.g. 6700 / 4.1.5, #2878) the synccwx-auto-engaged TX1 RCA only pulses
+    // ~40 ms — too short to trip an amplifier and out of sequence with RF.
+    // Pre-keying via xmit 1 mirrors the working manual MOX-then-CWX workflow:
+    // the radio runs the normal MOX sequencer, TX1 / serial PTT assert during
+    // TX_DELAY before RF, and the existing queueEmpty handler drops MOX when
+    // the radio's CWX buffer drains. Skipped when TX is already keyed (operator
+    // MOX, tune, hardware PTT) so we don't double-key.
+    connect(&m_cwxModel, &CwxModel::pttEngageRequested, this, [this]() {
+        if (m_radioTransmitting || m_transmitModel.isTransmitting()
+            || m_transmitModel.isTuning())
+            return;
+        m_transmitModel.setMox(true);
+    });
     // When the radio signals its CWX buffer is drained, release TX. (#2450)
     // The radio's break-in timer fires but sync_cwx=1 still requires an
     // explicit xmit 0 from the client — without it the radio holds TX for
