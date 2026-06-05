@@ -6547,8 +6547,11 @@ void MainWindow::showNetworkDiagnosticsDialog()
                           &m_radioModel, m_audio, m_networkDiagnosticsHistory,
                           m_tciServer);
 #else
+    // Pass an explicit TciServer* nullptr so showOrRaisePersistent's
+    // appended `this` lands in the QWidget* parent slot (#3379).
     showOrRaisePersistent(m_networkDiagnosticsDialog,
-                          &m_radioModel, m_audio, m_networkDiagnosticsHistory);
+                          &m_radioModel, m_audio, m_networkDiagnosticsHistory,
+                          static_cast<TciServer*>(nullptr));
 #endif
 }
 
@@ -13500,8 +13503,10 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         // Do not "normalise" these — collapsing the guards regresses Log4OM
         // behavior under lock or SWR sweep.
         if (tciSpot) {
+#ifdef HAVE_WEBSOCKETS
             if (m_tciServer && s && !s->isLocked() && !m_swrSweep.running)
                 m_tciServer->notifySpotClicked(spotIndex, s);
+#endif
         } else if (!isPassiveLocalSpotId(spotIndex)) {
             m_radioModel.sendCommand(
                 QString("spot trigger %1 pan=%2").arg(spotIndex).arg(applet->panId()));
@@ -16842,7 +16847,11 @@ void MainWindow::deactivateRADE()
             // silently kill TCI audio. Leave TCI responsible for cleanup in
             // that case. TODO: replace with proper ref-counting in PanadapterStream
             // so any creator/borrower can safely release independently (#stream-lifecycle).
+#ifdef HAVE_WEBSOCKETS
             bool tciActive = m_tciServer && m_tciServer->clientCount() > 0;
+#else
+            bool tciActive = false;
+#endif
             bool daxBridgeActive = false;
 #if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
             daxBridgeActive = (m_daxBridge != nullptr);
@@ -17373,7 +17382,11 @@ void MainWindow::onDaxChannelChanged(SliceModel* slice, int newCh)
             // another consumer is still using would silence WSJT-X or RADE
             // audio — the mirror image of #3270. Only tear down a stream that
             // no other consumer needs. (#2895)
+#ifdef HAVE_WEBSOCKETS
             const bool tciUsing = m_tciServer && m_tciServer->ownsDaxChannel(oldCh);
+#else
+            const bool tciUsing = false;
+#endif
 #ifdef HAVE_RADE
             const bool radeUsing = (id != 0 && id == m_radeDaxStreamId);
 #else
