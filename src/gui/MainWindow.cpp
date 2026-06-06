@@ -10575,6 +10575,13 @@ void MainWindow::onConnectionStateChanged(bool connected)
     }
 
     m_connPanel->setConnected(connected);
+
+    // Pause/resume the discovery re-bind loop in step with the connection
+    // lifecycle.  Without this the 5-second close()+bind() churn ran for the
+    // whole session on routed/VPN ("Connect by IP") sessions, where UDP
+    // broadcasts never reach the client by design (#3420).
+    m_discovery.setConnected(connected);
+
     if (connected) {
         m_suppressStartupPanLayoutRearrange = false;
         m_layoutRestoreUntilMs = kPanLayoutRestoreWaitingForFirstPan;

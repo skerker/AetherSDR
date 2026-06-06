@@ -102,12 +102,22 @@ public:
     static constexpr int BIND_RETRY_MS      = 2000;  // retry interval when bind fails
     static constexpr int MAX_BIND_RETRIES   = 15;    // give up after 30s (15 × 2s)
     static constexpr int REBIND_INTERVAL_MS = 5000;  // re-bind interval until first packet received
+    static constexpr int MAX_REBIND_RETRIES = 12;    // give up re-bind after 60s (12 × 5s)
 
     explicit RadioDiscovery(QObject* parent = nullptr);
     ~RadioDiscovery() override;
 
     void startListening();
     void stopListening();
+
+    // Couple discovery's re-bind loop to the connection lifecycle.  When a
+    // radio is connected (especially via the routed/VPN path where broadcasts
+    // cannot reach us by design) we pause the 5-second re-bind churn so the
+    // socket stops thrashing for the rest of the session.  The socket stays
+    // bound so Multi-Flex / other-GUI-client broadcasts still update the
+    // radio list passively when they do arrive on local networks.  On
+    // disconnect the timer resumes with a fresh retry budget. (#3420)
+    void setConnected(bool connected);
 
     QList<RadioInfo> discoveredRadios() const { return m_radios; }
 
@@ -130,7 +140,9 @@ private:
     QTimer            m_bindRetryTimer;  // retries bind if first attempt fails (e.g. macOS net consent)
     QTimer            m_rebindTimer;     // periodic re-bind until first packet (handles interface changes)
     int               m_bindRetryCount{0};
+    int               m_rebindAttempts{0}; // count of re-bind firings, capped at MAX_REBIND_RETRIES (#3420)
     bool              m_receivedAny{false};
+    bool              m_connected{false};  // active radio connection — pauses re-bind churn (#3420)
     QList<RadioInfo>  m_radios;
 
     // Track last-seen time per serial for staleness detection

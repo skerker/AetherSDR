@@ -20,10 +20,20 @@ RadioDiscovery::RadioDiscovery(QObject* parent)
 
     // Periodic re-bind: handles the case where bind() succeeds but the socket
     // is stale (e.g. no network interface at launch, macOS consent silently
-    // dropping packets).  Stops once the first discovery packet arrives.
+    // dropping packets).  Stops once the first discovery packet arrives,
+    // the connection lifecycle pauses it (see setConnected), or the retry
+    // budget runs out (#3420).
     m_rebindTimer.setInterval(REBIND_INTERVAL_MS);
     connect(&m_rebindTimer, &QTimer::timeout, this, [this]() {
-        qCDebug(lcDiscovery) << "RadioDiscovery: no packets yet, re-binding socket";
+        if (m_rebindAttempts >= MAX_REBIND_RETRIES) {
+            m_rebindTimer.stop();
+            qCWarning(lcDiscovery) << "RadioDiscovery: giving up re-bind after"
+                                   << MAX_REBIND_RETRIES << "attempts (no broadcasts received)";
+            return;
+        }
+        ++m_rebindAttempts;
+        qCDebug(lcDiscovery) << "RadioDiscovery: no packets yet, re-binding socket (attempt"
+                             << m_rebindAttempts << "/" << MAX_REBIND_RETRIES << ")";
         startListening();
     });
 }
@@ -64,7 +74,11 @@ void RadioDiscovery::startListening()
 
     // Keep re-binding periodically until we actually receive a discovery packet.
     // Covers: no network at launch, macOS consent blocking packets, interface changes.
-    if (!m_receivedAny) {
+    // Skipped while a radio is connected — routed/VPN sessions cannot receive
+    // broadcasts by design, and local sessions don't need the churn (#3420).
+    // Bounded by MAX_REBIND_RETRIES so it self-terminates even without a
+    // connection event.
+    if (!m_connected && !m_receivedAny && m_rebindAttempts < MAX_REBIND_RETRIES) {
         m_rebindTimer.start();
     }
 
@@ -76,9 +90,36 @@ void RadioDiscovery::stopListening()
     m_bindRetryTimer.stop();
     m_rebindTimer.stop();
     m_bindRetryCount = 0;
+    m_rebindAttempts = 0;
     m_receivedAny = false;
     m_staleTimer.stop();
     m_socket.close();
+}
+
+void RadioDiscovery::setConnected(bool connected)
+{
+    if (m_connected == connected)
+        return;
+    m_connected = connected;
+
+    if (connected) {
+        // Active radio session: stop the 5-second re-bind churn.  The socket
+        // stays bound so passive discovery (Multi-Flex / other-GUI-client
+        // updates) still works on local networks.  On routed/VPN the
+        // broadcasts wouldn't reach us anyway, so this just halts the
+        // unbounded close()+bind() loop the issue described (#3420).
+        m_rebindTimer.stop();
+        qCDebug(lcDiscovery) << "RadioDiscovery: radio connected — pausing re-bind loop";
+    } else {
+        // Disconnected: reset the retry budget and, if we never actually
+        // received a broadcast this session and the socket is still bound,
+        // resume the re-bind loop with a fresh count.
+        m_rebindAttempts = 0;
+        if (!m_receivedAny && m_socket.state() == QAbstractSocket::BoundState) {
+            m_rebindTimer.start();
+            qCDebug(lcDiscovery) << "RadioDiscovery: radio disconnected — resuming re-bind loop";
+        }
+    }
 }
 
 void RadioDiscovery::onBindRetry()
