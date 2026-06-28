@@ -366,6 +366,10 @@ void MainWindow::wireAetherDspWidget(AetherDspWidget* w)
     connect(w, &AetherDspWidget::dfnrPostFilterBetaChanged, this, [this](float v) {
         QMetaObject::invokeMethod(m_audio, [this, v]() { m_audio->setDfnrPostFilterBeta(v); });
     });
+    // BNR
+    connect(w, &AetherDspWidget::bnrIntensityChanged, this, [this](float v) {
+        QMetaObject::invokeMethod(m_audio, [this, v]() { m_audio->setBnrIntensity(v); });
+    });
     // MNR
     connect(w, &AetherDspWidget::mnrEnabledChanged, this, [this](bool on) {
         QMetaObject::invokeMethod(m_audio, [this, on]() { m_audio->setMnrEnabled(on); });

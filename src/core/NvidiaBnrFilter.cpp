@@ -110,8 +110,9 @@ bool NvidiaBnrFilter::isConnected() const
 
 void NvidiaBnrFilter::setIntensityRatio(float ratio)
 {
+    // Applied as the first-message config when the stream is (re)opened;
+    // the container does not honor config sent mid-stream.
     m_intensityRatio = std::clamp(ratio, 0.0f, 1.0f);
-    m_configDirty.store(true);
 }
 
 QByteArray NvidiaBnrFilter::process(const float* samples, int numSamples)
@@ -145,14 +146,6 @@ void NvidiaBnrFilter::workerLoop()
     // pushes to m_outBuf. All gRPC I/O happens here, never on audio/main thread.
 
     while (!m_stopping.load()) {
-        // Send config update if intensity changed
-        if (m_configDirty.exchange(false)) {
-            nvidia::maxine::bnr::v1::EnhanceAudioRequest configReq;
-            auto* config = configReq.mutable_config();
-            config->set_intensity_ratio(m_intensityRatio);
-            m_stream->Write(configReq);
-        }
-
         // Pull a frame from input buffer
         QByteArray frame;
         {

@@ -10,6 +10,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **BNR Intensity slider restored and now functional.** The #2297 DSP refactor
+  removed the slider (it lived in the since-removed Spectrum Overlay DSP panel)
+  and it was never re-created, so BNR ran pinned at 100% and the BNR tab still
+  pointed users to the gone overlay menu. The slider is back on the AetherDSP →
+  BNR tab (0–100%, mirroring DFNR), persisted as `BnrIntensity` with a Reset
+  Defaults (100%). Two backend defects that made intensity inert are also fixed:
+  enabling BNR now applies the persisted intensity as the stream's first-message
+  config (it previously connected at the hardcoded 1.0 default), and a live
+  change reopens the stream so it takes effect — the Maxine BNR container reads
+  `intensity_ratio` only from the first message and ignored the mid-stream config
+  the client used to send. (#3815)
 - **Closing a panafall-created panadapter now frees its waterfall stream on the
   radio.** The close path sent only `display pan remove` and never the matching
   `display panafall remove`, so the waterfall stream was left allocated on the

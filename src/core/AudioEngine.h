@@ -878,6 +878,11 @@ private:
     std::unique_ptr<Resampler> m_kiwiSdrBnrDown;
     std::atomic<bool> m_bnrEnabled{false};
     QString m_bnrAddress{"localhost:8001"};
+    float m_bnrIntensity{1.0f};            // desired denoising strength 0..1
+    QTimer* m_bnrReconnectTimer{nullptr};  // debounces live intensity changes
+    // The BNR container reads intensity_ratio only from the first message of a
+    // stream, so a live change is applied by reopening the stream (debounced).
+    void scheduleBnrReconnect();
     QByteArray m_bnrOutBuf;  // jitter buffer: denoised 24kHz stereo int16
     QByteArray m_kiwiSdrBnrOutBuf;
     bool m_bnrPrimed{false}; // true after enough denoised data accumulated

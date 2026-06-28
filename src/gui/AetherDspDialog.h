@@ -42,6 +42,8 @@ signals:
     // DFNR parameter changes
     void dfnrAttenLimitChanged(float dB);
     void dfnrPostFilterBetaChanged(float beta);
+    // BNR parameter changes
+    void bnrIntensityChanged(float ratio);
     // NR4 parameter changes
     void nr4ReductionChanged(float dB);
     void nr4SmoothingChanged(float pct);

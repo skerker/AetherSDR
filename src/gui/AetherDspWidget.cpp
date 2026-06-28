@@ -323,8 +323,10 @@ void AetherDspWidget::resetCurrentTab()
     } else if (name == "DFNR") {
         if (m_dfnrAttenSlider) m_dfnrAttenSlider->setValue(100);
         if (m_dfnrBetaSlider)  m_dfnrBetaSlider->setValue(0);
+    } else if (name == "BNR") {
+        if (m_bnrIntensitySlider) m_bnrIntensitySlider->setValue(100);
     }
-    // RN2 / BNR have no adjustable parameters — Reset Defaults is a no-op.
+    // RN2 has no adjustable parameters — Reset Defaults is a no-op.
 }
 
 void AetherDspWidget::setCompactMode(bool on)
@@ -340,11 +342,13 @@ void AetherDspWidget::setCompactMode(bool on)
                        m_nr4ReductionLabel, m_nr4SmoothingLabel, m_nr4WhiteningLabel,
                        m_nr4MaskingLabel, m_nr4SuppressionLabel,
                        m_mnrStrengthLabel,
-                       m_dfnrAttenLabel, m_dfnrBetaLabel }) {
+                       m_dfnrAttenLabel, m_dfnrBetaLabel,
+                       m_bnrIntensityLabel }) {
         if (lbl) lbl->setMinimumWidth(valWidth);
     }
     if (m_dfnrAttenLabel) m_dfnrAttenLabel->setFixedWidth(valWidth);
     if (m_dfnrBetaLabel)  m_dfnrBetaLabel->setFixedWidth(valWidth);
+    if (m_bnrIntensityLabel) m_bnrIntensityLabel->setFixedWidth(valWidth);
 }
 
 void AetherDspWidget::setDialogMode(bool on)
@@ -919,15 +923,62 @@ QWidget* AetherDspWidget::buildBnrPage()
 {
     auto* page = new QWidget;
     auto* vbox = new QVBoxLayout(page);
-    auto* lbl = new QLabel(
-        "NVIDIA Broadcast — GPU-accelerated AI noise removal.  Strongest "
-        "against non-stationary noise (typing, traffic, dogs barking).  "
-        "Requires an NVIDIA GPU with the Broadcast SDK.  Intensity is "
-        "controlled from the slice overlay menu.");
-    lbl->setWordWrap(true);
-    lbl->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-    AetherSDR::ThemeManager::instance().applyStyleSheet(lbl, "QLabel { color: {{color.text.secondary}}; font-size: 12px; }");
-    vbox->addWidget(lbl);
+    // Match the DFNR tab: 20 px top breathing room between the DSP
+    // selector buttons and the info paragraph; 10 px left margin.
+    vbox->setContentsMargins(10, 20, 0, 0);
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+
+    auto& s = AppSettings::instance();
+
+    auto* info = new QLabel(
+        "NVIDIA — GPU-accelerated AI noise removal. Strongest against "
+        "non-stationary noise (typing, traffic, dogs barking). Requires an "
+        "NVIDIA GPU and the Maxine BNR container.");
+    info->setWordWrap(true);
+    AetherSDR::ThemeManager::instance().applyStyleSheet(info, "QLabel { color: {{color.text.secondary}}; font-size: 12px; }");
+    {
+        auto* infoRow = new QHBoxLayout;
+        infoRow->setContentsMargins(0, 0, 10, 0);
+        infoRow->addWidget(info);
+        vbox->addLayout(infoRow);
+    }
+
+    {
+        auto* resetRow = new QHBoxLayout;
+        resetRow->setContentsMargins(0, 10, 10, 0);
+        resetRow->addStretch(1);
+        auto* bnrResetBtn = makeResetIconButton();
+        connect(bnrResetBtn, &QPushButton::clicked,
+                this, &AetherDspWidget::resetCurrentTab);
+        resetRow->addWidget(bnrResetBtn);
+        vbox->addLayout(resetRow);
+    }
+
+    grid->addWidget(new QLabel("Intensity"), 1, 0);
+    m_bnrIntensitySlider = new QSlider(Qt::Horizontal);
+    m_bnrIntensitySlider->setRange(0, 100);
+    m_bnrIntensitySlider->setValue(static_cast<int>(s.value("BnrIntensity", "100").toFloat()));
+    m_bnrIntensitySlider->setAccessibleName("BNR Intensity");
+    applyPrimarySliderStyle(m_bnrIntensitySlider);
+    m_bnrIntensitySlider->setToolTip("Denoising strength sent to the BNR engine.\n"
+                                     "0% = passthrough (no denoising)\n"
+                                     "100% = maximum noise removal");
+    grid->addWidget(m_bnrIntensitySlider, 1, 1);
+    m_bnrIntensityLabel = new QLabel(QString::number(m_bnrIntensitySlider->value()) + "%");
+    m_bnrIntensityLabel->setFixedWidth(40);
+    grid->addWidget(m_bnrIntensityLabel, 1, 2);
+
+    connect(m_bnrIntensitySlider, &QSlider::valueChanged, this, [this](int v) {
+        m_bnrIntensityLabel->setText(QString::number(v) + "%");
+        auto& s = AppSettings::instance();
+        s.setValue("BnrIntensity", QString::number(v));
+        s.save();
+        emit bnrIntensityChanged(v / 100.0f);
+    });
+
+    vbox->addLayout(grid);
     vbox->addStretch();
     return page;
 }
@@ -1104,6 +1155,11 @@ void AetherDspWidget::syncFromEngine()
         int beta = static_cast<int>(s.value("DfnrPostFilterBeta", "0.0").toFloat() * 100);
         m_dfnrBetaSlider->setValue(beta);
         m_dfnrBetaLabel->setText(QString::number(beta / 100.0f, 'f', 2));
+    }
+    if (m_bnrIntensitySlider) {
+        int intensity = static_cast<int>(s.value("BnrIntensity", "100").toFloat());
+        m_bnrIntensitySlider->setValue(intensity);
+        m_bnrIntensityLabel->setText(QString::number(intensity) + "%");
     }
 }
 

@@ -5523,6 +5523,13 @@ void AudioEngine::setBnrEnabled(bool on)
         connect(m_bnr.get(), &NvidiaBnrFilter::connectionChanged,
                 this, &AudioEngine::bnrConnectionChanged);
 
+        // Restore the persisted denoising intensity so the stream opens with it
+        // (the BNR container reads intensity_ratio only from the first message).
+        m_bnrIntensity = std::clamp(
+            AppSettings::instance().value("BnrIntensity", "100").toFloat() / 100.0f,
+            0.0f, 1.0f);
+        m_bnr->setIntensityRatio(m_bnrIntensity);
+
         // Resamplers: 24kHz mono ↔ 48kHz mono
         // BNR returns variable-sized chunks (up to 200ms = 9600 samples at 48kHz),
         // so use a large maxBlockSamples to avoid r8brain buffer overflow.
@@ -5593,12 +5600,36 @@ void AudioEngine::setBnrAddress(const QString& addr)
 
 void AudioEngine::setBnrIntensity(float ratio)
 {
-    if (m_bnr) m_bnr->setIntensityRatio(ratio);
+    std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
+    m_bnrIntensity = std::clamp(ratio, 0.0f, 1.0f);
+    if (!m_bnr) return;
+    m_bnr->setIntensityRatio(m_bnrIntensity);
+    // A live change only takes effect on a fresh stream — reopen it (debounced
+    // so dragging the slider coalesces into a single reconnect).
+    if (m_bnrEnabled.load() && m_bnr->isConnected())
+        scheduleBnrReconnect();
+}
+
+void AudioEngine::scheduleBnrReconnect()
+{
+    if (!m_bnrReconnectTimer) {
+        m_bnrReconnectTimer = new QTimer(this);
+        m_bnrReconnectTimer->setSingleShot(true);
+        m_bnrReconnectTimer->setInterval(250);
+        connect(m_bnrReconnectTimer, &QTimer::timeout, this, [this]() {
+            std::lock_guard<std::recursive_mutex> lock(m_dspMutex);
+            if (!m_bnrEnabled.load() || !m_bnr) return;
+            m_bnr->disconnect();
+            m_bnr->setIntensityRatio(m_bnrIntensity);
+            m_bnr->connectToServer(m_bnrAddress);
+        });
+    }
+    m_bnrReconnectTimer->start();
 }
 
 float AudioEngine::bnrIntensity() const
 {
-    return m_bnr ? m_bnr->intensityRatio() : 1.0f;
+    return m_bnrIntensity;
 }
 
 bool AudioEngine::bnrConnected() const

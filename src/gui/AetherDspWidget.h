@@ -68,6 +68,8 @@ signals:
     // DFNR parameter changes
     void dfnrAttenLimitChanged(float dB);
     void dfnrPostFilterBetaChanged(float beta);
+    // BNR parameter changes
+    void bnrIntensityChanged(float ratio);
     // NR4 parameter changes
     void nr4ReductionChanged(float dB);
     void nr4SmoothingChanged(float pct);
@@ -92,7 +94,7 @@ private:
     QWidget* buildDfnrPage();
 
     // Restore defaults for the currently-selected DSP page.  No-op for
-    // RN2 / BNR which expose no adjustable parameters.
+    // RN2 which exposes no adjustable parameters.
     void resetCurrentTab();
 
     // Click handler for the per-DSP selector buttons.  index = DspId.
@@ -142,6 +144,10 @@ private:
     QLabel*       m_dfnrAttenLabel{nullptr};
     QSlider*      m_dfnrBetaSlider{nullptr};
     QLabel*       m_dfnrBetaLabel{nullptr};
+
+    // BNR controls
+    QSlider*      m_bnrIntensitySlider{nullptr};
+    QLabel*       m_bnrIntensityLabel{nullptr};
 };
 
 } // namespace AetherSDR
