@@ -8,6 +8,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **KiwiSDR connection is released once a slice stops using it.** Switching a
+  slice to a different KiwiSDR, reverting its RX antenna back to the Flex, or
+  closing the slice now disconnects the previously-assigned KiwiSDR when no other
+  slice still uses it and it isn't set to auto-connect — instead of leaving the
+  WebSocket open. This stops a stale connection from squatting the receiver's
+  user slot and burning its per-IP time budget (e.g. 1 hr/day) until app quit. (#3950)
+
 ## [v26.7.1] — 2026-07-02
 
 ### 3D stacked-trace spectrum + in-process NVIDIA BNR + TX meter readouts + 60 fps panadapters
