@@ -8,6 +8,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **BNR no longer dead-ends on GPUs without a published AFX pack.** On an
+  NVIDIA card that is new enough for AFX but has no published denoiser pack for
+  its exact arch — notably **sm_120 (consumer Blackwell / RTX 50-series)** — the
+  BNR button and Download used to be offered and then silently fail (the pack
+  download 404s). BNR availability is now gated on the set of archs with a
+  *published* pack, so such GPUs get a clear "No BNR pack for your GPU (sm_120)
+  yet — use DFNR" state instead of a Download that can't succeed. (#3933)
+
 ## [v26.7.1] — 2026-07-02
 
 ### 3D stacked-trace spectrum + in-process NVIDIA BNR + TX meter readouts + 60 fps panadapters
