@@ -765,6 +765,13 @@ void PanadapterStream::processDatagram(const QByteArray& data)
 
     if (daxChannel >= 0) {
         int channel = daxChannel;
+        // A KiwiSDR is supplying this channel's audio (injectDaxAudio) — drop
+        // the Flex payload so WSJT-X hears only the Kiwi. (feat/kiwi-audio-to-dax)
+        if (channel >= 0 && channel < 32
+            && (m_kiwiSuppressedDaxMask.load(std::memory_order_relaxed)
+                & (1u << channel))) {
+            return;
+        }
         QByteArray pcm;
         if (pcc == PCC_IF_NARROW) {
             // Float32 stereo big-endian from radio → native float32 stereo
@@ -1445,6 +1452,22 @@ quint32 PanadapterStream::daxStreamIdForChannel(int channel) const
             return it.key();
     }
     return 0;
+}
+
+void PanadapterStream::injectDaxAudio(int channel, const QByteArray& pcm)
+{
+    // Feed non-Flex audio (KiwiSDR) onto a DAX channel using the same signal
+    // the Flex path uses, so TciServer / the DAX bridge need no changes. `pcm`
+    // is already the native DAX format (24 kHz stereo float32); no repackaging
+    // is required — consumers handle arbitrary payload sizes. (feat/kiwi-audio-to-dax)
+    if (channel < 0 || pcm.isEmpty())
+        return;
+    emit daxAudioReady(channel, pcm);
+}
+
+void PanadapterStream::setKiwiSuppressedDaxMask(quint32 mask)
+{
+    m_kiwiSuppressedDaxMask.store(mask, std::memory_order_relaxed);
 }
 
 void PanadapterStream::unregisterDaxStream(quint32 streamId)

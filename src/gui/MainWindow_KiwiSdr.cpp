@@ -15,6 +15,7 @@
 #include "core/KiwiSdrManager.h"
 #include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
+#include "core/PanadapterStream.h"
 #include "models/BandSettings.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
@@ -560,6 +561,7 @@ void MainWindow::setKiwiSdrVirtualAntennaForSlice(int sliceId,
         m_kiwiSdrVirtualPreviousMute.insert(sliceId, slice->flexAudioMute());
     }
     slice->setExternalReceiveAudioReplacementMute(true);
+    refreshKiwiSdrDaxSuppression();   // (feat/kiwi-audio-to-dax)
     if (m_appletPanel) {
         m_appletPanel->updateSliceButtons(m_radioModel.slices(), m_activeSliceId);
     }
@@ -611,6 +613,42 @@ void MainWindow::setKiwiSdrVirtualAntennaForSlice(int sliceId,
                           | KiwiSdrUiSyncWaterfallAvailability);
 }
 
+void MainWindow::routeKiwiSdrAudioToDax(const QString& profileId,
+                                       const QByteArray& pcm)
+{
+    if (!m_kiwiSdrManager || pcm.isEmpty())
+        return;
+    const int sliceId = m_kiwiSdrManager->assignedSliceForProfile(profileId);
+    if (sliceId < 0)
+        return;
+    SliceModel* slice = m_radioModel.slice(sliceId);
+    if (!slice || !slice->externalReceiveReplacementActive())
+        return;
+    const int channel = slice->daxChannel();
+    if (channel <= 0)
+        return;   // no DAX channel bound yet (no TCI/DAX client on this slice)
+    // TCI allocates the DAX channel lazily on audio_start — it may have bound
+    // after the Kiwi overlay engaged — so refresh the suppress mask here to be
+    // sure the Flex payload is dropped the moment we start injecting.
+    refreshKiwiSdrDaxSuppression();
+    if (PanadapterStream* pan = m_radioModel.panStream())
+        pan->injectDaxAudio(channel, pcm);
+}
+
+void MainWindow::refreshKiwiSdrDaxSuppression()
+{
+    quint32 mask = 0;
+    for (SliceModel* slice : m_radioModel.slices()) {
+        if (slice && slice->externalReceiveReplacementActive()) {
+            const int channel = slice->daxChannel();
+            if (channel > 0 && channel < 32)
+                mask |= (1u << channel);
+        }
+    }
+    if (PanadapterStream* pan = m_radioModel.panStream())
+        pan->setKiwiSuppressedDaxMask(mask);
+}
+
 void MainWindow::clearKiwiSdrVirtualAntennaForSlice(int sliceId)
 {
     qCInfo(lcKiwiSdr).noquote()
@@ -624,6 +662,7 @@ void MainWindow::clearKiwiSdrVirtualAntennaForSlice(int sliceId)
                 ? m_kiwiSdrVirtualPreviousMute.take(sliceId)
                 : slice->flexAudioMute();
         slice->setExternalReceiveAudioReplacementMute(false, restoreMute);
+        refreshKiwiSdrDaxSuppression();   // (feat/kiwi-audio-to-dax)
         if (m_appletPanel) {
             m_appletPanel->updateSliceButtons(m_radioModel.slices(), m_activeSliceId);
         }
@@ -1525,6 +1564,12 @@ void MainWindow::wireKiwiSdr()
                                                 const QByteArray& pcm) {
                 audio->feedKiwiSdrAudioData(id, pcm);
             }, Qt::QueuedConnection);
+            // Also route the Kiwi audio onto its slice's DAX channel so WSJT-X
+            // (DAX/TCI) decodes the Kiwi, not the muted Flex. (feat/kiwi-audio-to-dax)
+            connect(m_kiwiSdrManager, &KiwiSdrManager::decodedAudioReady,
+                    this, [this](const QString& id, const QByteArray& pcm) {
+                routeKiwiSdrAudioToDax(id, pcm);
+            }, Qt::QueuedConnection);
             connect(m_kiwiSdrManager, &KiwiSdrManager::audioSourceEnabledChanged,
                     m_audio, [audio = m_audio](const QString& id, bool enabled) {
                 audio->setKiwiSdrAudioSourceEnabled(id, enabled);
@@ -1742,6 +1787,7 @@ void MainWindow::wireKiwiSdr()
                         ? m_kiwiSdrVirtualPreviousMute.take(sliceId)
                         : slice->flexAudioMute();
                 slice->setExternalReceiveAudioReplacementMute(false, restoreMute);
+                refreshKiwiSdrDaxSuppression();   // (feat/kiwi-audio-to-dax)
                 if (m_appletPanel) {
                     m_appletPanel->updateSliceButtons(
                         m_radioModel.slices(), m_activeSliceId);
