@@ -356,6 +356,11 @@ private:
     void syncKiwiSdrTransmitMute();
     void setKiwiSdrVirtualAntennaForSlice(int sliceId, const QString& profileId);
     void clearKiwiSdrVirtualAntennaForSlice(int sliceId);
+    // Route a KiwiSDR profile's decoded audio onto its slice's DAX channel so
+    // WSJT-X (over DAX/TCI) decodes the Kiwi, and keep the "suppress the Flex
+    // payload on Kiwi-owned DAX channels" mask current. (feat/kiwi-audio-to-dax)
+    void routeKiwiSdrAudioToDax(const QString& profileId, const QByteArray& pcm);
+    void refreshKiwiSdrDaxSuppression();
     void updateKiwiSdrVirtualTrackingForSlice(SliceModel* slice);
     void updateKiwiSdrVirtualAudioControlsForSlice(SliceModel* slice);
     void updateKiwiSdrVirtualReceiverControlsForSlice(SliceModel* slice);
