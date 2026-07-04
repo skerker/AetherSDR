@@ -112,6 +112,16 @@ public:
     QList<quint32> daxStreamIds() const;
     quint32 daxStreamIdForChannel(int channel) const;
 
+    // External DAX audio injection (KiwiSDR → DAX/TCI, feat/kiwi-audio-to-dax).
+    // Emits `daxAudioReady(channel, pcm)` for audio that did not come from the
+    // Flex (e.g. a KiwiSDR replacing a slice's receive source). `pcm` must be
+    // the native DAX format: 24 kHz stereo float32. Safe to call from the GUI
+    // thread. `setKiwiSuppressedDaxMask` marks channels (bit N = channel N)
+    // whose *Flex* DAX payload must be dropped, so the injected audio is the
+    // only thing WSJT-X hears on that channel; read lock-free on the RX thread.
+    void injectDaxAudio(int channel, const QByteArray& pcm);
+    void setKiwiSuppressedDaxMask(quint32 mask);
+
     // DAX IQ stream routing
     void registerIqStream(quint32 streamId, int channel);
     void unregisterIqStream(quint32 streamId);
@@ -337,6 +347,10 @@ public:
     int audioPacketJitterMs() const { return m_audioPacketJitterMs.load(); }
 
 private:
+    // Bit N set => drop the Flex DAX payload for channel N (a KiwiSDR is
+    // supplying that channel's audio instead). Read on the RX parse thread,
+    // written from the GUI thread. (feat/kiwi-audio-to-dax)
+    std::atomic<quint32> m_kiwiSuppressedDaxMask{0};
     std::atomic<qint64> m_totalRxBytes{0};
     std::atomic<qint64> m_totalTxBytes{0};
     std::atomic<int> m_audioPacketGapMs{0};
