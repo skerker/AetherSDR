@@ -357,10 +357,13 @@ private:
     void setKiwiSdrVirtualAntennaForSlice(int sliceId, const QString& profileId);
     void clearKiwiSdrVirtualAntennaForSlice(int sliceId);
     // Route a KiwiSDR profile's decoded audio onto its slice's DAX channel so
-    // WSJT-X (over DAX/TCI) decodes the Kiwi, and keep the "suppress the Flex
-    // payload on Kiwi-owned DAX channels" mask current. (feat/kiwi-audio-to-dax)
+    // WSJT-X (over DAX/TCI) decodes the Kiwi. The "suppress the Flex payload
+    // on Kiwi-fed DAX channels" mask is kept current event-driven — see
+    // refreshKiwiSdrDaxSuppression — and kiwiSdrDaxStallTick feeds silence
+    // while a suppressed channel's Kiwi source stalls. (feat/kiwi-audio-to-dax)
     void routeKiwiSdrAudioToDax(const QString& profileId, const QByteArray& pcm);
     void refreshKiwiSdrDaxSuppression();
+    void kiwiSdrDaxStallTick();
     void updateKiwiSdrVirtualTrackingForSlice(SliceModel* slice);
     void updateKiwiSdrVirtualAudioControlsForSlice(SliceModel* slice);
     void updateKiwiSdrVirtualReceiverControlsForSlice(SliceModel* slice);
@@ -947,6 +950,14 @@ private:
     QMetaObject::Connection m_kiwiSdrAudioMuteConnection;
     QHash<int, bool> m_kiwiSdrVirtualPreviousMute;
     QSet<QString>    m_kiwiSdrFlexDisplayPans;
+    // Kiwi→DAX stall watchdog (feat/kiwi-audio-to-dax): monotonic clock,
+    // per-channel last-Kiwi-chunk timestamps for suppressed channels, the
+    // channels currently being silence-filled, and the tick timer (runs only
+    // while the suppression mask is non-zero).
+    QElapsedTimer      m_kiwiDaxClock;
+    QHash<int, qint64> m_kiwiDaxLastAudioMs;
+    QSet<int>          m_kiwiDaxStalledChannels;
+    QTimer*            m_kiwiDaxStallTimer{nullptr};
     ReceivePresentationSync m_receivePresentationSync;
     ReceiveAudioDelayEstimator m_receiveAudioDelayEstimator;
     ReceivePresentationQueue<std::function<void()>> m_receivePresentationVisualQueue;

@@ -11,6 +11,7 @@
 #include <QNetworkDatagram>
 #include <QHostAddress>
 #include <QStringList>
+#include <QThread>
 #include <QtEndian>
 #include <QSet>
 #include <algorithm>
@@ -465,6 +466,10 @@ void PanadapterStream::clearRegisteredStreams()
     m_orphanStreams.clear();
     m_everRegisteredPanStreams.clear();   // new session — re-arm from scratch (#3856)
     m_everRegisteredWfStreams.clear();
+    // The external-source suppression mask is session state too — a bit left
+    // set across a disconnect would silently mute that DAX channel on the
+    // next radio connection. (feat/kiwi-audio-to-dax)
+    m_externalDaxSourceMask.store(0, std::memory_order_relaxed);
     resetAudioStreamStats();
     qCDebug(lcVita49) << "PanadapterStream: cleared all registered streams";
 }
@@ -765,10 +770,11 @@ void PanadapterStream::processDatagram(const QByteArray& data)
 
     if (daxChannel >= 0) {
         int channel = daxChannel;
-        // A KiwiSDR is supplying this channel's audio (injectDaxAudio) — drop
-        // the Flex payload so WSJT-X hears only the Kiwi. (feat/kiwi-audio-to-dax)
-        if (channel >= 0 && channel < 32
-            && (m_kiwiSuppressedDaxMask.load(std::memory_order_relaxed)
+        // An external source (injectDaxAudio, e.g. a KiwiSDR) is supplying
+        // this channel's audio — drop the Flex payload so the two sources
+        // don't mix. (feat/kiwi-audio-to-dax)
+        if (isValidDaxChannel(channel)
+            && (m_externalDaxSourceMask.load(std::memory_order_relaxed)
                 & (1u << channel))) {
             return;
         }
@@ -1456,18 +1462,35 @@ quint32 PanadapterStream::daxStreamIdForChannel(int channel) const
 
 void PanadapterStream::injectDaxAudio(int channel, const QByteArray& pcm)
 {
-    // Feed non-Flex audio (KiwiSDR) onto a DAX channel using the same signal
-    // the Flex path uses, so TciServer / the DAX bridge need no changes. `pcm`
-    // is already the native DAX format (24 kHz stereo float32); no repackaging
-    // is required — consumers handle arbitrary payload sizes. (feat/kiwi-audio-to-dax)
-    if (channel < 0 || pcm.isEmpty())
+    // Feed non-Flex audio (e.g. a KiwiSDR) onto a DAX channel using the same
+    // signal the Flex path uses, so TciServer / the DAX bridge need no
+    // changes. `pcm` is already the native DAX format — 24 kHz stereo
+    // float32: both Flex packet-class paths above (PCC_IF_NARROW and
+    // PCC_IF_NARROW_REDUCED, fw 4.2.18) normalize to exactly that before
+    // `daxAudioReady`, and KiwiSdrClient resamples its 12 kHz feed to match.
+    // No repackaging is required — consumers handle arbitrary payload sizes.
+    // (feat/kiwi-audio-to-dax)
+    if (!isValidDaxChannel(channel) || pcm.isEmpty()) {
         return;
+    }
+    // Every Flex-path emission of daxAudioReady happens on this object's
+    // network thread; AutoConnection consumers (TciServer, DaxBridge) rely on
+    // that to get queued delivery. Re-invoke so an injection from the GUI
+    // thread keeps the identical contract instead of running the consumers'
+    // resampler/socket work synchronously inside the caller's slot.
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(
+            this,
+            [this, channel, pcm]() { emit daxAudioReady(channel, pcm); },
+            Qt::QueuedConnection);
+        return;
+    }
     emit daxAudioReady(channel, pcm);
 }
 
-void PanadapterStream::setKiwiSuppressedDaxMask(quint32 mask)
+void PanadapterStream::setExternalDaxSourceMask(quint32 mask)
 {
-    m_kiwiSuppressedDaxMask.store(mask, std::memory_order_relaxed);
+    m_externalDaxSourceMask.store(mask, std::memory_order_relaxed);
 }
 
 void PanadapterStream::unregisterDaxStream(quint32 streamId)
