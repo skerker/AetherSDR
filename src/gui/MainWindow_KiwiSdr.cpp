@@ -613,40 +613,132 @@ void MainWindow::setKiwiSdrVirtualAntennaForSlice(int sliceId,
                           | KiwiSdrUiSyncWaterfallAvailability);
 }
 
+namespace {
+// Kiwi→DAX stall watchdog (feat/kiwi-audio-to-dax): while a channel's Flex
+// payload is suppressed, the Kiwi must keep it fed — see kiwiSdrDaxStallTick.
+constexpr int kKiwiDaxStallTickMs = 250;       // watchdog cadence
+constexpr int kKiwiDaxStallThresholdMs = 400;  // > worst-case Kiwi chunk jitter
+}  // namespace
+
 void MainWindow::routeKiwiSdrAudioToDax(const QString& profileId,
                                        const QByteArray& pcm)
 {
-    if (!m_kiwiSdrManager || pcm.isEmpty())
+    if (!m_kiwiSdrManager || pcm.isEmpty()) {
         return;
+    }
     const int sliceId = m_kiwiSdrManager->assignedSliceForProfile(profileId);
-    if (sliceId < 0)
+    if (sliceId < 0) {
         return;
+    }
     SliceModel* slice = m_radioModel.slice(sliceId);
-    if (!slice || !slice->externalReceiveReplacementActive())
+    if (!slice || !slice->externalReceiveReplacementActive()) {
         return;
+    }
     const int channel = slice->daxChannel();
-    if (channel <= 0)
+    if (!PanadapterStream::isValidDaxChannel(channel)) {
         return;   // no DAX channel bound yet (no TCI/DAX client on this slice)
-    // TCI allocates the DAX channel lazily on audio_start — it may have bound
-    // after the Kiwi overlay engaged — so refresh the suppress mask here to be
-    // sure the Flex payload is dropped the moment we start injecting.
-    refreshKiwiSdrDaxSuppression();
-    if (PanadapterStream* pan = m_radioModel.panStream())
+    }
+    if (m_kiwiDaxClock.isValid()) {
+        m_kiwiDaxLastAudioMs.insert(channel, m_kiwiDaxClock.elapsed());
+    }
+    if (m_kiwiDaxStalledChannels.remove(channel)) {
+        qCInfo(lcKiwiSdr) << "KiwiSDR audio resumed on DAX channel" << channel;
+    }
+    if (PanadapterStream* pan = m_radioModel.panStream()) {
         pan->injectDaxAudio(channel, pcm);
+    }
 }
 
+// Recompute the Flex-suppression mask from live slice state. Event-driven:
+// wired to SliceModel::daxChannelChanged, RadioModel::sliceRemoved, and the
+// Kiwi assign/clear lifecycle (wireKiwiSdr), so it stays correct even while
+// no Kiwi audio is flowing (connect window, stall, reconnect backoff) and
+// after teardowns where the slice is already gone — it must never depend on
+// looking a particular slice up.
 void MainWindow::refreshKiwiSdrDaxSuppression()
 {
     quint32 mask = 0;
     for (SliceModel* slice : m_radioModel.slices()) {
         if (slice && slice->externalReceiveReplacementActive()) {
             const int channel = slice->daxChannel();
-            if (channel > 0 && channel < 32)
+            if (PanadapterStream::isValidDaxChannel(channel)) {
                 mask |= (1u << channel);
+            }
         }
     }
-    if (PanadapterStream* pan = m_radioModel.panStream())
-        pan->setKiwiSuppressedDaxMask(mask);
+    if (PanadapterStream* pan = m_radioModel.panStream()) {
+        pan->setExternalDaxSourceMask(mask);
+    }
+
+    // Watchdog bookkeeping: track exactly the suppressed channels. A channel
+    // that just became suppressed is armed "as of now" so the stall timer
+    // covers the initial websocket connect window too.
+    if (!m_kiwiDaxClock.isValid()) {
+        m_kiwiDaxClock.start();
+    }
+    const qint64 now = m_kiwiDaxClock.elapsed();
+    for (auto it = m_kiwiDaxLastAudioMs.begin();
+         it != m_kiwiDaxLastAudioMs.end();) {
+        if (!(mask & (1u << it.key()))) {
+            m_kiwiDaxStalledChannels.remove(it.key());
+            it = m_kiwiDaxLastAudioMs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (int channel = 1; channel < 32; ++channel) {
+        if ((mask & (1u << channel))
+            && !m_kiwiDaxLastAudioMs.contains(channel)) {
+            m_kiwiDaxLastAudioMs.insert(channel, now);
+        }
+    }
+    if (mask != 0) {
+        if (!m_kiwiDaxStallTimer) {
+            m_kiwiDaxStallTimer = new QTimer(this);
+            m_kiwiDaxStallTimer->setInterval(kKiwiDaxStallTickMs);
+            connect(m_kiwiDaxStallTimer, &QTimer::timeout,
+                    this, &MainWindow::kiwiSdrDaxStallTick);
+        }
+        if (!m_kiwiDaxStallTimer->isActive()) {
+            m_kiwiDaxStallTimer->start();
+        }
+    } else if (m_kiwiDaxStallTimer) {
+        m_kiwiDaxStallTimer->stop();
+    }
+}
+
+// While a channel is suppressed but the Kiwi has stopped delivering (stall,
+// reconnect backoff, initial connect), neither source reaches the DAX
+// consumers — they are all push-only, so WSJT-X's input would freeze
+// mid-stream with no indication which side failed. Feed silence at the
+// native DAX format instead: decoders keep their clocks, and real audio
+// resumes seamlessly when the Kiwi recovers.
+void MainWindow::kiwiSdrDaxStallTick()
+{
+    PanadapterStream* pan = m_radioModel.panStream();
+    if (!pan || !m_kiwiDaxClock.isValid()) {
+        return;
+    }
+    const qint64 now = m_kiwiDaxClock.elapsed();
+    for (auto it = m_kiwiDaxLastAudioMs.cbegin();
+         it != m_kiwiDaxLastAudioMs.cend(); ++it) {
+        if (now - it.value() < kKiwiDaxStallThresholdMs) {
+            continue;
+        }
+        const int channel = it.key();
+        if (!m_kiwiDaxStalledChannels.contains(channel)) {
+            m_kiwiDaxStalledChannels.insert(channel);
+            qCInfo(lcKiwiSdr)
+                << "KiwiSDR audio stalled on DAX channel" << channel
+                << "- feeding silence until it resumes";
+        }
+        // One tick's worth of 24 kHz stereo float32 silence.
+        static const QByteArray silence(
+            24000 * kKiwiDaxStallTickMs / 1000 * 2
+                * static_cast<int>(sizeof(float)),
+            '\0');
+        pan->injectDaxAudio(channel, silence);
+    }
 }
 
 void MainWindow::clearKiwiSdrVirtualAntennaForSlice(int sliceId)
@@ -662,7 +754,6 @@ void MainWindow::clearKiwiSdrVirtualAntennaForSlice(int sliceId)
                 ? m_kiwiSdrVirtualPreviousMute.take(sliceId)
                 : slice->flexAudioMute();
         slice->setExternalReceiveAudioReplacementMute(false, restoreMute);
-        refreshKiwiSdrDaxSuppression();   // (feat/kiwi-audio-to-dax)
         if (m_appletPanel) {
             m_appletPanel->updateSliceButtons(m_radioModel.slices(), m_activeSliceId);
         }
@@ -672,6 +763,10 @@ void MainWindow::clearKiwiSdrVirtualAntennaForSlice(int sliceId)
             spectrum->setKiwiSdrWaterfallProfile(QString());
         }
     }
+    // Outside the slice lookup on purpose: during slice removal RadioModel
+    // has already dropped the slice, and the mask must still be recomputed.
+    // (feat/kiwi-audio-to-dax)
+    refreshKiwiSdrDaxSuppression();
 
     if (!panId.isEmpty()) {
         m_kiwiSdrFlexDisplayPans.remove(panId);
@@ -1579,6 +1674,29 @@ void MainWindow::wireKiwiSdr()
                 audio->removeKiwiSdrAudioSource(id);
             }, Qt::QueuedConnection);
         }
+        // Keep the DAX suppression mask event-driven (feat/kiwi-audio-to-dax):
+        // a slice's DAX channel can (re)bind lazily (TCI audio_start) or drop
+        // to 0 (WSJT-X exit) while no Kiwi audio is flowing, so the refresh
+        // must follow the transitions themselves — mirroring wireDaxSlice
+        // (MainWindow_DigitalModes.cpp, #2895) — not the audio chunks.
+        const auto wireKiwiDaxSlice = [this](SliceModel* s) {
+            if (!s) {
+                return;
+            }
+            connect(s, &SliceModel::daxChannelChanged,
+                    this, [this](int) { refreshKiwiSdrDaxSuppression(); });
+        };
+        for (SliceModel* s : m_radioModel.slices()) {
+            wireKiwiDaxSlice(s);
+        }
+        connect(&m_radioModel, &RadioModel::sliceAdded,
+                this, wireKiwiDaxSlice);
+        // RadioModel drops the slice from its list BEFORE emitting
+        // sliceRemoved; refreshKiwiSdrDaxSuppression recomputes from the
+        // remaining slices, so this is exactly what clears the removed
+        // slice's mask bit.
+        connect(&m_radioModel, &RadioModel::sliceRemoved,
+                this, [this](int) { refreshKiwiSdrDaxSuppression(); });
         connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
                 this, [this](bool) { syncKiwiSdrTransmitMute(); });
         connect(&m_radioModel.transmitModel(), &TransmitModel::tuneChanged,
@@ -1787,7 +1905,6 @@ void MainWindow::wireKiwiSdr()
                         ? m_kiwiSdrVirtualPreviousMute.take(sliceId)
                         : slice->flexAudioMute();
                 slice->setExternalReceiveAudioReplacementMute(false, restoreMute);
-                refreshKiwiSdrDaxSuppression();   // (feat/kiwi-audio-to-dax)
                 if (m_appletPanel) {
                     m_appletPanel->updateSliceButtons(
                         m_radioModel.slices(), m_activeSliceId);
@@ -1799,6 +1916,11 @@ void MainWindow::wireKiwiSdr()
                     spectrum->setKiwiSdrWaterfallProfile(QString());
                 }
             }
+            // After the replacement-mute restore, and outside the slice
+            // lookup on purpose: during slice removal RadioModel has already
+            // dropped the slice, and the mask must still be recomputed.
+            // (feat/kiwi-audio-to-dax)
+            refreshKiwiSdrDaxSuppression();
             scheduleKiwiSdrUiSync(KiwiSdrUiSyncWaterfallAvailability
                                   | KiwiSdrUiSyncDiversityEsc);
             syncKiwiSdrPanadapterUiState(panId);
