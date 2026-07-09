@@ -2079,6 +2079,8 @@ QJsonObject AutomationServer::handleLine(const QByteArray& line, QLocalSocket* s
             }
         } else if (cmd == QLatin1String("streams")) {
             action = tok(1);  // "" (Layer A UDP-orphan) | "radio" (Layer B) | "reset"
+        } else if (cmd == QLatin1String("txstream")) {
+            action = tok(1);  // "reset" — tear down + recreate the DAX-TX stream
         } else if (cmd == QLatin1String("audioCapture")) {
             action = tok(1);  // start | stop | read | status
             QStringList rest;
@@ -2274,6 +2276,11 @@ QJsonObject AutomationServer::handleLine(const QByteArray& line, QLocalSocket* s
     }
     if (cmd == QLatin1String("streams"))
         return doStreams(action);
+    if (cmd == QLatin1String("txstream")) {
+        if (action.isEmpty())
+            return err(QStringLiteral("txstream requires an action (reset)"));
+        return doTxStream(action);
+    }
     if (cmd == QLatin1String("tci")) {
         if (action.isEmpty())
             return err(QStringLiteral("tci requires an action (start [port] | status | stop [abrupt])"));
@@ -5610,6 +5617,33 @@ QJsonObject AutomationServer::doStreams(const QString& action)
         {QStringLiteral("registeredWfStreams"), wfReg},
         {QStringLiteral("orphanStreams"), orphans},
         {QStringLiteral("orphanCount"), orphans.size()},
+    };
+}
+
+// `txstream reset` — the software equivalent of "restart WSJT-X / toggle the
+// audio source": tear down the current DAX-TX stream on the radio and recreate
+// it, invalidating both the ownership (RadioModel::m_daxTxStreamId) and the
+// emission (AudioEngine::m_txStreamId) id caches so no VITA packet stamps a
+// stale/dead id (the H5 desync). Operator-triggered recovery for the TX
+// low-power drop; call in the RX gap. See RadioModel::resetDaxTxStream().
+QJsonObject AutomationServer::doTxStream(const QString& action)
+{
+    if (!m_radioModel)
+        return err(QStringLiteral("no radio model available"));
+
+    if (action.compare(QLatin1String("reset"), Qt::CaseInsensitive) != 0)
+        return err(QStringLiteral("unknown txstream action: ") + action
+                   + QStringLiteral(" (only 'reset' is supported)"));
+
+    if (!m_radioModel->isConnected())
+        return err(QStringLiteral("not connected — cannot reset DAX TX stream"));
+
+    m_radioModel->resetDaxTxStream();  // reason defaults to TciTxAudio
+    return QJsonObject{
+        {QStringLiteral("ok"), true},
+        {QStringLiteral("txstream"), QStringLiteral("reset")},
+        {QStringLiteral("hint"),
+         QStringLiteral("recreate is async on the remove-ack; trigger only in the RX gap")},
     };
 }
 

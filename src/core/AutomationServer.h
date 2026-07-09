@@ -363,6 +363,7 @@ private:
     //                     waterfall the client view had already purged.
     //   streams reset   — clear the Layer-A orphan tally to re-baseline.
     QJsonObject doStreams(const QString& action);
+    QJsonObject doTxStream(const QString& action);
     QJsonObject doTci(const QString& action, const QString& value);
     QJsonObject doAudioCapture(const QString& action,
                                const QString& arg,
