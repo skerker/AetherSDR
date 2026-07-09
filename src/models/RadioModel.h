@@ -259,6 +259,12 @@ public:
     void resetPanState();
     void createAudioStream();
     bool ensureDaxTxStream(DaxTxRequestReason reason);
+    // Tear down the current DAX-TX stream and recreate it (the software
+    // equivalent of "restart WSJT-X / toggle the audio source"): drops the
+    // stream on the radio, invalidates BOTH id caches (ownership here +
+    // AudioEngine's emission id, via txAudioStreamInvalidated), then re-runs
+    // ensureDaxTxStream() on the remove-ack. Call only in the RX gap.
+    void resetDaxTxStream(DaxTxRequestReason reason = DaxTxRequestReason::TciTxAudio);
     QJsonObject troubleshootingSnapshot() const;
 
     // Memory channel cache
@@ -515,6 +521,10 @@ signals:
     void networkQualityChanged(const QString& quality, int pingMs);
     // Emitted when the radio assigns a TX audio stream ID (DAX TX).
     void txAudioStreamReady(quint32 streamId);
+    // Emitted when the DAX-TX stream is torn down (reset, or radio-side
+    // removal) so the emission-side id (AudioEngine::m_txStreamId) is zeroed
+    // and no VITA packet stamps a stale/dead stream id.
+    void txAudioStreamInvalidated();
     // Emitted when the radio assigns a remote audio TX stream ID (voice/VOX).
     void remoteTxStreamReady(quint32 streamId);
     // Audio TX gate for sample pipeline (separate from optimistic MOX UI state).
@@ -967,6 +977,7 @@ private:
     bool        m_daxTxActive{false};
     quint32     m_daxTxClientHandle{0};  // Tracked for diagnostics only — not consulted in routing.
     bool        m_daxTxCreatePending{false};
+    bool        m_daxTxResetPending{false};   // guards resetDaxTxStream() re-entry
     QSet<quint32> m_deadDaxRxSeen;
     QSet<quint32> m_externalDaxTxSeen;
     QSet<quint32> m_externalDaxRxSeen;

@@ -512,6 +512,13 @@ void MainWindow::wireRadioModel()
             audioStartTx(m_radioModel.radioAddress(), 4991);
         }
     });
+    // Zero the emission-side id when the DAX-TX stream is torn down (reset or
+    // radio-side removal) so no VITA packet stamps a stale/dead stream id.
+    connect(&m_radioModel, &RadioModel::txAudioStreamInvalidated,
+            this, [this] {
+        m_audio->setTxStreamId(0);
+        qDebug() << "MainWindow: DAX TX stream ID invalidated (set to 0)";
+    });
     connect(&m_radioModel, &RadioModel::remoteTxStreamReady,
             this, [this](quint32 streamId) {
         m_audio->setRemoteTxStreamId(streamId);

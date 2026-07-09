@@ -4529,6 +4529,10 @@ void RadioModel::traceDaxStreamStatus(const QString& object,
                 m_daxTxActive = false;
                 m_daxTxClientHandle = 0;
                 m_daxTxCreatePending = false;
+                // Keep the emission-side id coherent: AudioEngine::m_txStreamId
+                // is otherwise only ever set, never cleared, so a radio-side
+                // removal would leave it stamping a dead id (the H5 desync).
+                emit txAudioStreamInvalidated();
             }
             m_deadDaxRxSeen.remove(stream.streamId);
             m_externalDaxTxSeen.remove(stream.streamId);
@@ -4657,6 +4661,8 @@ void RadioModel::traceDaxStreamStatus(const QString& object,
             m_daxTxActive = false;
             m_daxTxClientHandle = 0;
             m_daxTxCreatePending = false;
+            // Keep AudioEngine::m_txStreamId coherent on radio-side removal.
+            emit txAudioStreamInvalidated();
         }
         m_daxStreamDebug.remove(txAudioStream.streamId);
         m_externalDaxTxSeen.remove(txAudioStream.streamId);
@@ -6413,6 +6419,60 @@ bool RadioModel::ensureDaxTxStream(DaxTxRequestReason reason)
             emit txAudioStreamReady(id);
         });
     return true;
+}
+
+void RadioModel::resetDaxTxStream(DaxTxRequestReason reason)
+{
+    if (!isConnected())
+        return;
+
+    const quint32 id = m_daxTxStreamId;
+
+    // Nothing to tear down — just (re)create. Covers the case where the radio
+    // already removed the stream and zeroed our id (ensureDaxTxStream is then
+    // a real create, not a no-op).
+    if (id == 0) {
+        qCInfo(lcDax).noquote()
+            << "RadioModel: DAX TX reset — no live stream, ensuring instead"
+            << QStringLiteral("reason=%1").arg(daxTxRequestReasonName(reason));
+        ensureDaxTxStream(reason);
+        return;
+    }
+    if (m_daxTxResetPending)
+        return;
+    m_daxTxResetPending = true;
+
+    qCInfo(lcDax).noquote()
+        << "RadioModel: DAX TX reset"
+        << QStringLiteral("stream=%1").arg(hexId(id))
+        << QStringLiteral("reason=%1").arg(daxTxRequestReasonName(reason));
+
+    // (1) Stop emission immediately: zero AudioEngine's emission id so no VITA
+    //     packet stamps the dead id. (Intended to run in the RX gap, where no
+    //     TX audio is flowing — but this also closes the general desync window.)
+    emit txAudioStreamInvalidated();
+
+    // (2) Invalidate local ownership so ensureDaxTxStream() won't early-return.
+    m_daxTxStreamId = 0;
+    m_daxTxActive = false;
+    m_daxTxClientHandle = 0;
+    m_daxTxCreatePending = false;
+
+    // (3) Drop the stream on the radio, then recreate on the ack (ack-sequenced,
+    //     so we never briefly hold two dax_tx streams). A late "removed" status
+    //     for the OLD id is harmless: the removal sites guard on
+    //     `streamId == m_daxTxStreamId`, which is the NEW id by then.
+    sendCmd(QString("stream remove 0x%1").arg(id, 0, 16),
+        [this, reason](int code, const QString& body) {
+            m_daxTxResetPending = false;
+            if (code != 0) {
+                qCWarning(lcDax).noquote()
+                    << "RadioModel: DAX TX reset — remove reported error (recreating anyway)"
+                    << QStringLiteral("code=%1").arg(hexCode(code))
+                    << QStringLiteral("body=%1").arg(body);
+            }
+            ensureDaxTxStream(reason);  // fresh create → txAudioStreamReady(newId)
+        });
 }
 
 QJsonObject RadioModel::troubleshootingSnapshot() const
