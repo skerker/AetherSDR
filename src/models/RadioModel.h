@@ -69,6 +69,15 @@ public:
     // Access the underlying connection and panadapter stream
     RadioConnection*  connection()  { return m_connection; }
     PanadapterStream* panStream()   { return m_panStream; }
+
+    // Seam forwarders for above-seam callers (GUI) that must not include the
+    // vendor PanadapterStream header directly (engine-boundary EB3). RadioModel
+    // already owns the stream, so DAX-channel helpers route through here rather
+    // than leaking the vendor type into the GUI.
+    bool hasPanStream() const { return m_panStream != nullptr; }
+    bool isValidDaxChannel(int channel) const;
+    void injectDaxAudio(int channel, const QByteArray& pcm);
+    void setExternalDaxSourceMask(quint32 mask);
     // Sub-models owned by RadioModel (main thread). (#502)
     MeterModel&       meterModel()       { return m_meterModel; }
     TunerModel&       tunerModel()       { return m_tunerModel; }

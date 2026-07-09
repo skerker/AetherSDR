@@ -6415,6 +6415,26 @@ bool RadioModel::ensureDaxTxStream(DaxTxRequestReason reason)
     return true;
 }
 
+// Seam forwarders (engine-boundary EB3): let above-seam callers reach the DAX
+// stream through the model instead of including the vendor PanadapterStream
+// header. Pure delegation — no behavior of its own.
+bool RadioModel::isValidDaxChannel(int channel) const
+{
+    return PanadapterStream::isValidDaxChannel(channel);
+}
+
+void RadioModel::injectDaxAudio(int channel, const QByteArray& pcm)
+{
+    if (m_panStream)
+        m_panStream->injectDaxAudio(channel, pcm);
+}
+
+void RadioModel::setExternalDaxSourceMask(quint32 mask)
+{
+    if (m_panStream)
+        m_panStream->setExternalDaxSourceMask(mask);
+}
+
 QJsonObject RadioModel::troubleshootingSnapshot() const
 {
     QJsonObject snapshot;
