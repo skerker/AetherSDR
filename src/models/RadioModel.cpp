@@ -3152,6 +3152,11 @@ void RadioModel::onDisconnected()
     m_daxTxActive = false;
     m_daxTxClientHandle = 0;
     m_daxTxCreatePending = false;
+    // A reset in flight when the link dropped will never get its remove-ack
+    // (pending callbacks are not invoked on disconnect), so clear the guard
+    // here too — otherwise resetDaxTxStream() would no-op forever after
+    // reconnect. Mirrors the m_daxTxCreatePending cleanup above. (F1)
+    m_daxTxResetPending = false;
     m_deadDaxRxSeen.clear();
     m_externalDaxTxSeen.clear();
     m_externalDaxRxSeen.clear();
@@ -6426,6 +6431,14 @@ void RadioModel::resetDaxTxStream(DaxTxRequestReason reason)
     if (!isConnected())
         return;
 
+    // A reset already in flight owns the teardown/recreate sequence; a second
+    // call must not race a create ahead of the pending remove. Guard BEFORE the
+    // id==0 fast-path, because step (2) below has already zeroed m_daxTxStreamId
+    // for the in-flight reset — without this, a re-entrant call would fall into
+    // the id==0 branch and issue an out-of-order ensure. (F2)
+    if (m_daxTxResetPending)
+        return;
+
     const quint32 id = m_daxTxStreamId;
 
     // Nothing to tear down — just (re)create. Covers the case where the radio
@@ -6438,8 +6451,6 @@ void RadioModel::resetDaxTxStream(DaxTxRequestReason reason)
         ensureDaxTxStream(reason);
         return;
     }
-    if (m_daxTxResetPending)
-        return;
     m_daxTxResetPending = true;
 
     qCInfo(lcDax).noquote()

@@ -5638,6 +5638,13 @@ QJsonObject AutomationServer::doTxStream(const QString& action)
     if (!m_radioModel->isConnected())
         return err(QStringLiteral("not connected — cannot reset DAX TX stream"));
 
+    // RX-gap-only for the manual path: resetting mid-transmit zeroes the
+    // emission stream id during a live TX and glitches that cycle. The native
+    // watchdog (2b) enforces this itself; the bridge verb must too. (F3)
+    if (m_radioModel->isRadioTransmitting())
+        return err(QStringLiteral("currently transmitting — trigger 'txstream reset' in the "
+                                  "RX gap (between TX cycles) so it can't interrupt a live transmit"));
+
     m_radioModel->resetDaxTxStream();  // reason defaults to TciTxAudio
     return QJsonObject{
         {QStringLiteral("ok"), true},
