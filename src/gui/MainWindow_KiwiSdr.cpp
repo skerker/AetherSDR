@@ -15,7 +15,6 @@
 #include "core/KiwiSdrManager.h"
 #include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
-#include "core/PanadapterStream.h"
 #include "models/BandSettings.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
@@ -635,7 +634,7 @@ void MainWindow::routeKiwiSdrAudioToDax(const QString& profileId,
         return;
     }
     const int channel = slice->daxChannel();
-    if (!PanadapterStream::isValidDaxChannel(channel)) {
+    if (!m_radioModel.isValidDaxChannel(channel)) {
         return;   // no DAX channel bound yet (no TCI/DAX client on this slice)
     }
     if (m_kiwiDaxClock.isValid()) {
@@ -644,9 +643,7 @@ void MainWindow::routeKiwiSdrAudioToDax(const QString& profileId,
     if (m_kiwiDaxStalledChannels.remove(channel)) {
         qCInfo(lcKiwiSdr) << "KiwiSDR audio resumed on DAX channel" << channel;
     }
-    if (PanadapterStream* pan = m_radioModel.panStream()) {
-        pan->injectDaxAudio(channel, pcm);
-    }
+    m_radioModel.injectDaxAudio(channel, pcm);
 }
 
 // Recompute the Flex-suppression mask from live slice state. Event-driven:
@@ -661,14 +658,12 @@ void MainWindow::refreshKiwiSdrDaxSuppression()
     for (SliceModel* slice : m_radioModel.slices()) {
         if (slice && slice->externalReceiveReplacementActive()) {
             const int channel = slice->daxChannel();
-            if (PanadapterStream::isValidDaxChannel(channel)) {
+            if (m_radioModel.isValidDaxChannel(channel)) {
                 mask |= (1u << channel);
             }
         }
     }
-    if (PanadapterStream* pan = m_radioModel.panStream()) {
-        pan->setExternalDaxSourceMask(mask);
-    }
+    m_radioModel.setExternalDaxSourceMask(mask);
 
     // Watchdog bookkeeping: track exactly the suppressed channels. A channel
     // that just became suppressed is armed "as of now" so the stall timer
@@ -715,8 +710,7 @@ void MainWindow::refreshKiwiSdrDaxSuppression()
 // resumes seamlessly when the Kiwi recovers.
 void MainWindow::kiwiSdrDaxStallTick()
 {
-    PanadapterStream* pan = m_radioModel.panStream();
-    if (!pan || !m_kiwiDaxClock.isValid()) {
+    if (!m_radioModel.hasPanStream() || !m_kiwiDaxClock.isValid()) {
         return;
     }
     const qint64 now = m_kiwiDaxClock.elapsed();
@@ -737,7 +731,7 @@ void MainWindow::kiwiSdrDaxStallTick()
             24000 * kKiwiDaxStallTickMs / 1000 * 2
                 * static_cast<int>(sizeof(float)),
             '\0');
-        pan->injectDaxAudio(channel, silence);
+        m_radioModel.injectDaxAudio(channel, silence);
     }
 }
 
