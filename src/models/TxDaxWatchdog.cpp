@@ -146,6 +146,16 @@ void TxDaxWatchdog::tick(bool transmitting)
     }
 
     if (decision == Decision::WouldReset) {
+        // The policy only ever emits WouldReset on the TX->RX falling edge, so
+        // this is already the RX gap. Re-check isRadioTransmitting() anyway as
+        // defense-in-depth — the same F3 guard the bridge verb enforces — so a
+        // reset can never zero the emission id mid-transmit even if some future
+        // signal ordering surprised us.
+        if (m_radio.isRadioTransmitting()) {
+            qCWarning(lcTxDaxWatchdog)
+                << "WouldReset while still transmitting — deferring (RX-gap-only guard)";
+            return;
+        }
         qCInfo(lcTxDaxWatchdog).noquote()
             << "confirmed zero-power DAX-TX stall over" << m_policy.faultedCycles()
             << "cycles — firing resetDaxTxStream() in the RX gap";
