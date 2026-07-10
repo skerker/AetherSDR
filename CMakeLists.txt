@@ -652,6 +652,7 @@ set(MODEL_SOURCES
     src/models/TunerModel.cpp
     src/models/AmpModel.cpp
     src/models/TransmitModel.cpp
+    src/models/TxDaxWatchdog.cpp
     src/models/EqualizerModel.cpp
     src/models/TnfModel.cpp
     src/models/UsbCableModel.cpp

@@ -28,6 +28,7 @@
 #include "PhoneCwApplet.h"
 #include "SpectrumOverlayMenu.h"
 #include "core/CwSidetoneGenerator.h"
+#include "models/TxDaxWatchdog.h"
 #include "core/CwTrace.h"
 #include "core/CwxLocalKeyer.h"
 #include "core/IambicKeyer.h"
@@ -519,6 +520,13 @@ void MainWindow::wireRadioModel()
         m_audio->setTxStreamId(0);
         qDebug() << "MainWindow: DAX TX stream ID invalidated (set to 0)";
     });
+    // 2b: opt-in native DAX-TX zero-power watchdog. Off unless
+    // AETHER_TX_DAX_WATCHDOG=1; when armed it auto-fires resetDaxTxStream() in
+    // the RX gap after K confirmed zero-power TX cycles — the recovery proven
+    // manually on-air via the 2c `txstream reset` verb (2026-07-09). Constructed
+    // once; it wires itself to m_radioModel's TX/meter/connection signals.
+    if (!m_txDaxWatchdog)
+        m_txDaxWatchdog = new TxDaxWatchdog(m_radioModel, this);
     connect(&m_radioModel, &RadioModel::remoteTxStreamReady,
             this, [this](quint32 streamId) {
         m_audio->setRemoteTxStreamId(streamId);

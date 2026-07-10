@@ -94,6 +94,7 @@ namespace AetherSDR {
 
 class ConnectionPanel;
 class TitleBar;
+class TxDaxWatchdog;
 class KiwiSdrManager;
 class SpectrumWidget;
 class PanadapterApplet;
@@ -681,6 +682,9 @@ private:
     DxccColorProvider m_dxccProvider;
     AudioEngine*      m_audio{nullptr};
     QThread*          m_audioThread{nullptr};
+    // 2b: opt-in native DAX-TX zero-power watchdog (off unless
+    // AETHER_TX_DAX_WATCHDOG=1). Parented to this; auto-wires to m_radioModel.
+    TxDaxWatchdog*    m_txDaxWatchdog{nullptr};
     QMediaDevices*    m_audioDeviceMonitor{nullptr};
     QTimer            m_audioDeviceChangeTimer;
     QList<QByteArray> m_knownAudioInputIds;
