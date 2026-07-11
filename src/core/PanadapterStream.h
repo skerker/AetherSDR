@@ -182,6 +182,12 @@ public:
     // read lock-free on the RX thread.
     void injectDaxAudio(int channel, const QByteArray& pcm);
     void setExternalDaxSourceMask(quint32 mask);
+    // Read-back for the Automation Bridge `get dax` snapshot (debug probe):
+    // lets a live session prove whether the Flex-payload drop gate is armed.
+    quint32 externalDaxSourceMask() const
+    {
+        return m_externalDaxSourceMask.load(std::memory_order_relaxed);
+    }
 
     // The one definition of a routable DAX audio channel (1..4 on current
     // radios; bounded above by the 32-bit suppression mask). Keep every

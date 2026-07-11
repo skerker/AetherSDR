@@ -3115,11 +3115,24 @@ QJsonObject AutomationServer::doGet(const QString& model, const QString& selecto
             sliceDax.append(QJsonObject{
                 {QStringLiteral("sliceId"),    s->sliceId()},
                 {QStringLiteral("daxChannel"), s->daxChannel()},
+                // Debug probe (ANT1-no-decode): is this slice's Flex audio
+                // replaced by an external (KiwiSDR) source right now?
+                {QStringLiteral("externalReplacementActive"),
+                 s->externalReceiveReplacementActive()},
             });
         }
+        // Debug probe (ANT1-no-decode): the live Flex-payload suppression
+        // mask — bit N set means the drop gate is eating channel N's Flex
+        // DAX audio (feat/kiwi-audio-to-dax).
+        const quint32 extMask = ps->externalDaxSourceMask();
         return QJsonObject{{QStringLiteral("ok"), true},
                            {QStringLiteral("model"), model},
                            {QStringLiteral("channels"), channels},
+                           {QStringLiteral("externalDaxSourceMask"),
+                            static_cast<qint64>(extMask)},
+                           {QStringLiteral("externalDaxSourceMaskHex"),
+                            QStringLiteral("0x")
+                                + QString::number(extMask, 16)},
                            {QStringLiteral("slices"), sliceDax}};
     }
     if (model == QLatin1String("panstats")) {
