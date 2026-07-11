@@ -775,6 +775,25 @@ void MainWindow::kiwiSdrDaxStallTick()
     }
 }
 
+// Radio disconnect: RadioModel stages slices out WITHOUT emitting
+// sliceRemoved (they go to the stale-session store), so the event-driven
+// refresh never runs and the core-side mask reset in clearRegisteredStreams()
+// has no GUI-side sibling — the stall timer would keep injecting silence on
+// stale channels into a fully disconnected app. Reset here, from the same
+// disconnect hook that clears the other per-session Kiwi GUI state
+// (onConnectionStateChanged → clearKiwiSdrPanDisplaySourceOverrides).
+void MainWindow::resetKiwiSdrDaxSuppressionState()
+{
+    if (m_kiwiDaxStallTimer) {
+        m_kiwiDaxStallTimer->stop();
+    }
+    m_kiwiDaxLastAudioMs.clear();
+    m_kiwiDaxStalledChannels.clear();
+    // Channel latch is per-session state too (TciServer clears m_channelTrx
+    // on disconnect for the same reason): reconnect re-resolves from scratch.
+    m_kiwiDaxLatchedChannels.clear();
+}
+
 void MainWindow::clearKiwiSdrVirtualAntennaForSlice(int sliceId)
 {
     qCInfo(lcKiwiSdr).noquote()

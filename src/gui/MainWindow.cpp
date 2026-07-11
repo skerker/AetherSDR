@@ -5151,6 +5151,7 @@ void MainWindow::onConnectionStateChanged(bool connected)
         m_suppressStartupPanLayoutRearrange = false;
         m_layoutRestoreUntilMs = 0;
         clearKiwiSdrPanDisplaySourceOverrides();
+        resetKiwiSdrDaxSuppressionState();
         if (m_appletPanel) {
             m_appletPanel->clearSliceButtons();
         }

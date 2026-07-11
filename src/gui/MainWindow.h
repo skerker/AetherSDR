@@ -364,6 +364,7 @@ private:
     void routeKiwiSdrAudioToDax(const QString& profileId, const QByteArray& pcm);
     void refreshKiwiSdrDaxSuppression();
     void kiwiSdrDaxStallTick();
+    void resetKiwiSdrDaxSuppressionState();
     void updateKiwiSdrVirtualTrackingForSlice(SliceModel* slice);
     void updateKiwiSdrVirtualAudioControlsForSlice(SliceModel* slice);
     void updateKiwiSdrVirtualReceiverControlsForSlice(SliceModel* slice);
