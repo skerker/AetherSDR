@@ -609,6 +609,10 @@ RadioModel::RadioModel(QObject* parent)
         if (!isConnected()) return;
         sendCommand(QString("stream remove 0x%1").arg(streamId, 0, 16));
     });
+    // Seam forward for above-seam consumers (EB3) — Qt drops the trailing
+    // streamId argument.
+    connect(m_panStream, &PanadapterStream::daxStreamUnregistered,
+            this, &RadioModel::daxStreamUnregistered);
 
     // RadioConnection (created + owned by the backend above, on its own worker
     // thread #502 so TCP I/O never blocks paintEvent) — wire its signals to us.

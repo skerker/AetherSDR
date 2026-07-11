@@ -956,6 +956,14 @@ private:
     QHash<int, qint64> m_kiwiDaxLastAudioMs;
     QSet<int>          m_kiwiDaxStalledChannels;
     QTimer*            m_kiwiDaxStallTimer{nullptr};
+    // Suppression latch (mirrors TciServer::m_channelTrx, #3669): sliceId →
+    // the last DAX channel that slice held while Kiwi-fed. Keeps the
+    // suppression bit set through the radio's transient dax=0→N status
+    // rebroadcasts so Flex payload can't dual-feed the consumer mid-flip.
+    // Invalidated on clear/slice-removal (refresh prune), genuine stream
+    // release (RadioModel::daxStreamUnregistered), channel takeover by
+    // another slice, and disconnect (resetKiwiSdrDaxSuppressionState).
+    QHash<int, int>    m_kiwiDaxLatchedChannels;
     ReceivePresentationSync m_receivePresentationSync;
     ReceiveAudioDelayEstimator m_receiveAudioDelayEstimator;
     ReceivePresentationQueue<std::function<void()>> m_receivePresentationVisualQueue;

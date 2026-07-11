@@ -654,13 +654,53 @@ void MainWindow::routeKiwiSdrAudioToDax(const QString& profileId,
 // looking a particular slice up.
 void MainWindow::refreshKiwiSdrDaxSuppression()
 {
+    // Latch upkeep first: an entry whose slice is gone (removed — RadioModel
+    // has already dropped it) or no longer Kiwi-fed must not keep a bit alive.
+    for (auto it = m_kiwiDaxLatchedChannels.begin();
+         it != m_kiwiDaxLatchedChannels.end();) {
+        SliceModel* slice = m_radioModel.slice(it.key());
+        if (!slice || !slice->externalReceiveReplacementActive()) {
+            it = m_kiwiDaxLatchedChannels.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     quint32 mask = 0;
     for (SliceModel* slice : m_radioModel.slices()) {
-        if (slice && slice->externalReceiveReplacementActive()) {
-            const int channel = slice->daxChannel();
-            if (m_radioModel.isValidDaxChannel(channel)) {
-                mask |= (1u << channel);
+        if (!slice || !slice->externalReceiveReplacementActive()) {
+            continue;
+        }
+        const int channel = slice->daxChannel();
+        if (m_radioModel.isValidDaxChannel(channel)) {
+            // Latch on assignment: remember the resolved channel so the bit
+            // survives the radio's transient dax=0→N rebroadcast (the
+            // dual-feed window) — mirroring TciServer::m_channelTrx (#3669).
+            m_kiwiDaxLatchedChannels.insert(slice->sliceId(), channel);
+            mask |= (1u << channel);
+            continue;
+        }
+        const auto latched = m_kiwiDaxLatchedChannels.constFind(slice->sliceId());
+        if (latched == m_kiwiDaxLatchedChannels.constEnd()) {
+            continue;   // never resolved a channel — nothing to hold
+        }
+        // dax reads 0: either a transient rebroadcast (hold the bit — this is
+        // the latch's whole purpose) or the channel moved on. If another slice
+        // now owns the latched channel, holding the bit would suppress that
+        // slice's live Flex feed — the orphaned-bit defect this lifecycle work
+        // exists to prevent — so the latch yields to the new owner.
+        bool takenOver = false;
+        for (SliceModel* other : m_radioModel.slices()) {
+            if (other && other != slice
+                && other->daxChannel() == latched.value()) {
+                takenOver = true;
+                break;
             }
+        }
+        if (takenOver) {
+            m_kiwiDaxLatchedChannels.erase(latched);
+        } else {
+            mask |= (1u << latched.value());
         }
     }
     m_radioModel.setExternalDaxSourceMask(mask);
@@ -1691,6 +1731,27 @@ void MainWindow::wireKiwiSdr()
         // slice's mask bit.
         connect(&m_radioModel, &RadioModel::sliceRemoved,
                 this, [this](int) { refreshKiwiSdrDaxSuppression(); });
+        // The latch (m_kiwiDaxLatchedChannels) deliberately holds a bit
+        // through a slice's transient dax=0; a channel whose dax_rx stream is
+        // genuinely gone (grace-expiry release after WSJT-X exit, radio-side
+        // removal) must drop out of it here, or the held bit would suppress
+        // Flex DAX for the channel's next holder.
+        connect(&m_radioModel, &RadioModel::daxStreamUnregistered,
+                this, [this](int channel) {
+            bool dropped = false;
+            for (auto it = m_kiwiDaxLatchedChannels.begin();
+                 it != m_kiwiDaxLatchedChannels.end();) {
+                if (it.value() == channel) {
+                    it = m_kiwiDaxLatchedChannels.erase(it);
+                    dropped = true;
+                } else {
+                    ++it;
+                }
+            }
+            if (dropped) {
+                refreshKiwiSdrDaxSuppression();
+            }
+        });
         connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
                 this, [this](bool) { syncKiwiSdrTransmitMute(); });
         connect(&m_radioModel.transmitModel(), &TransmitModel::tuneChanged,

@@ -449,6 +449,12 @@ signals:
     void cwKeyDownChanged(bool down);
     void sliceAdded(SliceModel* slice);
     void sliceRemoved(int sliceId);
+    // Seam forward of PanadapterStream::daxStreamUnregistered (streamId
+    // dropped): fires when a dax_rx stream is genuinely gone — radio-side
+    // removal or the #3305 grace-expiry release — as opposed to a slice's
+    // dax binding transiently reading 0 during a status rebroadcast. GUI
+    // consumers (kiwi DAX suppression latch) key invalidation off this.
+    void daxStreamUnregistered(int channel);
     void metersChanged();
     void connectionError(const QString& msg);
     // Phase 2 of GHSA-wfx7-w6p8-4jr2 (#2951): forwarded from
