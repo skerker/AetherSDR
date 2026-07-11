@@ -721,7 +721,7 @@ void MainWindow::refreshKiwiSdrDaxSuppression()
             ++it;
         }
     }
-    for (int channel = 1; channel < 32; ++channel) {
+    for (int channel = 1; m_radioModel.isValidDaxChannel(channel); ++channel) {
         if ((mask & (1u << channel))
             && !m_kiwiDaxLastAudioMs.contains(channel)) {
             m_kiwiDaxLastAudioMs.insert(channel, now);
@@ -1712,12 +1712,6 @@ void MainWindow::wireKiwiSdr()
                                                 const QByteArray& pcm) {
                 audio->feedKiwiSdrAudioData(id, pcm);
             }, Qt::QueuedConnection);
-            // Also route the Kiwi audio onto its slice's DAX channel so WSJT-X
-            // (DAX/TCI) decodes the Kiwi, not the muted Flex. (feat/kiwi-audio-to-dax)
-            connect(m_kiwiSdrManager, &KiwiSdrManager::decodedAudioReady,
-                    this, [this](const QString& id, const QByteArray& pcm) {
-                routeKiwiSdrAudioToDax(id, pcm);
-            }, Qt::QueuedConnection);
             connect(m_kiwiSdrManager, &KiwiSdrManager::audioSourceEnabledChanged,
                     m_audio, [audio = m_audio](const QString& id, bool enabled) {
                 audio->setKiwiSdrAudioSourceEnabled(id, enabled);
@@ -1727,6 +1721,15 @@ void MainWindow::wireKiwiSdr()
                 audio->removeKiwiSdrAudioSource(id);
             }, Qt::QueuedConnection);
         }
+        // Route the Kiwi audio onto its slice's DAX channel so WSJT-X
+        // (DAX/TCI) decodes the Kiwi, not the muted Flex. Deliberately
+        // outside the if (m_audio) guard: DAX/TCI decode is independent of
+        // the local audio engine, and routeKiwiSdrAudioToDax never touches
+        // m_audio. (feat/kiwi-audio-to-dax)
+        connect(m_kiwiSdrManager, &KiwiSdrManager::decodedAudioReady,
+                this, [this](const QString& id, const QByteArray& pcm) {
+            routeKiwiSdrAudioToDax(id, pcm);
+        }, Qt::QueuedConnection);
         // Keep the DAX suppression mask event-driven (feat/kiwi-audio-to-dax):
         // a slice's DAX channel can (re)bind lazily (TCI audio_start) or drop
         // to 0 (WSJT-X exit) while no Kiwi audio is flowing, so the refresh
