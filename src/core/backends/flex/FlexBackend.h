@@ -62,6 +62,7 @@ public:
     void setSliceFrequency(int sliceId, double hz) override;
     void setSliceMode(int sliceId, const QString& mode) override;
     void setSliceFilter(int sliceId, int lowHz, int highHz) override;
+    void sendSliceWaveformCommand(int sliceId, const QString& command);
     void setKeying(bool key) override;
     void invokeExtension(const QString& ns, const QString& verb,
                          quint64 requestId, const QVariant& arg = {}) override;
@@ -134,7 +135,14 @@ public:
     // "amplifier <handle> model=TunerGeniusXL …" kv-sets) into a typed
     // TunerDelta and emit tunerChanged (aetherd 2.4 — TunerModel decode split,
     // #4092). Present-only, strict-parity with the prior TunerModel::applyStatus.
-    void decodeTunerStatus(const QMap<QString, QString>& kvs);
+    // `handle` is the (sanitized) TGXL object handle RadioModel extracted; it is
+    // cached here to source the tuner encode path (#4198).
+    void decodeTunerStatus(const QString& handle, const QMap<QString, QString>& kvs);
+    // Drop the cached amp/tuner encode handles (#4198). Called on radio
+    // disconnect/reset, where RadioModel clears the model-side presence outside
+    // the decode path — without this the stale handle could survive a reconnect
+    // to a *different* radio and be used to build a bogus relay command.
+    void clearExtensionHandles();
     void decodeApdSamplerStatus(const QMap<QString, QString>& kvs);
     // Decode the Flex GPS-status line ("gps …", '#'-separated key=value tokens)
     // into a present-only GpsDelta and emit gpsChanged (aetherd RFC 2.3 —
@@ -165,6 +173,14 @@ private:
     std::function<void(const QString&)> m_sink;
     std::function<void(const QString&)> m_sliceSink;
     std::function<QString()> m_modelProvider;
+
+    // Decode-side handle state (#4198). Captured from the amplifier/tgxl status
+    // decode and consumed by invokeExtension() to build the amp/tuner relay wire,
+    // so RadioModel no longer threads the Flex handle through the encode arg.
+    // Touched only on the main thread — both the decode (RadioModel::handleStatus)
+    // and the encode intent lambdas run there — so a plain QString needs no sync.
+    QString m_ampHandle;
+    QString m_tunerHandle;
 };
 
 }  // namespace AetherSDR

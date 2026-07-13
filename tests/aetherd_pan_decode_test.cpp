@@ -147,6 +147,40 @@ int main(int argc, char** argv)
             CHECK(f.value(QStringLiteral("wnb")).toBool() == true);
             CHECK(!f.contains(QStringLiteral("wnb_level")));   // guarded out
         }
+
+        // #4147 audit: wnb / wnb_updating mirror FlexLib's uint.TryParse +
+        // > 1 reject (Panadapter.cs 1226/1262) — malformed AND out-of-range
+        // values are dropped from the carry, not coerced to a bool. wnb_level
+        // additionally rejects > 100 and negatives (Panadapter.cs 1244) instead
+        // of leaving them to a model-side clamp.
+        backend.decodePanExtensions(QStringLiteral("0x40000000"),
+                                    {{QStringLiteral("wnb"), QStringLiteral("bogus")},
+                                     {QStringLiteral("wnb_updating"), QStringLiteral("5")},
+                                     {QStringLiteral("wnb_level"), QStringLiteral("150")}});
+        CHECK(spy.count() == 0);   // every key rejected → nothing to carry
+
+        backend.decodePanExtensions(QStringLiteral("0x40000000"),
+                                    {{QStringLiteral("wnb"), QStringLiteral("2")},
+                                     {QStringLiteral("wnb_level"), QStringLiteral("-5")},
+                                     {QStringLiteral("wnb_updating"), QStringLiteral("1")}});
+        CHECK(spy.count() == 1);   // wnb_updating alone survives
+        {
+            const QVariantMap f = spy.takeFirst().at(2).toMap();
+            CHECK(!f.contains(QStringLiteral("wnb")));         // 2 > 1 → dropped
+            CHECK(!f.contains(QStringLiteral("wnb_level")));   // negative → dropped
+            CHECK(f.value(QStringLiteral("wnb_updating")).toBool() == true);
+        }
+
+        // Boundary values still pass: wnb_level=100 is the FlexLib max.
+        backend.decodePanExtensions(QStringLiteral("0x40000000"),
+                                    {{QStringLiteral("wnb"), QStringLiteral("0")},
+                                     {QStringLiteral("wnb_level"), QStringLiteral("100")}});
+        CHECK(spy.count() == 1);
+        {
+            const QVariantMap f = spy.takeFirst().at(2).toMap();
+            CHECK(f.value(QStringLiteral("wnb")).toBool() == false);
+            CHECK(f.value(QStringLiteral("wnb_level")).toInt() == 100);
+        }
     }
 
     // ---- Facet 1c: DECODE (rfgain / antenna — universal) ----
@@ -307,6 +341,18 @@ int main(int argc, char** argv)
         PanadapterModel pan(QStringLiteral("0x40000000"));
         QSignalSpy info(&pan, &PanadapterModel::infoChanged);
 
+        // The numeric center default is only a placeholder until a normalized
+        // update arrives. An update equal to that default still marks it known
+        // and emits one edge so consumers can replace their fallback; repeated
+        // identical updates remain quiet (#3913 review).
+        CHECK(pan.centerKnown() == false);
+        pan.setCenterBandwidth(14.1, -1.0);
+        CHECK(pan.centerKnown() == true);
+        CHECK(info.count() == 1);
+        info.clear();
+        pan.setCenterBandwidth(14.1, -1.0);
+        CHECK(info.count() == 0);
+
         // Negative = "leave unchanged": bandwidth held, only center moves.
         const double origBw = pan.bandwidthMhz();
         pan.setCenterBandwidth(7.15, -1.0);
@@ -318,6 +364,17 @@ int main(int argc, char** argv)
         // No actual change → no emission.
         pan.setCenterBandwidth(7.15, -1.0);
         CHECK(info.count() == 0);
+
+        // Reconnect staging may retain the model object, but its old numeric
+        // center must not remain authoritative for TCI dds: in the new session.
+        pan.resetCenterKnownForReconnect();
+        CHECK(pan.centerKnown() == false);
+        CHECK(qFuzzyCompare(pan.centerMhz(), 7.15));
+        CHECK(info.count() == 0);
+        pan.setCenterBandwidth(7.15, -1.0);
+        CHECK(pan.centerKnown() == true);
+        CHECK(info.count() == 1);
+        info.clear();
 
         // setRange: NaN = "leave unchanged" (max held, only min moves); returns
         // whether anything changed (gates the setDbmRange side-effect).

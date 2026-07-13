@@ -32,11 +32,13 @@
 #include "MainWindowShortcutState.h"
 #include "core/AppSettings.h"
 #include "core/CwTrace.h"
+#include "core/DigitalVoiceFeature.h"
 #include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
 #include "models/SliceModel.h"
 
 #include <QAbstractSlider>
+#include <QJsonObject>
 #include <QToolTip>
 #include <QApplication>
 #include <QApplicationStateChangeEvent>
@@ -803,9 +805,9 @@ void MainWindow::registerShortcutActions()
     }
 
     // ── Mode ────────────────────────────────────────────────────────────
-    static const char* modes[] = {"USB", "LSB", "CW", "CWL", "AM", "SAM", "FM", "NFM", "DFM", "DIGU", "DIGL", "RTTY"};
-    for (const char* mode : modes) {
-        QString m = mode;
+    const QStringList modes = filterUnavailableDigitalVoiceModes(
+        {"USB", "LSB", "CW", "CWL", "AM", "SAM", "FM", "NFM", "DFM", "DSTR", "DIGU", "DIGL", "RTTY"});
+    for (const QString& m : modes) {
         m_shortcutManager.registerAction(
             QString("mode_%1").arg(m.toLower()), m, "Mode",
             QKeySequence(), [this, m]() {
@@ -998,6 +1000,13 @@ void MainWindow::registerShortcutActions()
         QKeySequence(Qt::Key_L), [this]() {
             auto* s = activeSlice();
             if (s) s->setLocked(!s->isLocked());
+        });
+    m_shortcutManager.registerAction("center_lock_toggle", "Center Lock Active Slice", "Tuning",
+        QKeySequence(), [this]() {
+            SliceModel* slice = activeSlice();
+            if (slice) {
+                setCenterLockForSlice(slice, !centerLockActiveForSlice(slice));
+            }
         });
 
     static constexpr double kPanZoomFactor = 1.5;

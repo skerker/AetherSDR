@@ -145,6 +145,7 @@
 #include "MeterSlider.h"
 #include "FramelessResizer.h"
 #include "FramelessWindowTitleBar.h"
+#include "FramelessMessageBox.h"
 
 #include <algorithm>
 #include <atomic>
@@ -213,6 +214,7 @@
 #include <QToolTip>
 #include <QMediaDevices>
 #include "core/AppSettings.h"
+#include "core/AutomationServer.h"
 #include "core/SpotCommandPolicy.h"
 #include "core/SpotModeResolver.h"
 #ifdef HAVE_RADE
@@ -1110,6 +1112,12 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::showPanadapterInterlockNotification);
 
     m_networkDiagnosticsHistory = new NetworkDiagnosticsHistory(&m_radioModel, m_audio, this);
+    connect(&m_radioModel, &RadioModel::digitalVoiceWaveformDegradationStarted,
+            this, [this](const QString& message) {
+        if (!message.isEmpty()) {
+            statusBar()->showMessage(message, 10000);
+        }
+    });
 
     // Local CW sidetone — every key source (serial, MIDI, TCI, CWX, HID)
     // funnels through RadioModel::sendCwKey/sendCwPaddle, which emits
@@ -1152,7 +1160,7 @@ MainWindow::MainWindow(QWidget* parent)
     m_updateChecker = new UpdateChecker(this);
     connect(m_updateChecker, &UpdateChecker::updateAvailable, this, [this](const QString& ver) {
         const QString current = QCoreApplication::applicationVersion();
-        QMessageBox box(this);
+        FramelessMessageBox box(this);
         box.setWindowTitle("AetherSDR Update Available");
         box.setIcon(QMessageBox::Information);
         box.setText(QString("AetherSDR v%1 is available.").arg(ver));
@@ -1170,16 +1178,17 @@ MainWindow::MainWindow(QWidget* parent)
             QDesktopServices::openUrl(QUrl(UpdateChecker::kReleasesPageUrl));
     });
     connect(m_updateChecker, &UpdateChecker::upToDate, this, [this](const QString& ver) {
-        QMessageBox::information(this, "Check for Updates",
+        FramelessMessageBox::information(this, "Check for Updates",
             QString("AetherSDR is up to date (v%1).").arg(ver));
     });
     connect(m_updateChecker, &UpdateChecker::checkFailed, this, [this]() {
-        QMessageBox::warning(this, "Check for Updates",
+        FramelessMessageBox::warning(this, "Check for Updates",
             "Could not reach GitHub. Check your connection and try again.");
     });
 
     buildMenuBar();
     buildUI();
+    loadCenterLockSettings();
 #ifdef Q_OS_WIN
     applyWindowsCustomFrame();
 #endif
@@ -1532,11 +1541,6 @@ MainWindow::MainWindow(QWidget* parent)
     // Overlay-menu antenna wiring is now per-pan in wirePanadapter() (#1260).
     // Antenna list and S-meter are now wired per-widget in onSliceAdded.
 
-    // ── Title bar: Pan Follow ────────────────────────────────────────────────
-    connect(m_titleBar, &TitleBar::panFollowToggled,
-            this, &MainWindow::setPanFollow);
-    if (m_titleBar->isPanFollowChecked()) setPanFollow(true);
-
     // ── Title bar: PC Audio, master volume, headphone volume ────────────────
     // The remote_audio_rx stream controls the radio's audio routing:
     // stream exists → audio to PC; stream removed → audio to radio speakers.
@@ -1589,6 +1593,12 @@ MainWindow::MainWindow(QWidget* parent)
     // Multi-Flex: show when another client is transmitting
     connect(&m_radioModel, &RadioModel::txOwnerChanged,
             m_titleBar, &TitleBar::setOtherClientTx);
+
+    // Status-bar transmit timer — runs only for operator MOX/PTT/VOX, never
+    // TCI/DAX (the model gates the source). Hidden idle; 15s hold + fade on
+    // unkey is handled inside TitleBar.
+    connect(&m_radioModel, &RadioModel::operatorTransmitChanged,
+            m_titleBar, &TitleBar::setOperatorTransmitting);
 
     // Multi-Flex: title bar indicator when other clients are connected
     connect(&m_radioModel, &RadioModel::otherClientsChanged,
@@ -2421,9 +2431,12 @@ void MainWindow::onEqCutoffsDragRequested(ClientEqApplet::Path path,
     const QString mode = s->mode();
     int lo = audioLo;
     int hi = audioHi;
-    if (mode == "LSB" || mode == "DIGL") {
+    if (mode == "LSB" || mode == "DIGL" || mode == "FDVL") {
         // Lower-sideband: filter offsets are negative; the audio low edge
-        // maps to the high (closest-to-zero) offset and vice versa.
+        // maps to the high (closest-to-zero) offset and vice versa. FDVL
+        // included since #3434 stores it canonically negative — the old
+        // pass-through sent positives that flip-flopped the overlay per
+        // drag step against the mirrored radio echo.
         lo = -audioHi;
         hi = -audioLo;
     } else if (mode == "AM" || mode == "SAM" || mode == "FM"
@@ -2635,6 +2648,22 @@ void MainWindow::wireRadioSetupDialogSignals(RadioSetupDialog* dlg, const QStrin
     if (!dlg) return;
     connect(dlg, &RadioSetupDialog::txBandSettingsRequested,
             m_txBandAction, &QAction::trigger);
+    // Agent automation bridge toggle (#3646). The dialog already persisted
+    // AutomationBridgeEnabled; here we act on it live. AETHER_AUTOMATION
+    // force-enables at launch and the dialog disables the toggle in that
+    // case, so a stop request can't arrive for an env-forced bridge.
+    connect(dlg, &RadioSetupDialog::automationBridgeToggled, this, [this](bool on) {
+        if (on) {
+            if (!startAutomationBridge())
+                qWarning() << "automation bridge failed to start (socket in use?)";
+        } else {
+            stopAutomationBridge();
+        }
+    });
+    connect(dlg, &RadioSetupDialog::automationBridgeTokenRotated, this,
+            [this](const QString& tok) { setAutomationBridgeToken(tok); });
+    connect(dlg, &RadioSetupDialog::automationBridgeTxAllowedChanged, this,
+            [this](bool allowed) { setAutomationTxAllowed(allowed); });
     // serialSettingsChanged is the "external-device settings changed" signal in
     // practice — the dialog emits it for serial-port, FlexControl, Ulanzi-dial,
     // and HID-encoder edits. The Ulanzi/HID branches below run regardless of
@@ -3017,6 +3046,14 @@ void MainWindow::closeEvent(QCloseEvent* event)
     m_tgxlConn.disconnect();
     m_pgxlConn.disconnect();
 
+    // Same reason as the TGXL/PGXL sockets above: the D-STAR helper is stopped
+    // by the queued RadioModel::connectionStateChanged(false) handler, which
+    // does not run during close (the event loop isn't pumped here). Without an
+    // explicit stop, quitting while the radio is connected orphans the helper
+    // subprocess — it keeps holding the ThumbDV serial port and can block the
+    // next AetherSDR launch from reacquiring it.
+    stopDigitalVoiceService(true);
+
     preparePanadapterUiForShutdown();
     auto& s = AppSettings::instance();
     s.setValue("MainWindowGeometry", saveGeometry().toBase64());
@@ -3336,6 +3373,21 @@ void MainWindow::toggleConnectionDialog()
 
     showConnectionDialog();
 }
+
+QJsonObject MainWindow::automationTxTimerSnapshot() const
+{
+    if (!m_titleBar)
+        return QJsonObject{{QStringLiteral("visible"), false},
+                           {QStringLiteral("running"), false}};
+    return QJsonObject::fromVariantMap(m_titleBar->txTimerState());
+}
+
+// The agent automation-bridge lifecycle (startAutomationBridge / stop /
+// isRunning / endpoint / setAutomationBridgeToken / setAutomationTxAllowed)
+// lives in MainWindow_Session.cpp with the rest of the session/subsystem
+// wiring — not in this monolith. automationTxTimerSnapshot above is the
+// per-frame status accessor and stays here with the other automation*
+// snapshot accessors.
 
 void MainWindow::showConnectionDialog()
 {
@@ -5013,9 +5065,11 @@ void MainWindow::onConnectionStateChanged(bool connected)
                     xvtrBands.append({x.name, x.rfFreq, QString("X%1").arg(x.index)});
             }
             const ModelCapabilities caps = m_radioModel.capabilities();
+            const QStringList declaredBands = m_radioModel.declaredBands();
             for (auto* applet : m_panStack->allApplets()) {
                 auto* menu = applet->spectrumWidget()->overlayMenu();
                 menu->setRadioCapabilities(caps);
+                menu->setDeclaredBands(declaredBands);
                 menu->setXvtrBands(xvtrBands);
             }
         };
@@ -5039,6 +5093,7 @@ void MainWindow::onConnectionStateChanged(bool connected)
             });
         }
 #endif
+        scheduleDigitalVoiceAutoStart();
         // Auto-connect DX cluster if enabled
         {
             auto& cs = AppSettings::instance();
@@ -5141,6 +5196,8 @@ void MainWindow::onConnectionStateChanged(bool connected)
         updateTMate2Status();
 #endif
     } else {
+        stopDigitalVoiceService(false);
+
         // Radio disconnected: trim CAT ports back to 1 so apps on channel A
         // stay connected through brief reconnects, higher channels stop cleanly.
         applyCatPortCount();  // catPortTargetCount() returns 1 when !connected
@@ -5248,6 +5305,32 @@ void MainWindow::onConnectionStateChanged(bool connected)
             }
         }
         m_wfLineDurationReconcile.clear();
+        for (auto it = m_panAverageReconcileConnections.begin();
+             it != m_panAverageReconcileConnections.end(); ++it) {
+            QObject::disconnect(it.value());
+        }
+        m_panAverageReconcileConnections.clear();
+        for (auto it = m_panWeightedAvgReconcileConnections.begin();
+             it != m_panWeightedAvgReconcileConnections.end(); ++it) {
+            QObject::disconnect(it.value());
+        }
+        m_panWeightedAvgReconcileConnections.clear();
+        for (auto it = m_panAverageReconcile.begin();
+             it != m_panAverageReconcile.end(); ++it) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+        }
+        m_panAverageReconcile.clear();
+        for (auto it = m_panWeightedAvgReconcile.begin();
+             it != m_panWeightedAvgReconcile.end(); ++it) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+        }
+        m_panWeightedAvgReconcile.clear();
         m_adaptiveThrottleActive = false;
         m_adaptiveFpsCap = 0;  // clear cap alongside throttle flag — see #2829 review
 
@@ -5681,8 +5764,22 @@ void MainWindow::applyMasterVolume(int pct)
 // onSliceAdded() / onSliceRemoved() lives in MainWindow_Wiring.cpp (#3351 Phase 1d).
 SliceModel* MainWindow::activeSlice() const
 {
-    if (m_activeSliceId < 0) return nullptr;
-    return m_radioModel.slice(m_activeSliceId);
+    SliceModel* cached = nullptr;
+    if (m_activeSliceId >= 0) {
+        cached = m_radioModel.slice(m_activeSliceId);
+        if (cached && cached->isActive()) {
+            return cached;
+        }
+    }
+    for (SliceModel* slice : m_radioModel.slices()) {
+        if (slice && slice->isActive()) {
+            return slice;
+        }
+    }
+    if (cached) {
+        return cached;
+    }
+    return nullptr;
 }
 
 void MainWindow::pushRxFilterCutoffsToEq()
@@ -5749,6 +5846,9 @@ void MainWindow::pushSliceFrequencyToOverlays(SliceModel* slice, double mhz)
     if (!slice) {
         return;
     }
+
+    mhz = centerLockDisplayFrequency(slice, mhz);
+    snapCenterLocksForTuningSlice(slice, mhz, true);
 
     const QString freqStr = vfoFrequencyText(mhz);
     auto pushOne = [this, mhz, &freqStr](SliceModel* s) {
@@ -5882,6 +5982,7 @@ void MainWindow::applyTuneRequest(SliceModel* slice, double mhz,
 #endif
     }
 
+    holdCenterLockTuneTarget(slice, mhz);
     pushSliceFrequencyToOverlays(slice, mhz);
 
     const BandStackPreselectResult bandPreselect =
@@ -5889,6 +5990,7 @@ void MainWindow::applyTuneRequest(SliceModel* slice, double mhz,
             ? preselectBandStackForTune(slice, mhz, source)
             : BandStackPreselectResult::NotNeeded;
     if (bandPreselect == BandStackPreselectResult::Unsupported) {
+        m_centerLockTuneHoldBySlice.remove(slice->sliceId());
         pushSliceFrequencyToOverlays(slice, oldFreqMhz);
         return;
     }
@@ -5900,6 +6002,7 @@ void MainWindow::applyTuneRequest(SliceModel* slice, double mhz,
             auto* pendingSlice = m_radioModel.slice(sliceId);
             if (!pendingSlice || pendingSlice->isLocked() || m_swrSweep.running)
                 return;
+            holdCenterLockTuneTarget(pendingSlice, mhz);
             pushSliceFrequencyToOverlays(pendingSlice, mhz);
             pendingSlice->tuneAndRecenter(mhz);
 
@@ -5922,6 +6025,48 @@ void MainWindow::applyTuneRequest(SliceModel* slice, double mhz,
             ? panFollowVfo(slice, mhz, source)
             : revealFrequencyIfNeeded(slice, mhz, intent, source);
     logTunePolicyDecision(source, intent, oldFreqMhz, mhz, result);
+}
+
+QJsonObject MainWindow::automationTune(double mhz)
+{
+    SliceModel* slice = activeSlice();
+    if (!slice) {
+        return QJsonObject{{QStringLiteral("ok"), false},
+                           {QStringLiteral("error"), QStringLiteral("no slice to tune")}};
+    }
+    if (slice->isLocked()) {
+        return QJsonObject{
+            {QStringLiteral("ok"), false},
+            {QStringLiteral("error"),
+             QStringLiteral("refused: slice %1 is VFO-locked").arg(slice->letter())}};
+    }
+    if (m_swrSweep.running) {
+        return QJsonObject{{QStringLiteral("ok"), false},
+                           {QStringLiteral("error"),
+                            QStringLiteral("refused: SWR sweep is running")}};
+    }
+
+    applyTuneRequest(slice, mhz, TuneIntent::IncrementalTune, "automation-tune");
+    return QJsonObject{{QStringLiteral("ok"), true},
+                       {QStringLiteral("tune"), mhz},
+                       {QStringLiteral("sliceId"), slice->sliceId()},
+                       {QStringLiteral("letter"), slice->letter()}};
+}
+
+QJsonObject MainWindow::automationSetCenterLock(int sliceId, bool enabled)
+{
+    SliceModel* slice = m_radioModel.slice(sliceId);
+    if (!slice) {
+        return QJsonObject{{QStringLiteral("ok"), false},
+                           {QStringLiteral("error"),
+                            QStringLiteral("no slice with id %1").arg(sliceId)}};
+    }
+
+    setCenterLockForSlice(slice, enabled);
+    return QJsonObject{{QStringLiteral("ok"), true},
+                       {QStringLiteral("slice"), QStringLiteral("centerlock")},
+                       {QStringLiteral("id"), sliceId},
+                       {QStringLiteral("enabled"), enabled}};
 }
 
 void MainWindow::applyPanRangeRequest(const QString& panId, double centerMhz,
@@ -6629,6 +6774,193 @@ void MainWindow::schedulePanFpsReconcile(const QString& panId, int reportedFps)
     state.timer->start();
 }
 
+void MainWindow::schedulePanAverageReconcile(const QString& panId, int reportedAverage)
+{
+    // FFT averaging is radio-authoritative (#4001): the firmware runs the
+    // averaging and echoes the level in pan status. After a global-profile /
+    // band switch the firmware adopts the profile's stored average, but the
+    // client never re-asserts the user's displayed level. Mirror the fps
+    // reconcile — reuse the profile-load write-hold + cooldown guards. Unlike
+    // fps, averaging is NOT adaptively throttled, so there is deliberately NO
+    // adaptive-throttle guard here. average=0 (off) is a VALID desired value, so
+    // guard on < 0 (the unknown sentinel), never <= 0.
+    if (panId.isEmpty() || reportedAverage < 0)
+        return;
+    if (profileLoadRadioStateWritesHeld()) {
+        qCDebug(lcProtocol).noquote().nospace()
+            << "MainWindow: average reconcile suppressed for profile load pan=" << panId
+            << " reported=" << reportedAverage;
+        return;
+    }
+
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan)
+        return;
+
+    auto& state = m_panAverageReconcile[panId];
+    if (!state.spectrum) {
+        if (auto* applet = m_panStack->panadapter(panId))
+            state.spectrum = applet->spectrumWidget();
+    }
+
+    auto* sw = state.spectrum.data();
+    if (!sw)
+        return;
+
+    const int desiredAverage = sw->fftAverage();
+    if (desiredAverage < 0)
+        return;
+    if (desiredAverage == reportedAverage) {
+        if (state.timer)
+            state.timer->stop();
+        state.lastSentMs = 0;
+        state.lastSentDesired = -1;
+        return;
+    }
+
+    if (!state.timer) {
+        state.timer = new QTimer(this);
+        state.timer->setSingleShot(true);
+        state.timer->setInterval(300);
+        connect(state.timer, &QTimer::timeout, this, [this, panId]() {
+            auto it = m_panAverageReconcile.find(panId);
+            if (it == m_panAverageReconcile.end())
+                return;
+
+            auto* pan = m_radioModel.panadapter(panId);
+            auto* sw = it->spectrum.data();
+            if (!sw) {
+                if (auto* applet = m_panStack->panadapter(panId)) {
+                    sw = applet->spectrumWidget();
+                    it->spectrum = sw;
+                }
+            }
+            if (!pan || !sw)
+                return;
+            if (profileLoadRadioStateWritesHeld()) {
+                qCDebug(lcProtocol).noquote().nospace()
+                    << "MainWindow: average timer suppressed for profile load pan=" << panId;
+                return;
+            }
+
+            const int reported = pan->average();
+            const int desired = sw->fftAverage();
+            if (reported < 0 || desired < 0 || reported == desired)
+                return;
+
+            constexpr qint64 kCooldownMs = 5000;
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (it->lastSentDesired == desired
+                && it->lastSentMs > 0
+                && now - it->lastSentMs < kCooldownMs) {
+                return;
+            }
+
+            qCDebug(lcProtocol).noquote().nospace()
+                << "MainWindow: reasserting panadapter average pan=" << panId
+                << " reported=" << reported
+                << " desired=" << desired;
+            m_radioModel.sendCommand(
+                QString("display pan set %1 average=%2").arg(panId).arg(desired));
+            it->lastSentMs = now;
+            it->lastSentDesired = desired;
+        });
+    }
+
+    state.timer->start();
+}
+
+void MainWindow::schedulePanWeightedAvgReconcile(const QString& panId, bool reportedWeighted)
+{
+    // weighted_average has the identical latent gap (#4001): a band switch via
+    // global profile adopts the profile's stored flag and the client never
+    // re-asserts the user's checkbox. Mirror the average reconcile; the wire
+    // field is a bool flag (weighted_average=0/1). No adaptive-throttle guard.
+    if (panId.isEmpty())
+        return;
+    if (profileLoadRadioStateWritesHeld()) {
+        qCDebug(lcProtocol).noquote().nospace()
+            << "MainWindow: weighted_average reconcile suppressed for profile load pan=" << panId
+            << " reported=" << reportedWeighted;
+        return;
+    }
+
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan)
+        return;
+
+    auto& state = m_panWeightedAvgReconcile[panId];
+    if (!state.spectrum) {
+        if (auto* applet = m_panStack->panadapter(panId))
+            state.spectrum = applet->spectrumWidget();
+    }
+
+    auto* sw = state.spectrum.data();
+    if (!sw)
+        return;
+
+    const bool desiredWeighted = sw->fftWeightedAvg();
+    if (desiredWeighted == reportedWeighted) {
+        if (state.timer)
+            state.timer->stop();
+        state.lastSentMs = 0;
+        state.lastSentDesired = -1;
+        return;
+    }
+
+    if (!state.timer) {
+        state.timer = new QTimer(this);
+        state.timer->setSingleShot(true);
+        state.timer->setInterval(300);
+        connect(state.timer, &QTimer::timeout, this, [this, panId]() {
+            auto it = m_panWeightedAvgReconcile.find(panId);
+            if (it == m_panWeightedAvgReconcile.end())
+                return;
+
+            auto* pan = m_radioModel.panadapter(panId);
+            auto* sw = it->spectrum.data();
+            if (!sw) {
+                if (auto* applet = m_panStack->panadapter(panId)) {
+                    sw = applet->spectrumWidget();
+                    it->spectrum = sw;
+                }
+            }
+            if (!pan || !sw)
+                return;
+            if (profileLoadRadioStateWritesHeld()) {
+                qCDebug(lcProtocol).noquote().nospace()
+                    << "MainWindow: weighted_average timer suppressed for profile load pan=" << panId;
+                return;
+            }
+
+            const bool reported = pan->weightedAverage();
+            const bool desired = sw->fftWeightedAvg();
+            if (reported == desired)
+                return;
+
+            constexpr qint64 kCooldownMs = 5000;
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            const int desiredInt = desired ? 1 : 0;
+            if (it->lastSentDesired == desiredInt
+                && it->lastSentMs > 0
+                && now - it->lastSentMs < kCooldownMs) {
+                return;
+            }
+
+            qCDebug(lcProtocol).noquote().nospace()
+                << "MainWindow: reasserting panadapter weighted_average pan=" << panId
+                << " reported=" << reported
+                << " desired=" << desired;
+            m_radioModel.sendCommand(
+                QString("display pan set %1 weighted_average=%2").arg(panId).arg(desiredInt));
+            it->lastSentMs = now;
+            it->lastSentDesired = desiredInt;
+        });
+    }
+
+    state.timer->start();
+}
+
 void MainWindow::scheduleWaterfallLineDurationReconcile(const QString& panId, int reportedMs)
 {
     if (panId.isEmpty() || reportedMs <= 0)
@@ -6765,6 +7097,36 @@ void MainWindow::wirePanReconcilers(PanadapterApplet* applet, PanadapterModel* p
         }));
     scheduleWaterfallLineDurationReconcile(applet->panId(),
                                            pan->waterfallLineDuration());
+
+    auto oldAverageConnection =
+        m_panAverageReconcileConnections.take(applet->panId());
+    if (oldAverageConnection)
+        QObject::disconnect(oldAverageConnection);
+
+    auto& averageState = m_panAverageReconcile[applet->panId()];
+    averageState.spectrum = sw;
+    m_panAverageReconcileConnections.insert(
+        applet->panId(),
+        connect(pan, &PanadapterModel::averageReported,
+                this, [this, panId = applet->panId()](int average) {
+            schedulePanAverageReconcile(panId, average);
+        }));
+    schedulePanAverageReconcile(applet->panId(), pan->average());
+
+    auto oldWeightedAvgConnection =
+        m_panWeightedAvgReconcileConnections.take(applet->panId());
+    if (oldWeightedAvgConnection)
+        QObject::disconnect(oldWeightedAvgConnection);
+
+    auto& weightedAvgState = m_panWeightedAvgReconcile[applet->panId()];
+    weightedAvgState.spectrum = sw;
+    m_panWeightedAvgReconcileConnections.insert(
+        applet->panId(),
+        connect(pan, &PanadapterModel::weightedAverageReported,
+                this, [this, panId = applet->panId()](bool weighted) {
+            schedulePanWeightedAvgReconcile(panId, weighted);
+        }));
+    schedulePanWeightedAvgReconcile(applet->panId(), pan->weightedAverage());
 }
 
 // wirePanadapter() / revealFrequencyIfNeeded() / panFollowVfo() / wireVfoWidget() lives in MainWindow_Wiring.cpp (#3351 Phase 1d).
@@ -6956,6 +7318,8 @@ SpectrumWidget* MainWindow::spectrum() const
 }
 
 // ── UI Scale helpers ────────────────────────────────────────────────────
+// Duplicated in AutomationServer::doScale (bridge can't include GUI
+// headers) — if a step is added here, add it there too.
 static constexpr int kScaleSteps[] = {75, 85, 100, 110, 125, 150, 175, 200};
 static constexpr int kScaleStepCount = sizeof(kScaleSteps) / sizeof(kScaleSteps[0]);
 
@@ -7115,6 +7479,17 @@ void MainWindow::toggleAppletPanelFloating(bool floating)
     }
 }
 
+void MainWindow::trackPersistentDialog(PersistentDialog* dialog)
+{
+    if (!dialog) {
+        return;
+    }
+    m_persistentDialogs.removeIf([dialog](const QPointer<PersistentDialog>& tracked) {
+        return tracked.isNull() || tracked.data() == dialog;
+    });
+    m_persistentDialogs.append(QPointer<PersistentDialog>(dialog));
+}
+
 void MainWindow::setFramelessWindow(bool on)
 {
     auto& s = AppSettings::instance();
@@ -7156,6 +7531,8 @@ void MainWindow::setFramelessWindow(bool on)
         m_appletPanel->containerManager()->setFramelessMode(on);
     if (m_connPanel)
         m_connPanel->setFramelessMode(on);
+    if (m_titleBar)
+        m_titleBar->setChildDialogsFramelessMode(on);
     // RadioSetupDialog frameless propagation flows through the
     // m_persistentDialogs loop below (#2781) — all four entry points use
     // showOrRaisePersistent so the dialog is always tracked there.
@@ -8456,79 +8833,6 @@ void MainWindow::onSpectrumReadyForSHistory(quint32 streamId, const QVector<floa
             PerfTelemetry::instance().recordSHistorySkipped();
         }
     }
-}
-
-// ─── Pan Follow ───────────────────────────────────────────────────────────────
-
-void MainWindow::setPanFollow(bool on)
-{
-    disconnect(m_panFollowConn);
-    disconnect(m_panFollowSliceConn);
-    m_panFollowActive = on;
-    // Toggling Pan Lock clears any drag-suppress state — a defensive reset in
-    // case a slice drag was ever abandoned without a mouse-release (e.g. the pane
-    // was removed mid-drag), which would otherwise leave Pan Follow suppressed.
-    m_sliceDragInProgress = false;
-
-    if (!on) return;
-
-    // Re-attach helper: wires frequency tracking to whichever slice 0
-    // is currently live. Called on activation and whenever slice 0 is
-    // recreated (radio reconnect, slice re-assignment, etc.).
-    auto attachToSlice0 = [this]() {
-        disconnect(m_panFollowConn);
-
-        auto* s = m_radioModel.slice(0);
-        if (!s) {
-            // No slice yet — uncheck the button so UI matches reality.
-            if (m_titleBar) m_titleBar->setPanFollowChecked(false);
-            return;
-        }
-
-        recenterPanFollowOnSlice0();
-        m_panFollowConn = connect(s, &SliceModel::frequencyChanged,
-                                  this, [this](double) { recenterPanFollowOnSlice0(); });
-    };
-
-    attachToSlice0();
-
-    // Re-attach whenever a new slice 0 appears (reconnect / re-assignment).
-    m_panFollowSliceConn = connect(&m_radioModel, &RadioModel::sliceAdded,
-        this, [this, attachToSlice0](SliceModel* s) {
-            if (s && s->sliceId() == 0) attachToSlice0();
-        });
-}
-
-// Pan Follow ("Pan Lock"): recenter the panadapter on Slice A (slice 0). Called
-// on enable, on every slice-0 frequency change, and once when a slice drag ends.
-void MainWindow::recenterPanFollowOnSlice0()
-{
-    if (!m_panFollowActive) return;   // Pan Lock off — never move the pan
-    // A slice is being dragged (in-window tune or edge auto-pan): the drag owns
-    // the pan center, so stand down rather than fight it with a per-tick recenter
-    // (that conflict caused ~0.33 MHz pan lurches + jumping). The drag-end handler
-    // calls this once with the flag cleared, so Pan Lock re-asserts on release.
-    // (user-reported)
-    if (m_sliceDragInProgress) return;
-    auto* s = m_radioModel.slice(0);
-    if (!s) return;
-    const QString panId = s->panId();
-    if (panId.isEmpty()) return;
-    // WFM holds its pan fixed: Doppler rides the demodulator's NCO, and
-    // recentring underneath it would desync the NCO offset until the next slice
-    // retune. While WFM is active on this pan, WFM wins and Pan Follow stands
-    // down. (Precedence is a UX call — flagged for maintainer review in the WFM PR.)
-    if (m_wfmSliceId >= 0) {
-        auto* wfmSlice = m_radioModel.slice(m_wfmSliceId);
-        if (wfmSlice && wfmSlice->panId() == panId) return;
-    }
-    const double freq = s->frequency();
-    auto* pan = m_radioModel.panadapter(panId);
-    if (pan && qFuzzyCompare(pan->centerMhz(), freq)) return;
-    const QString freqStr = QString::number(freq, 'f', 6);
-    if (pan) pan->setCenterBandwidth(freq, -1.0);  // aetherd RFC 2.3
-    m_radioModel.sendCommand(
-        QString("display pan set %1 center=%2").arg(panId, freqStr));
 }
 
 } // namespace AetherSDR

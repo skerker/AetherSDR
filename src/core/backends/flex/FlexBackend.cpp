@@ -4,6 +4,7 @@
 
 #include <QThread>
 
+#include "core/LogManager.h"
 #include "core/RadioConnection.h"
 #include "core/PanadapterStream.h"
 #include "core/backends/flex/FlexKvCarry.h"
@@ -14,6 +15,23 @@ namespace AetherSDR {
 // Shared present-only + ok-guarded Flex status carriers (#4070), used by the
 // pan/slice/meter/transmit decoders below (one overloaded carry() family).
 using namespace flexkv;
+
+namespace {
+
+QStringList uniqueCommaList(const QString& value)
+{
+    QStringList result;
+    const QStringList parts = value.split(',', Qt::SkipEmptyParts);
+    for (const QString& part : parts) {
+        const QString item = part.trimmed();
+        if (!item.isEmpty() && !result.contains(item)) {
+            result.append(item);
+        }
+    }
+    return result;
+}
+
+} // namespace
 
 FlexBackend::FlexBackend(QObject* parent)
     : IRadioBackend(parent)
@@ -130,11 +148,11 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.canTransmit = true;
     caps.hasTuner = true;
 
-    // Advertise NO extension namespaces yet: no flex verb is routed through the
-    // seam, and invokeExtension() can't produce a reply. Advertising "flex"
-    // would let a client pre-check the namespace and then hang awaiting an
-    // extensionResult/Error that never comes. "flex" is declared here when the
-    // first amp/tuner/DAX verb converts.
+    // Advertise the "flex" extension namespace: the amp/tuner operate/bypass/
+    // autotune verbs are now routed through invokeExtension() (#4092/#4094), and
+    // it honors the async contract — an awaited call (requestId != 0) always
+    // gets exactly one extensionResult/Error, never a hang.
+    caps.extensionNamespaces << QStringLiteral("flex");
     return caps;
 }
 
@@ -175,6 +193,16 @@ void FlexBackend::setSliceFilter(int sliceId, int lowHz, int highHz)
     sendSlice(QStringLiteral("filt %1 %2 %3").arg(sliceId).arg(lowHz).arg(highHz));
 }
 
+void FlexBackend::sendSliceWaveformCommand(int sliceId, const QString& command)
+{
+    if (sliceId < 0 || command.trimmed().isEmpty()) {
+        return;
+    }
+    sendSlice(QStringLiteral("slice waveform_cmd %1 %2")
+                  .arg(sliceId)
+                  .arg(command));
+}
+
 void FlexBackend::setKeying(bool key)
 {
     // Keying is only translated here; the interlock/authorization decision is
@@ -182,17 +210,48 @@ void FlexBackend::setKeying(bool key)
     send(QStringLiteral("xmit %1").arg(key ? 1 : 0));
 }
 
-void FlexBackend::invokeExtension(const QString& /*ns*/, const QString& /*verb*/,
-                                  quint64 requestId, const QVariant& /*arg*/)
+void FlexBackend::invokeExtension(const QString& ns, const QString& verb,
+                                  quint64 requestId, const QVariant& arg)
 {
-    // No flex extension verbs are routed through the seam yet. Honor the async
-    // contract by construction: a caller awaiting a reply (requestId != 0) gets
-    // an error, never a hang. Real verbs land with the amp/tuner/DAX touchpoint
-    // conversions.
-    if (requestId != 0) {
-        emit extensionError(requestId,
-                            QStringLiteral("flex: no extension verbs implemented"));
+    // Translate a neutral amp/tuner intent (#4092/#4094) into the SmartSDR relay
+    // wire. The device object handle is a Flex detail resolved from this backend's
+    // own decode-side state (m_ampHandle/m_tunerHandle, #4198) — the intent no
+    // longer carries it. Async contract: an awaited call (requestId != 0) gets
+    // exactly one reply, never a hang.
+    const auto fail = [&](const QString& why) {
+        if (requestId != 0)
+            emit extensionError(requestId, why);
+    };
+    if (ns != QLatin1String("flex")) {
+        fail(QStringLiteral("unknown extension namespace: %1").arg(ns));
+        return;
     }
+
+    const bool on = arg.toMap().value(QStringLiteral("on")).toBool();
+    QString cmd;
+    if (verb == QLatin1String("amp.operate")) {
+        if (m_ampHandle.isEmpty()) { fail(QStringLiteral("flex amp.operate: no amp handle")); return; }
+        cmd = QStringLiteral("amplifier set %1 operate=%2").arg(m_ampHandle).arg(on ? 1 : 0);
+    } else if (verb == QLatin1String("tuner.operate")) {
+        if (m_tunerHandle.isEmpty()) { fail(QStringLiteral("flex tuner.operate: no tuner handle")); return; }
+        cmd = QStringLiteral("tgxl set handle=%1 mode=%2").arg(m_tunerHandle).arg(on ? 1 : 0);
+    } else if (verb == QLatin1String("tuner.bypass")) {
+        if (m_tunerHandle.isEmpty()) { fail(QStringLiteral("flex tuner.bypass: no tuner handle")); return; }
+        cmd = QStringLiteral("tgxl set handle=%1 bypass=%2").arg(m_tunerHandle).arg(on ? 1 : 0);
+    } else if (verb == QLatin1String("tuner.autotune")) {
+        if (m_tunerHandle.isEmpty()) { fail(QStringLiteral("flex tuner.autotune: no tuner handle")); return; }
+        cmd = QStringLiteral("tgxl autotune handle=%1").arg(m_tunerHandle);
+    } else {
+        fail(QStringLiteral("unknown flex verb: %1").arg(verb));
+        return;
+    }
+
+    send(cmd);
+    // Fire-and-forget on the wire: the real device state returns asynchronously
+    // via the amplifier/tgxl status decode. Acknowledge dispatch so an awaiting
+    // caller (requestId != 0) completes; our own RadioModel routes pass 0.
+    if (requestId != 0)
+        emit extensionResult(requestId, QVariant(true));
 }
 
 void FlexBackend::decodePanCenterBandwidth(const QString& panId,
@@ -303,6 +362,8 @@ void FlexBackend::decodePanState(const QString& panId,
     carry(kvs, "loopa", st);
     carry(kvs, "loopb", st);
     carry(kvs, "fps", st);
+    carry(kvs, "average", st);
+    carry(kvs, "weighted_average", st);
     carry(kvs, "pre", st);
     carry(kvs, "daxiq_channel", st);
     carry(kvs, "client_handle", st);
@@ -323,29 +384,51 @@ void FlexBackend::decodePanExtensions(const QString& panId,
 {
     // WNB (wideband noise blanker) is a Flex-specific pan feature, not core
     // profile — carry only the keys the wire reported, namespaced under "flex".
+    // All three keys mirror FlexLib's guarded parses (#4147 audit): a malformed
+    // or out-of-range value is dropped from the carry (the model keeps
+    // last-known-good), never coerced to false/0.
     QVariantMap wnb;
     if (kvs.contains(QStringLiteral("wnb"))) {
-        wnb.insert(QStringLiteral("wnb"),
-                   kvs.value(QStringLiteral("wnb")).toInt() != 0);
+        // FlexLib Panadapter.cs:1226 — uint.TryParse + reject > 1, skip on
+        // failure. Bare toInt() != 0 turned "wnb=bogus" into false and could
+        // silently switch the noise blanker indicator off.
+        bool ok = false;
+        const uint v = kvs.value(QStringLiteral("wnb")).toUInt(&ok);
+        if (ok && v <= 1) {
+            wnb.insert(QStringLiteral("wnb"), v != 0);
+        } else {
+            qCDebug(lcProtocol) << "FlexBackend: invalid wnb value"
+                                << kvs.value(QStringLiteral("wnb"));
+        }
     }
     if (kvs.contains(QStringLiteral("wnb_level"))) {
-        // Guard the numeric parse: a malformed/non-numeric wnb_level must be
-        // ignored, not applied as 0. The old inline applyPanStatus path did
-        // exactly this (toInt(&ok) + if(ok)), mirroring FlexLib's own
-        // uint.TryParse + skip-on-failure (Panadapter.cs:1244). Dropping the
-        // guard would silently snap the WNB-level UI to 0 (Principle VII).
+        // FlexLib Panadapter.cs:1244 — uint.TryParse (negatives fail to parse)
+        // + reject > 100, skip on failure: an out-of-range level keeps the last
+        // known-good value rather than being clamped into range (the old signed
+        // toInt(&ok) accepted negatives and left > 100 to a model-side clamp,
+        // fabricating levels FlexLib refuses; Principle VII).
         bool ok = false;
-        const int level = kvs.value(QStringLiteral("wnb_level")).toInt(&ok);
-        if (ok) {
-            wnb.insert(QStringLiteral("wnb_level"), level);
+        const uint level = kvs.value(QStringLiteral("wnb_level")).toUInt(&ok);
+        if (ok && level <= 100) {
+            wnb.insert(QStringLiteral("wnb_level"), int(level));
+        } else {
+            qCDebug(lcProtocol) << "FlexBackend: invalid wnb_level value"
+                                << kvs.value(QStringLiteral("wnb_level"));
         }
     }
     if (kvs.contains(QStringLiteral("wnb_updating"))) {
         // FlexLib v4.2.18 exposes wnb_updating on display pan status while the
         // radio normalizes the SCU-level WNB threshold; it is distinct from the
-        // per-pan WNB enable flag ("wnb") above — keep them separate.
-        wnb.insert(QStringLiteral("wnb_updating"),
-                   kvs.value(QStringLiteral("wnb_updating")).toInt() != 0);
+        // per-pan WNB enable flag ("wnb") above — keep them separate. Same
+        // guarded parse as wnb (Panadapter.cs:1262, uint.TryParse + > 1 reject).
+        bool ok = false;
+        const uint v = kvs.value(QStringLiteral("wnb_updating")).toUInt(&ok);
+        if (ok && v <= 1) {
+            wnb.insert(QStringLiteral("wnb_updating"), v != 0);
+        } else {
+            qCDebug(lcProtocol) << "FlexBackend: invalid wnb_updating value"
+                                << kvs.value(QStringLiteral("wnb_updating"));
+        }
     }
     if (!wnb.isEmpty()) {
         wnb.insert(QStringLiteral("panId"), panId);
@@ -432,8 +515,9 @@ void FlexBackend::decodeSliceStatus(int sliceId, const QMap<QString, QString>& k
     carry(kvs, "mode", d.mode);
     carry(kvs, "filter_lo", d.filterLow);
     carry(kvs, "filter_hi", d.filterHigh);
-    if (kvs.contains(QStringLiteral("mode_list")))
-        d.modeList = kvs.value(QStringLiteral("mode_list")).split(',', Qt::SkipEmptyParts);
+    if (kvs.contains(QStringLiteral("mode_list"))) {
+        d.modeList = uniqueCommaList(kvs.value(QStringLiteral("mode_list")));
+    }
 
     // Core state
     carry(kvs, "active", d.active);
@@ -635,14 +719,25 @@ void FlexBackend::decodeAmplifierStatus(const QString& handle, const QString& mo
     // Stateless translation of the SmartSDR "amplifier <handle> …" wire → AmpDelta
     // (#4094). The presence latch, operate change-gating, and handle matching are
     // the model's job (AmpModel::applyChanges) — this only reports what the wire
-    // said. Command/encode is not here (stays AmpModel::commandReady, step 3).
+    // said. Command/encode is the reverse path — invokeExtension("flex",
+    // "amp.operate", …) below translates AmpModel's neutral intent (#4094).
     AmpDelta d;
     d.handle = handle;
     if (removed) {
+        // Drop the cached handle for the encode path (#4198) when the device it
+        // names goes away. TGXL removal also arrives on the amplifier-removed
+        // wire (routed here by RadioModel), so clear whichever handle matches.
+        if (handle == m_ampHandle) m_ampHandle.clear();
+        if (handle == m_tunerHandle) m_tunerHandle.clear();
         d.removed = true;
         emit amplifierChanged(d);
         return;
     }
+    // RadioModel routes only power amps (PGXL) into this decode, so the handle is
+    // the amp's — cache it for the encode path (#4198). Ignore the placeholder
+    // handle a first status can carry before the real one is assigned.
+    if (!handle.isEmpty() && handle != QLatin1String("0x00000000"))
+        m_ampHandle = handle;
     // A non-empty, non-TGXL model marks a power amp (PGXL); the TunerGeniusXL is
     // the tuner and routes to TunerModel, not here.
     if (!model.isEmpty() && model != QLatin1String("TunerGeniusXL")) {
@@ -663,8 +758,13 @@ void FlexBackend::decodeAmplifierStatus(const QString& handle, const QString& mo
     emit amplifierChanged(d);
 }
 
-void FlexBackend::decodeTunerStatus(const QMap<QString, QString>& kvs)
+void FlexBackend::decodeTunerStatus(const QString& handle, const QMap<QString, QString>& kvs)
 {
+    // Cache the TGXL handle for the encode path (#4198). RadioModel passes the
+    // handle it already extracted+sanitized (never the 0x00000000 placeholder),
+    // so the tuner intents no longer carry a Flex identifier through the seam.
+    if (!handle.isEmpty() && handle != QLatin1String("0x00000000"))
+        m_tunerHandle = handle;
     // Present-only, strict parity with the prior TunerModel::applyStatus: bools
     // are "1"-equality, ints are unguarded toInt() (matching val.toInt()), text
     // is verbatim. The change-gating / edge signals live in TunerModel::applyChanges.
@@ -692,6 +792,14 @@ void FlexBackend::decodeTunerStatus(const QMap<QString, QString>& kvs)
     if (kvs.contains(QStringLiteral("one_by_three")))
         d.oneByThree = (kvs.value(QStringLiteral("one_by_three")) == QLatin1String("1"));
     emit tunerChanged(d);
+}
+
+void FlexBackend::clearExtensionHandles()
+{
+    // #4198: forget the amp/tuner encode handles on disconnect/reset so a stale
+    // handle can't survive into a reconnect (possibly a different radio).
+    m_ampHandle.clear();
+    m_tunerHandle.clear();
 }
 
 void FlexBackend::decodeApdStatus(const QMap<QString, QString>& kvs)
@@ -742,6 +850,7 @@ void FlexBackend::decodeRadioStatus(const QMap<QString, QString>& kvs)
     carry(kvs, "nickname", d.nickname);
     carry(kvs, "region", d.region);
     carry(kvs, "radio_options", d.radioOptions);
+    carry(kvs, "bands", d.bandsRaw);   // optional radio-declared bands (gateway/non-Flex); validated in RadioModel
     // Global flags
     carry(kvs, "remote_on_enabled", d.remoteOnEnabled);
     carry(kvs, "mf_enable", d.multiFlexEnabled);

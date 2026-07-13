@@ -22,6 +22,7 @@
 #include "MainWindowHelpers.h"
 #include "core/AppSettings.h"
 #include "core/CwTrace.h"
+#include "core/DigitalVoiceFeature.h"
 #include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
 #include "core/MidiSettings.h"
@@ -1749,6 +1750,17 @@ void MainWindow::registerMidiParams()
         [this](float v) { if (auto* s = activeSlice()) s->setLocked(v > 0.5f); },
         [this]() -> float { auto* s = activeSlice(); return s && s->isLocked() ? 1 : 0; });
 
+    reg("rx.centerLock", "Center Lock", "RX", P::Toggle, 0, 1,
+        [this](float v) {
+            if (SliceModel* slice = activeSlice()) {
+                setCenterLockForSlice(slice, v > 0.5f);
+            }
+        },
+        [this]() -> float {
+            SliceModel* slice = activeSlice();
+            return centerLockActiveForSlice(slice) ? 1 : 0;
+        });
+
     reg("rx.ritEnable", "RIT Enable", "RX", P::Toggle, 0, 1,
         [this](float v) { if (auto* s = activeSlice()) s->setRit(v > 0.5f, s->ritFreq()); },
         [this]() -> float { auto* s = activeSlice(); return s && s->ritOn() ? 1 : 0; });
@@ -1991,11 +2003,11 @@ void MainWindow::registerMidiParams()
     };
 
     // ── Mode triggers (mirror Mode/* keyboard shortcuts) ───────────────
-    static const char* kModes[] = {"USB", "LSB", "CW", "CWL",
-                                    "AM", "SAM", "FM", "NFM",
-                                    "DFM", "DIGU", "DIGL", "RTTY"};
-    for (const char* m : kModes) {
-        const QString idShort = QString("mode_%1").arg(QString(m).toLower());
+    const QStringList modes = filterUnavailableDigitalVoiceModes(
+        {"USB", "LSB", "CW", "CWL", "AM", "SAM", "FM", "NFM",
+         "DFM", "DSTR", "DIGU", "DIGL", "RTTY"});
+    for (const QString& m : modes) {
+        const QString idShort = QString("mode_%1").arg(m.toLower());
         const QString idMidi  = QString("global.mode%1").arg(m);
         const QString name    = QString("Mode %1").arg(m);
         reg(idMidi.toUtf8().constData(),
@@ -2060,19 +2072,20 @@ void MainWindow::registerMidiParams()
         [cycleBand](float) { cycleBand(-1); });
 
     // ── Mode Up / Down (cycle through the mode list above) ───────────
-    static constexpr int kModeCount =
-        static_cast<int>(sizeof(kModes) / sizeof(const char*));
-    auto cycleMode = [this, fireShortcut](int direction) {
+    auto cycleMode = [this, fireShortcut, modes](int direction) {
         // Find current mode index from the active slice; if no match, start at 0.
         int currentIdx = 0;
         if (auto* s = activeSlice()) {
             const QString curMode = s->mode().toUpper();
-            for (int i = 0; i < kModeCount; ++i) {
-                if (curMode == QLatin1String(kModes[i])) { currentIdx = i; break; }
+            for (int i = 0; i < modes.size(); ++i) {
+                if (curMode == modes[i]) {
+                    currentIdx = i;
+                    break;
+                }
             }
         }
-        const int next = (currentIdx + direction + kModeCount) % kModeCount;
-        const QString idShort = QString("mode_%1").arg(QString(kModes[next]).toLower());
+        const int next = (currentIdx + direction + modes.size()) % modes.size();
+        const QString idShort = QString("mode_%1").arg(modes[next].toLower());
         fireShortcut(idShort.toUtf8().constData());
     };
     reg("global.modeUp", "Mode Up", "Global", P::Trigger, 0, 1,
