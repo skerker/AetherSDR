@@ -4,11 +4,13 @@
 
 #include <QMap>
 
+class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
 class QCheckBox;
 class QTabWidget;
+class QTimer;
 
 namespace AetherSDR {
 
@@ -25,6 +27,7 @@ private:
                              const QString& active);
     QWidget* buildAutoSaveTab();
     void refreshTab(const QString& type);
+    void onGlobalSaveResult(const QString& name, int code, const QString& body);
 
     RadioModel* m_model;
     QTabWidget* m_tabs;
@@ -40,6 +43,11 @@ private:
     QMap<QString, TabWidgets> m_tabWidgets;
 
     QCheckBox* m_autoSaveTx{nullptr};
+
+    // Global-tab save feedback (#4362). TX/Mic don't need it — their
+    // Create path already reports via the QMessageBox flows above.
+    QLabel* m_globalSaveStatus{nullptr};
+    QTimer* m_globalSaveStatusTimer{nullptr};
 };
 
 } // namespace AetherSDR

@@ -12,7 +12,9 @@
 #include <QCheckBox>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPointer>
 #include <QSignalBlocker>
+#include <QTimer>
 
 namespace AetherSDR {
 
@@ -101,8 +103,12 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     auto* page = new QWidget;
     auto* vbox = new QVBoxLayout(page);
 
-    // New profile name entry
+    // New profile name entry. objectNames on the save-path controls so the
+    // automation bridge can address them (#4362 test evidence).
+    QString typeCap = type;
+    typeCap[0] = typeCap[0].toUpper();
     auto* nameEdit = new QLineEdit;
+    nameEdit->setObjectName(QString("profile%1NameEdit").arg(typeCap));
     nameEdit->setPlaceholderText("New Profile Name");
     vbox->addWidget(nameEdit);
 
@@ -115,6 +121,7 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     auto* loadBtn = new QPushButton("Load");
     const bool isGlobal = (type == "global");
     auto* saveBtn = new QPushButton(isGlobal ? "Save" : "Create");
+    saveBtn->setObjectName(QString("profile%1SaveButton").arg(typeCap));
     auto* deleteBtn = new QPushButton("Delete");
 
     loadBtn->setEnabled(false);
@@ -124,6 +131,26 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
     btnRow->addWidget(saveBtn);
     btnRow->addWidget(deleteBtn);
     vbox->addLayout(btnRow);
+
+    if (isGlobal) {
+        // Save-result feedback (#4362): transient confirmation on success;
+        // failures get a QMessageBox in onGlobalSaveResult. Always in the
+        // layout (cleared, not hidden) so the tab doesn't reflow.
+        m_globalSaveStatus = new QLabel;
+        m_globalSaveStatus->setObjectName(
+            QStringLiteral("profileGlobalSaveStatus"));
+        m_globalSaveStatus->setStyleSheet(
+            QString("QLabel { color: %1; font-size: 11px; min-height: 14px; }")
+                .arg(ThemeManager::instance().value(
+                    QStringLiteral("color.accent.success"))));
+        vbox->addWidget(m_globalSaveStatus);
+
+        m_globalSaveStatusTimer = new QTimer(this);
+        m_globalSaveStatusTimer->setSingleShot(true);
+        m_globalSaveStatusTimer->setInterval(4000);
+        connect(m_globalSaveStatusTimer, &QTimer::timeout,
+                m_globalSaveStatus, &QLabel::clear);
+    }
 
     if (!isGlobal) {
         auto* note = new QLabel(
@@ -196,7 +223,18 @@ QWidget* ProfileManagerDialog::buildProfileTab(const QString& type,
         if (name.isEmpty()) return;
 
         if (type == "global") {
-            m_model->sendCommand(QString("profile global save \"%1\"").arg(name));
+            // #4362 — send with a response callback so the R-line result
+            // drives feedback; a fire-and-forget save made a refused
+            // overwrite indistinguishable from a success. The name field
+            // clears only on a confirmed save (see onGlobalSaveResult).
+            QPointer<ProfileManagerDialog> self(this);
+            m_model->sendCmdPublic(
+                QString("profile global save \"%1\"").arg(name),
+                [self, name](int code, const QString& body) {
+                    if (self)
+                        self->onGlobalSaveResult(name, code, body);
+                });
+            return;
         } else {
             bool exists = false;
             for (int i = 0; i < list->count(); ++i) {
@@ -309,6 +347,31 @@ QWidget* ProfileManagerDialog::buildAutoSaveTab()
     vbox->addStretch();
 
     return page;
+}
+
+void ProfileManagerDialog::onGlobalSaveResult(const QString& name, int code,
+                                              const QString& body)
+{
+    if (code == 0) {
+        if (m_tabWidgets.contains("global"))
+            m_tabWidgets["global"].nameEdit->clear();
+        if (m_globalSaveStatus) {
+            m_globalSaveStatus->setText(
+                QString("Profile \"%1\" saved").arg(name));
+            m_globalSaveStatusTimer->start();
+        }
+        return;
+    }
+
+    // Radio refused the save. Keep the name field intact so the user can
+    // retry, and surface the radio's own message when it sent one.
+    QString detail = body.simplified();
+    if (detail.isEmpty())
+        detail = "The radio rejected the save.";
+    QMessageBox::warning(this, "Profile Save Failed",
+        QString("Could not save profile \"%1\".\n\n%2 (code 0x%3)")
+            .arg(name, detail,
+                 QString::number(static_cast<quint32>(code), 16).toUpper()));
 }
 
 void ProfileManagerDialog::refreshTab(const QString& type)
