@@ -588,6 +588,12 @@ signals:
     // must be re-established from this.
     void panadapterReclaimed(PanadapterModel* pan);
     void panadapterRemoved(const QString& panId);
+    // Brackets the actual wire dispatch of a radio-authoritative band-stack
+    // recall. Unlike requestPanBand(), these signals fire after any profile-
+    // load deferral, so clients can order dependent radio commands around the
+    // real `display pan set ... band=...` write.
+    void panBandAboutToDispatch(const QString& panId);
+    void panBandDispatchFailed(const QString& panId);
     // Emitted when createPanadapter() is blocked because the radio's pan limit is reached.
     void panadapterLimitReached(int limit, const QString& model);
     // Emitted when the radio rejects a slice create command (e.g. limit reached across
@@ -1157,6 +1163,11 @@ private:
     QSet<quint32> m_deadDaxRxSeen;
     QSet<quint32> m_externalDaxTxSeen;
     QSet<quint32> m_externalDaxRxSeen;
+    // #1439 nudge one-shot (#4383): stream ids we have already re-asserted
+    // `slice set dax=` for. Armed on nudge send, cleared only on a real
+    // `stream remove` (unregisterDaxStream). Stops the radio's own transient
+    // empty-slice= unbind echo from re-triggering the nudge → #4009 storm.
+    QSet<quint32> m_nudgedDaxStreams;
     WanConnection* m_wanConn{nullptr};  // non-null when connected via SmartLink
     QString  m_wanPublicIp;
     quint16  m_wanUdpPort{4991};

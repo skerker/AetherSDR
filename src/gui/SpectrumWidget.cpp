@@ -84,6 +84,16 @@ namespace {
 constexpr int kDssMaxIncrementalUploadRows = 8;
 
 #ifdef AETHER_GPU_SPECTRUM
+QSize evenAlignedRhiSize(QSize size)
+{
+    if (size.isEmpty()) {
+        return size;
+    }
+    size.rwidth() += size.width() & 1;
+    size.rheight() += size.height() & 1;
+    return size;
+}
+
 bool waterfallGpuFrequencyPreviewRequested()
 {
     if (!qEnvironmentVariableIsSet("AETHER_WF_GPU_PREVIEW")) {
@@ -888,12 +898,44 @@ QVariantMap SpectrumWidget::automationRhiSnapshot() const
     m[QStringLiteral("colorBufferH")] = fixed.height();
     // What an even-aligned pin *should* be for the current size — lets a test
     // assert the #4091 alignment without recomputing the formula itself.
-    const int expW = static_cast<int>(std::ceil(width() * dpr));
-    const int expH = static_cast<int>(std::ceil(height() * dpr));
-    m[QStringLiteral("expectedEvenW")] = expW + (expW & 1);
-    m[QStringLiteral("expectedEvenH")] = expH + (expH & 1);
+    const QSize expected = evenAlignedRhiSize(
+        QSize(static_cast<int>(std::ceil(width() * dpr)),
+              static_cast<int>(std::ceil(height() * dpr))));
+    m[QStringLiteral("expectedEvenW")] = expected.width();
+    m[QStringLiteral("expectedEvenH")] = expected.height();
     m[QStringLiteral("evenAligned")] =
         !autoSized && (fixed.width() % 2 == 0) && (fixed.height() % 2 == 0);
+    // QSize() is already (-1,-1); keep the JSON sentinel explicit so the
+    // automation contract cannot be mistaken for a real zero-sized texture.
+    const QSize unsetTextureSize(-1, -1);
+    const QSize overlaySize = m_ovGpuTex ? m_ovGpuTex->pixelSize() : unsetTextureSize;
+    const QSize backgroundSize = m_bgGpuTex ? m_bgGpuTex->pixelSize() : unsetTextureSize;
+    const QSize waterfallTextureSize =
+        m_wfGpuTex ? m_wfGpuTex->pixelSize() : unsetTextureSize;
+    const QSize waterfallImageSize = m_waterfall.size();
+    m[QStringLiteral("overlayTextureW")] = overlaySize.width();
+    m[QStringLiteral("overlayTextureH")] = overlaySize.height();
+    m[QStringLiteral("backgroundTextureW")] = backgroundSize.width();
+    m[QStringLiteral("backgroundTextureH")] = backgroundSize.height();
+    m[QStringLiteral("waterfallTextureW")] = waterfallTextureSize.width();
+    m[QStringLiteral("waterfallTextureH")] = waterfallTextureSize.height();
+    m[QStringLiteral("waterfallImageW")] = waterfallImageSize.width();
+    m[QStringLiteral("waterfallImageH")] = waterfallImageSize.height();
+    // The upload is safe whenever the GPU texture can hold the CPU image, i.e.
+    // texture >= image in both dimensions. initWaterfallPipeline floors the
+    // texture at 64x64, so a smaller retained image is still a safe (larger)
+    // texture; asserting exact equality here would false-negative that safe
+    // pop-out case, so report the fits-within invariant the field documents.
+    m[QStringLiteral("waterfallTextureMatchesImage")] =
+        !waterfallImageSize.isEmpty()
+        && waterfallTextureSize.width() >= waterfallImageSize.width()
+        && waterfallTextureSize.height() >= waterfallImageSize.height();
+    m[QStringLiteral("fullFrameTexturesEvenAligned")] =
+        !overlaySize.isEmpty() && !backgroundSize.isEmpty()
+        && (overlaySize.width() % 2 == 0) && (overlaySize.height() % 2 == 0)
+        && (backgroundSize.width() % 2 == 0) && (backgroundSize.height() % 2 == 0);
+    m[QStringLiteral("fullFrameTexturesMatchColorBuffer")] =
+        !autoSized && overlaySize == fixed && backgroundSize == fixed;
 #else
     m[QStringLiteral("gpu")] = false;
 #endif
@@ -6509,20 +6551,66 @@ void SpectrumWidget::setCenterLockSliceId(int sliceId)
         return;
     }
     m_centerLockSliceId = sliceId;
-    QString sliceName = QString::number(sliceId);
-    const int overlay = overlayIndex(sliceId);
-    if (overlay >= 0) {
-        sliceName = SliceLabel::unicodeForm(
-            m_sliceOverlays.at(overlay).sliceId,
-            m_sliceOverlays.at(overlay).perClientLetter);
-    }
-    setAccessibleDescription(
-        sliceId >= 0
-            ? tr("Center Lock enabled for Slice %1").arg(sliceName)
-            : tr("Center Lock is off"));
+    updateAccessibleStateDescription();
     QAccessibleValueChangeEvent event(this, sliceId);
     QAccessible::updateAccessibility(&event);
     markOverlayDirty();
+}
+
+void SpectrumWidget::setSliceLinkPairs(const QVector<SliceLinkPair>& pairs)
+{
+    if (m_sliceLinkPairs == pairs) {
+        return;
+    }
+    m_sliceLinkPairs = pairs;
+    updateAccessibleStateDescription();
+    QAccessibleEvent event(this, QAccessible::DescriptionChanged);
+    QAccessible::updateAccessibility(&event);
+    markOverlayDirty();
+}
+
+// Center Lock and Slice Link share the widget-level accessible description,
+// so it is composed from both states — neither setter may overwrite the
+// other's announcement (screen readers hold only one description per widget).
+void SpectrumWidget::updateAccessibleStateDescription()
+{
+    QStringList parts;
+    if (m_centerLockSliceId >= 0) {
+        QString sliceName = QString::number(m_centerLockSliceId);
+        const int overlay = overlayIndex(m_centerLockSliceId);
+        if (overlay >= 0) {
+            sliceName = SliceLabel::unicodeForm(
+                m_sliceOverlays.at(overlay).sliceId,
+                m_sliceOverlays.at(overlay).perClientLetter);
+        }
+        parts << tr("Center Lock enabled for Slice %1").arg(sliceName);
+    } else {
+        parts << tr("Center Lock is off");
+    }
+    for (const SliceLinkPair& pair : std::as_const(m_sliceLinkPairs)) {
+        QString aName = QString::number(pair.aSliceId);
+        QString bName = QString::number(pair.bSliceId);
+        for (const SliceLinkCandidate& candidate :
+             std::as_const(m_sliceLinkCandidates)) {
+            if (candidate.sliceId == pair.aSliceId) {
+                aName = candidate.display;
+            } else if (candidate.sliceId == pair.bSliceId) {
+                bName = candidate.display;
+            }
+        }
+        parts << (pair.suspended
+                      ? tr("Slice Link %1 to %2 suspended; a member is "
+                           "VFO-locked").arg(aName, bName)
+                      : tr("Slice Link %1 to %2 active").arg(aName, bName));
+    }
+    setAccessibleDescription(parts.join(QStringLiteral("; ")));
+}
+
+void SpectrumWidget::setSliceLinkCandidates(
+    const QVector<SliceLinkCandidate>& candidates)
+{
+    m_sliceLinkCandidates = candidates;
+    updateAccessibleStateDescription();
 }
 
 void SpectrumWidget::setSliceOverlayFreq(int sliceId, double freqMhz)
@@ -7964,6 +8052,135 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
                 addCenterLockAction(centerLockMenu, so, false);
             }
         };
+        // Slice Link (cross-panadapter VFO link). Keep every operation under
+        // one explicit menu: no active/first-overlay anchor is inferred from
+        // where the background happened to be clicked.
+        auto addSliceLinkControls = [this](QMenu& targetMenu) {
+            if (m_sliceLinkPairs.isEmpty()
+                && m_sliceLinkCandidates.size() < 2) {
+                return;
+            }
+            targetMenu.addSeparator();
+            QMenu* linkMenu = targetMenu.addMenu(QStringLiteral("Link Slice"));
+
+            const auto linkedPeer = [this](int sliceId) {
+                for (const SliceLinkPair& pair :
+                     std::as_const(m_sliceLinkPairs)) {
+                    if (pair.aSliceId == sliceId) {
+                        return pair.bSliceId;
+                    }
+                    if (pair.bSliceId == sliceId) {
+                        return pair.aSliceId;
+                    }
+                }
+                return -1;
+            };
+            const auto displayFor = [this](int sliceId) {
+                for (const SliceLinkCandidate& candidate :
+                     std::as_const(m_sliceLinkCandidates)) {
+                    if (candidate.sliceId == sliceId) {
+                        return candidate.display;
+                    }
+                }
+                return QString::number(sliceId);
+            };
+            const auto addSectionHeader = [linkMenu](const QString& text) {
+                QAction* header = linkMenu->addAction(text);
+                header->setEnabled(false);
+                QFont headerFont = header->font();
+                headerFont.setBold(true);
+                header->setFont(headerFont);
+            };
+
+            struct MenuPair {
+                int aId;
+                int bId;
+                QString aDisplay;
+                QString bDisplay;
+            };
+            QVector<MenuPair> currentLinks;
+            for (const SliceLinkPair& pair :
+                 std::as_const(m_sliceLinkPairs)) {
+                MenuPair menuPair{pair.aSliceId, pair.bSliceId,
+                                  displayFor(pair.aSliceId),
+                                  displayFor(pair.bSliceId)};
+                if (QString::localeAwareCompare(menuPair.aDisplay,
+                                                menuPair.bDisplay) > 0) {
+                    std::swap(menuPair.aId, menuPair.bId);
+                    std::swap(menuPair.aDisplay, menuPair.bDisplay);
+                }
+                currentLinks.append(std::move(menuPair));
+            }
+            std::sort(currentLinks.begin(), currentLinks.end(),
+                      [](const MenuPair& lhs, const MenuPair& rhs) {
+                const int first = QString::localeAwareCompare(
+                    lhs.aDisplay, rhs.aDisplay);
+                if (first != 0) {
+                    return first < 0;
+                }
+                return QString::localeAwareCompare(
+                           lhs.bDisplay, rhs.bDisplay) < 0;
+            });
+
+            if (!currentLinks.isEmpty()) {
+                addSectionHeader(QStringLiteral("Current Links"));
+                for (const MenuPair& pair : std::as_const(currentLinks)) {
+                    QAction* action = linkMenu->addAction(
+                        QStringLiteral("    Slice %1 ⇄ Slice %2")
+                            .arg(pair.aDisplay, pair.bDisplay));
+                    action->setCheckable(true);
+                    action->setChecked(true);
+                    connect(action, &QAction::triggered, this,
+                            [this, aId = pair.aId, bId = pair.bId]() {
+                        emit sliceLinkRequested(aId, bId, false);
+                    });
+                }
+            }
+
+            QVector<const SliceLinkCandidate*> available;
+            for (const SliceLinkCandidate& candidate :
+                 std::as_const(m_sliceLinkCandidates)) {
+                if (linkedPeer(candidate.sliceId) < 0) {
+                    available.append(&candidate);
+                }
+            }
+            std::sort(available.begin(), available.end(),
+                      [](const SliceLinkCandidate* lhs,
+                         const SliceLinkCandidate* rhs) {
+                const int displayOrder = QString::localeAwareCompare(
+                    lhs->display, rhs->display);
+                if (displayOrder != 0) {
+                    return displayOrder < 0;
+                }
+                return lhs->sliceId < rhs->sliceId;
+            });
+            if (available.size() >= 2) {
+                if (!currentLinks.isEmpty()) {
+                    linkMenu->addSeparator();
+                }
+                addSectionHeader(QStringLiteral("Available Links"));
+                for (int sourceIndex = 0;
+                     sourceIndex < available.size() - 1; ++sourceIndex) {
+                    const SliceLinkCandidate* source =
+                        available.at(sourceIndex);
+                    for (int peerIndex = sourceIndex + 1;
+                         peerIndex < available.size(); ++peerIndex) {
+                        const SliceLinkCandidate* peer =
+                            available.at(peerIndex);
+                        QAction* action = linkMenu->addAction(
+                            QStringLiteral("    Slice %1 ⇄ Slice %2")
+                                .arg(source->display, peer->display));
+                        action->setCheckable(true);
+                        action->setChecked(false);
+                        connect(action, &QAction::triggered, this,
+                                [this, aId = source->sliceId,
+                                 bId = peer->sliceId]() {
+                            emit sliceLinkRequested(aId, bId, true);
+                        });
+                    }
+                }
+            }
+        };
 
         // Right-click on off-screen slice indicator → slice context menu
         for (int oi = 0; oi < m_offScreenRects.size(); ++oi) {
@@ -7986,6 +8203,7 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
                     });
                 menu.addSeparator();
                 addCenterLockAction(&menu, so, true);
+                addSliceLinkControls(menu);
                 menu.exec(ev->globalPosition().toPoint());
                 ev->accept();
                 return;
@@ -8113,6 +8331,7 @@ void SpectrumWidget::mousePressEvent(QMouseEvent* ev)
 
         if (hitTnf < 0) {
             addCenterLockControls(menu);
+            addSliceLinkControls(menu);
 
             // Close Slice option (only when multiple slices exist)
             if (m_sliceOverlays.size() > 1) {
@@ -9644,16 +9863,26 @@ void SpectrumWidget::updateFixedColorBufferSize()
     // its scale from renderTarget()->pixelSize(), not width()×dpr, so the
     // ≤1 px overshoot is invisible.
     const qreal dpr = devicePixelRatioF();
-    QSize devicePx(static_cast<int>(std::ceil(width() * dpr)),
-                   static_cast<int>(std::ceil(height() * dpr)));
+    const QSize devicePx = evenAlignedRhiSize(
+        QSize(static_cast<int>(std::ceil(width() * dpr)),
+              static_cast<int>(std::ceil(height() * dpr))));
     if (devicePx.isEmpty()) {
         return;
     }
-    devicePx.rwidth()  += devicePx.width()  & 1;
-    devicePx.rheight() += devicePx.height() & 1;
     if (fixedColorBufferSize() != devicePx) {
         setFixedColorBufferSize(devicePx);
     }
+}
+
+QSize SpectrumWidget::fullFrameTextureSize() const
+{
+    QSize devicePx = renderTarget() ? renderTarget()->pixelSize() : QSize();
+    if (devicePx.isEmpty()) {
+        const qreal dpr = devicePixelRatioF();
+        devicePx = QSize(static_cast<int>(std::ceil(width() * dpr)),
+                         static_cast<int>(std::ceil(height() * dpr)));
+    }
+    return evenAlignedRhiSize(devicePx.expandedTo(QSize(64, 64)));
 }
 #endif
 
@@ -10324,8 +10553,17 @@ bool SpectrumWidget::initWaterfallPipeline()
         return false;
     }
 
-    const int textureWidth = qMax(contentWidth(), 64);
-    const int textureHeight = qMax(m_waterfall.height(), 64);
+    // A top-level reparent preserves the CPU waterfall until the new window's
+    // resize settles. Size the replacement texture for that retained image,
+    // not the new (still provisional) content width — uploading the old wide
+    // image into a smaller floating-window texture is rejected by QRhi and can
+    // crash the D3D11 backend (#4319). The normal render path resizes both once
+    // the new geometry is authoritative.
+    const QSize waterfallSize = m_waterfall.isNull()
+        ? QSize(qMax(contentWidth(), 64), 64)
+        : m_waterfall.size().expandedTo(QSize(64, 64));
+    const int textureWidth = waterfallSize.width();
+    const int textureHeight = waterfallSize.height();
     std::unique_ptr<QRhiBuffer> vbo(r->newBuffer(
         QRhiBuffer::Immutable, QRhiBuffer::VertexBuffer,
         sizeof(kQuadData)));
@@ -10512,11 +10750,10 @@ void SpectrumWidget::initOverlayPipeline()
     m_ovVbo = r->newBuffer(QRhiBuffer::Immutable, QRhiBuffer::VertexBuffer, sizeof(kQuadData));
     m_ovVbo->create();
 
-    int w = qMax(width(), 64);
-    int h = qMax(height(), 64);
     const qreal dpr = devicePixelRatioF();
-    const int pw = static_cast<int>(w * dpr);
-    const int ph = static_cast<int>(h * dpr);
+    const QSize fullFramePx = fullFrameTextureSize();
+    const int pw = fullFramePx.width();
+    const int ph = fullFramePx.height();
     m_ovGpuTex = r->newTexture(QRhiTexture::RGBA8, QSize(pw, ph));
     m_ovGpuTex->create();
 
@@ -11310,8 +11547,13 @@ void SpectrumWidget::renderGpuFrame(QRhiCommandBuffer* cb,
     {
         // Resize overlay images if needed
         const qreal dpr = devicePixelRatioF();
-        const int pw = static_cast<int>(w * dpr);
-        const int ph = static_cast<int>(h * dpr);
+        // Match the pinned QRhi color buffer exactly. The old width*dpr
+        // truncation produced 1919-pixel RGBA textures at the fractional DPR
+        // in #4319; pop-out recreated them and opening a slice uploaded into
+        // them, reaching the same old-Intel D3D11 crash class as #4091.
+        const QSize fullFramePx = fullFrameTextureSize();
+        const int pw = fullFramePx.width();
+        const int ph = fullFramePx.height();
         if (!resizePreview && m_overlayStatic.size() != QSize(pw, ph)) {
             m_overlayStatic = QImage(pw, ph, QImage::Format_RGBA8888_Premultiplied);
             m_overlayStatic.setDevicePixelRatio(dpr);
@@ -13917,6 +14159,39 @@ void SpectrumWidget::drawSliceMarkers(QPainter& p, const QRect& specRect, const 
                        targetCenter.x() + 9, targetCenter.y());
             p.drawLine(targetCenter.x(), targetCenter.y() - 9,
                        targetCenter.x(), targetCenter.y() + 9);
+        }
+
+        // Slice Link member marker: name the peer beside each linked VFO so
+        // multiple independent pairs remain legible without opening a menu.
+        // Passive affordance like the Center Lock target above — the control
+        // lives in the right-click menu, not on the pan chrome.
+        const SliceLinkPair* sliceLink = nullptr;
+        for (const SliceLinkPair& pair : std::as_const(m_sliceLinkPairs)) {
+            if (pair.aSliceId == so.sliceId || pair.bSliceId == so.sliceId) {
+                sliceLink = &pair;
+                break;
+            }
+        }
+        if (sliceLink) {
+            const int peerId = (sliceLink->aSliceId == so.sliceId)
+                ? sliceLink->bSliceId : sliceLink->aSliceId;
+            QString peerName = QString::number(peerId);
+            for (const SliceLinkCandidate& candidate :
+                 std::as_const(m_sliceLinkCandidates)) {
+                if (candidate.sliceId == peerId) {
+                    peerName = candidate.display;
+                    break;
+                }
+            }
+            QFont linkFont = p.font();
+            linkFont.setPixelSize(12);
+            linkFont.setBold(true);
+            p.setFont(linkFont);
+            p.setPen(sliceLink->suspended
+                         ? QColor(0x80, 0x80, 0x80, 220)
+                         : QColor(col.red(), col.green(), col.blue(), 220));
+            p.drawText(vfoX + 12, specRect.top() + 24,
+                       QStringLiteral("⇄ %1").arg(peerName));
         }
 
         // ── Filter passband shading ──────────────────────────────────────
