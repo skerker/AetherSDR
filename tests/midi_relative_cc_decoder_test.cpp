@@ -132,5 +132,28 @@ int main()
                      && result.encoding == MidiRelativeCcEncoding::Undetermined,
                  "stale-lock heal on a non-unit byte unlocks without guessing");
 
+    // Documented coverage limit of the one-message heal (see
+    // kMidiRelativeCcImplausibleStep). A step |d| from the switched wheel decodes
+    // under the stale lock to magnitude 64 - |d|, so only |d| <= 8 crosses the
+    // threshold. Speed Tuning bursts (+/-12 Normal, +/-24 Fast on the reference
+    // unit) land below it and are bit-identical to a legitimate spin of the
+    // locked encoding, so they decode under the stale lock and it survives.
+    // Pinned so anyone retuning the threshold sees the trade-off: catching these
+    // would false-heal legitimate spec-max (+/-50) spins.
+    encoding = MidiRelativeCcEncoding::Center64;
+    result = decodeMidiRelativeCc(12, encoding); // two's-complement +12 after a switch
+    ok &= expect(result.delta == -52
+                     && result.encoding == MidiRelativeCcEncoding::Center64,
+                 "Speed-Tuning-sized step from the switched wheel misses the heal");
+    result = decodeMidiRelativeCc(24, encoding); // two's-complement +24 after a switch
+    ok &= expect(result.delta == -40
+                     && result.encoding == MidiRelativeCcEncoding::Center64,
+                 "fast-spin step from the switched wheel also misses the heal");
+    // Recovery path: the next unit detent still heals, whatever came before it.
+    result = decodeMidiRelativeCc(1, encoding);
+    ok &= expect(result.delta == 1
+                     && result.encoding == MidiRelativeCcEncoding::TwosComplement,
+                 "a unit detent heals even after missed Speed Tuning bursts");
+
     return ok ? 0 : 1;
 }
