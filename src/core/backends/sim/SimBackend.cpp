@@ -3,6 +3,7 @@
 #include <QtEndian>
 #include <QThread>
 
+#include "core/AppSettings.h"
 #include "core/RadioConnection.h"
 #include "core/PanadapterStream.h"
 
@@ -28,6 +29,12 @@ SimBackend::SimBackend(QObject* parent) : IRadioBackend(parent)
     m_audio.setEnabled(NoiseMixer::Channel::Birdie, true);
     m_audio.setLevelDb(NoiseMixer::Channel::Birdie, -18.0);
     m_audio.setKnob(NoiseMixer::Channel::Birdie, QStringLiteral("hz"), 1200.0);
+    // Operator-suppliable demo CW id (default "L" when the key is absent) —
+    // e.g. "CQ CQ CQ DE KM6LFY KM6LFY K". Read once at backend construction.
+    m_audio.setCwMessage(AppSettings::instance()
+                             .value(QStringLiteral("DemoCwMessage"),
+                                    QStringLiteral("L"))
+                             .toString());
 
     // ---- Path B (RFC #4288): own a RadioConnection + PanadapterStream in
     // synthetic-demo mode, mirroring FlexBackend's ctor (same load-bearing #502

@@ -1,5 +1,7 @@
 #include "core/backends/sim/NoiseMixer.h"
 
+#include "core/MorseTable.h"
+
 #include <QFile>
 #include <QtGlobal>   // qWarning
 
@@ -162,38 +164,12 @@ void NoiseMixer::genCw(const ChannelState& c, float* out)
     // Keys the CW id in real Morse — 18 WPM, standard 1/3/7-dit
     // element/character/word spacing, raised-cosine edges (no key clicks) — so
     // the demo CW channel is decodable by ear, by CwDecoder, or by an external
-    // decoder fed over TCI. The schedule is built from kMsg, so a longer id
-    // (e.g. "CQ CQ DE AETHER") is a one-line change.
+    // decoder fed over TCI. The schedule is built from m_cwMsg (default "L",
+    // settable via setCwMessage) using the shared ITU morseTable().
     const double hz = c.hz > 0 ? c.hz : 700.0;
     const double wpm = 18.0, dit = 1.2 / wpm;
-    struct Span { double on, off; };            // one key-down interval, in dits
-    struct Schedule { std::vector<Span> spans; double total = 0.0; };
-    static const Schedule sched = [] {
-        static const char* kMsg = "L";              // ·—·· — the original id
-        auto code = [](char ch) -> const char* {
-            switch (ch) {
-                case 'A': return ".-";   case 'C': return "-.-.";
-                case 'D': return "-..";  case 'E': return ".";
-                case 'H': return "...."; case 'L': return ".-..";
-                case 'Q': return "--.-"; case 'R': return ".-.";
-                case 'T': return "-";
-                default:  return "";
-            }
-        };
-        Schedule s;
-        double t = 0.0;
-        for (const char* p = kMsg; *p; ++p) {
-            if (*p == ' ') { t += 4.0; continue; }     // char gap 3 + 4 = 7-dit word gap
-            for (const char* e = code(*p); *e; ++e) {
-                const double dur = (*e == '-') ? 3.0 : 1.0;
-                s.spans.push_back({t, t + dur});
-                t += dur + 1.0;                        // element + 1-dit element gap
-            }
-            t += 2.0;                                  // element gap 1 + 2 = 3-dit char gap
-        }
-        s.total = t + 4.0;                             // loop restart = 7-dit word gap
-        return s;
-    }();
+    if (!m_cwSchedBuilt) rebuildCwSchedule();
+    const CwSchedule& sched = m_cwSched;
     const int nSpans = static_cast<int>(sched.spans.size());
     for (int i = 0; i < kFrameLen; ++i) {
         const double tt = static_cast<double>(m_cwPhase + i) / kSampleRate;
@@ -213,6 +189,46 @@ void NoiseMixer::genCw(const ChannelState& c, float* out)
         out[i] = static_cast<float>(key * std::sin(kTwoPi * hz * tt));
     }
     m_cwPhase += kFrameLen;
+}
+
+void NoiseMixer::setCwMessage(const QString& msg)
+{
+    const QString m = msg.trimmed().toUpper();
+    if (m.isEmpty() || m == m_cwMsg) return;
+    m_cwMsg = m;
+    m_cwSchedBuilt = false;   // rebuilt (and cursor reset) on the next genCw
+}
+
+void NoiseMixer::rebuildCwSchedule()
+{
+    // Same span math CWX keying uses: dot 1, dash 3, element gap 1, char gap 3,
+    // word gap 7 (all in dits). Unknown characters key as a word gap — the CWX
+    // convention — after a warning, so a typo is audible in the log, not just
+    // silently absent from the audio.
+    const auto& tbl = morseTable();
+    CwSchedule s;
+    double t = 0.0;
+    for (const QChar ch : m_cwMsg) {
+        if (ch == u' ') { t += 4.0; continue; }        // char gap 3 + 4 = 7-dit word gap
+        const QString code = tbl.value(ch);
+        if (code.isEmpty()) {
+            qWarning("NoiseMixer: no Morse for '%s' in CW message — keying a word gap",
+                     qUtf8Printable(QString(ch)));
+            t += 4.0;
+            continue;
+        }
+        for (const QChar e : code) {
+            const double dur = (e == u'-') ? 3.0 : 1.0;
+            s.spans.push_back({t, t + dur});
+            t += dur + 1.0;                            // element + 1-dit element gap
+        }
+        t += 2.0;                                      // element gap 1 + 2 = 3-dit char gap
+    }
+    s.total = t + 4.0;                                 // loop restart = 7-dit word gap
+    m_cwSched = std::move(s);
+    m_cwSchedBuilt = true;
+    m_cwSpan = 0;
+    m_cwPos  = 0.0;
 }
 
 void NoiseMixer::loadVoiceClip()

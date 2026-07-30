@@ -2,37 +2,12 @@
 
 #include <QHash>
 
+#include "core/MorseTable.h"
+
 namespace AetherSDR {
-
-namespace {
-
-// Standard ITU Morse table.  Lowercase keys; we uppercase incoming text
-// before lookup.  Punctuation mirrors what FlexRadio's CWX accepts on
-// the wire; if we encounter an unknown character we just emit a word
-// gap so the message stays time-aligned with the radio.
-const QHash<QChar, QString>& morseTable()
-{
-    static const QHash<QChar, QString> t = {
-        {'A', ".-"},    {'B', "-..."},  {'C', "-.-."},  {'D', "-.."},
-        {'E', "."},     {'F', "..-."},  {'G', "--."},   {'H', "...."},
-        {'I', ".."},    {'J', ".---"},  {'K', "-.-"},   {'L', ".-.."},
-        {'M', "--"},    {'N', "-."},    {'O', "---"},   {'P', ".--."},
-        {'Q', "--.-"},  {'R', ".-."},   {'S', "..."},   {'T', "-"},
-        {'U', "..-"},   {'V', "...-"},  {'W', ".--"},   {'X', "-..-"},
-        {'Y', "-.--"},  {'Z', "--.."},
-        {'0', "-----"}, {'1', ".----"}, {'2', "..---"}, {'3', "...--"},
-        {'4', "....-"}, {'5', "....."}, {'6', "-...."}, {'7', "--..."},
-        {'8', "---.."}, {'9', "----."},
-        {'.', ".-.-.-"},{',', "--..--"},{'?', "..--.."},{'\'',".----."},
-        {'!', "-.-.--"},{'/', "-..-."}, {'(', "-.--."}, {')', "-.--.-"},
-        {'&', ".-..."}, {':', "---..."},{';', "-.-.-."},{'=', "-...-"},
-        {'+', ".-.-."}, {'-', "-....-"},{'_', "..--.-"},{'"', ".-..-."},
-        {'$', "...-..-"},{'@', ".--.-."},
-    };
-    return t;
-}
-
-} // namespace
+// The ITU Morse table lives in core/MorseTable.cpp, shared with the sim
+// NoiseMixer's demo CW channel. Unknown characters get a word gap so the
+// message stays time-aligned with the radio.
 
 CwxLocalKeyer::CwxLocalKeyer() : CwxLocalKeyer(true) {}
 

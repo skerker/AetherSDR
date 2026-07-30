@@ -80,6 +80,12 @@ public:
     bool anyEnabled() const;
     const ChannelState& channel(Channel c) const;
 
+    // The CW channel's Morse id text (default "L"). Built into a keying
+    // schedule via the shared ITU morseTable(); unknown characters key as a
+    // word gap (CWX convention) with a one-time warning. Takes effect at the
+    // next message cycle.
+    void setCwMessage(const QString& msg);
+
     // ---- notches (TNF manual + ANF auto) ----
     void setNotches(const std::vector<Notch>& notches);
 
@@ -148,6 +154,13 @@ private:
     qint64 m_cwPhase = 0;      // sample counter; long overflows in ~25 h on LLP64
     int    m_cwSpan  = 0;      // current schedule span (persistent, no per-sample rescan)
     double m_cwPos   = 0.0;    // last in-cycle position, for wrap detection
+    // CW keying schedule, built from m_cwMsg via the shared morseTable().
+    struct CwSpan { double on, off; };           // one key-down interval, in dits
+    struct CwSchedule { std::vector<CwSpan> spans; double total = 0.0; };
+    QString    m_cwMsg = QStringLiteral("L");    // ·—·· — the original id
+    CwSchedule m_cwSched;
+    bool       m_cwSchedBuilt = false;
+    void rebuildCwSchedule();
     long m_plPhase = 0;
     // Voice playback: the bundled speech clip's samples (mono float, 24 kHz),
     // loaded once, and the loop read position.

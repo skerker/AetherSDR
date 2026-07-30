@@ -577,6 +577,7 @@ set(CORE_SOURCES
     src/core/CwSidetoneGenerator.cpp
     src/core/CwSidetoneQAudioSink.cpp
     src/core/CwxLocalKeyer.cpp
+    src/core/MorseTable.cpp
     src/core/IambicKeyer.cpp
     src/core/SpectralNR.cpp
     src/core/MonoDspStereoAdapter.cpp
@@ -3796,6 +3797,7 @@ add_executable(cwx_local_keyer_drift_test
     tests/cwx_local_keyer_drift_test.cpp
     src/core/CwxLocalKeyer.cpp
     src/core/CwxLocalKeyer.h
+    src/core/MorseTable.cpp
 )
 target_include_directories(cwx_local_keyer_drift_test PRIVATE src)
 target_link_libraries(cwx_local_keyer_drift_test PRIVATE Qt6::Core)
@@ -4036,6 +4038,7 @@ add_test(NAME spectrum_pattern_test COMMAND spectrum_pattern_test)
 add_executable(noise_mixer_test
     tests/noise_mixer_test.cpp
     src/core/backends/sim/NoiseMixer.cpp
+    src/core/MorseTable.cpp
     resources/resources.qrc          # for the bundled demo voice clip (:/demo_voice.wav)
 )
 target_include_directories(noise_mixer_test PRIVATE src)
