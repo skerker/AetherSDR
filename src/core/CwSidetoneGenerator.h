@@ -49,7 +49,17 @@ public:
     // QAudioSink sink).  On queue overflow the last-known state still
     // lands at the next block start (the pre-#4809 behavior) via
     // m_keyDown.
-    void setKeyDown(bool down) noexcept;
+    // `when` (#4890): producers with an exact element schedule (the iambic
+    // keyer's grid) pass the edge's scheduled instant so the rendered
+    // rhythm is the intended rhythm, not the worker's thread-wake rhythm;
+    // producers without one take the wall-clock default.  Timestamps are
+    // clamped monotonic inside the lock — a scheduled instant lies a few
+    // ms in the past, so a wall-clock edge from another producer (the GUI
+    // echo) could otherwise land in the queue ahead of it with a later
+    // stamp, and process() requires queue order == time order.
+    void setKeyDown(bool down,
+                    std::chrono::steady_clock::time_point when =
+                        std::chrono::steady_clock::now()) noexcept;
 
     bool  isEnabled() const noexcept { return m_enabled.load(std::memory_order_relaxed); }
     float pitchHz() const noexcept   { return m_pitchHz.load(std::memory_order_relaxed); }
@@ -93,6 +103,10 @@ private:
         bool down;
     };
     static constexpr uint32_t kEdgeQueueSize = 64;  // power of two
+
+    // Newest stamp ever queued — the monotonic floor for caller-supplied
+    // scheduled instants (see setKeyDown).  Guarded by m_edgeLock.
+    std::chrono::steady_clock::time_point m_lastQueuedStamp{};
 
     // Release the timestamp→sample anchor only after this much continuous
     // idle: longer than any inter-element or inter-character gap at
