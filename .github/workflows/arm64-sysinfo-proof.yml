@@ -1,0 +1,101 @@
+# One-shot, manually-triggered: build the #4986 branch on a real Apple Silicon
+# runner, launch the app offscreen, and print the aether.sysinfo startup block
+# — the arm64 runtime proof no local machine here can produce. Lives on its
+# own fork branch (ci/4986-arm64-sysinfo-proof), never intended for upstream.
+# Qt setup mirrors ci.yml's check-macos job (aqt-pinned Qt, no Homebrew Qt).
+name: arm64 sysinfo proof (4986)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ci/4986-arm64-sysinfo-proof]
+
+jobs:
+  sysinfo-proof:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      QT_VERSION: '6.8.3'
+      AQTINSTALL_VERSION: '3.3.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install dependencies via Homebrew
+        run: |
+          brew install ninja fftw portaudio hidapi autoconf automake libtool
+
+      - name: Cache Qt
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: cache-qt-mac
+        with:
+          path: ${{ github.workspace }}/Qt
+          key: qt-${{ env.QT_VERSION }}-macos-clang64-aqt${{ env.AQTINSTALL_VERSION }}-mm.ws.sp.st
+
+      - name: Install Qt LTS via aqtinstall
+        if: steps.cache-qt-mac.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          python3 -m venv "$RUNNER_TEMP/aqtvenv"
+          "$RUNNER_TEMP/aqtvenv/bin/pip" install -q "aqtinstall==${AQTINSTALL_VERSION}"
+          "$RUNNER_TEMP/aqtvenv/bin/aqt" install-qt mac desktop "$QT_VERSION" clang_64 \
+            -m qtmultimedia qtwebsockets qtserialport qtshadertools \
+            --outputdir "${{ github.workspace }}/Qt"
+
+      - name: Export Qt environment
+        run: |
+          QT_ROOT="${{ github.workspace }}/Qt/$QT_VERSION/macos"
+          test -x "$QT_ROOT/bin/qmake"
+          {
+            echo "QT_ROOT=$QT_ROOT"
+            echo "CMAKE_PREFIX_PATH=$QT_ROOT"
+          } >> "$GITHUB_ENV"
+          echo "$QT_ROOT/bin" >> "$GITHUB_PATH"
+
+      - name: Configure (lean — defaults, no GPU extras)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT;$(brew --prefix)"
+
+      - name: Build app + inventory test
+        run: ninja -C build AetherSDR system_inventory_test
+
+      - name: Run system_inventory_test on real arm64
+        run: ./build/system_inventory_test
+
+      - name: Launch offscreen and capture the sysinfo block
+        run: |
+          set +e
+          LOGDIR="$HOME/Library/Preferences/AetherSDR/logs"
+          QT_QPA_PLATFORM=offscreen ./build/AetherSDR.app/Contents/MacOS/AetherSDR \
+            > "$RUNNER_TEMP/app-stdout.log" 2> "$RUNNER_TEMP/app-stderr.log" &
+          APP=$!
+          L=""
+          for i in $(seq 1 45); do
+            L=$(ls -t "$LOGDIR"/aethersdr-*.log 2>/dev/null | head -1)
+            if [ -n "$L" ] && grep -q "aether.sysinfo" "$L" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          kill "$APP" 2>/dev/null
+          if [ -n "$L" ] && grep -q "aether.sysinfo" "$L" 2>/dev/null; then
+            echo "== log: $L"
+            echo '## aether.sysinfo block (arm64 runner)' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep "aether.sysinfo" "$L" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            if grep -q "aether.asr.whisper" "$L" 2>/dev/null; then
+              echo '## aether.asr.whisper device lines' >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              grep "aether.asr.whisper" "$L" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+          echo "FAILED: no aether.sysinfo block after 45 s. Diagnostics:"
+          echo "-- log dir:"; ls -la "$LOGDIR" 2>&1
+          echo "-- app still alive?"; ps -p "$APP" 2>&1
+          echo "-- app stderr:"; cat "$RUNNER_TEMP/app-stderr.log" 2>&1
+          echo "-- app stdout (tail):"; tail -30 "$RUNNER_TEMP/app-stdout.log" 2>&1
+          [ -n "$L" ] && { echo "-- newest log tail:"; tail -30 "$L" 2>&1; }
+          exit 1
