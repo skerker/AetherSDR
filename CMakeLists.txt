@@ -766,6 +766,7 @@ set(CORE_SOURCES
     src/core/ShortcutManager.cpp
     src/core/SupportBundle.cpp
     src/core/IssueReport.cpp
+    src/core/SystemInventory.cpp
     src/core/DeviceDiagnostics.cpp
     src/core/SerialPortController.cpp
     src/core/FlexControlManager.cpp
@@ -2934,6 +2935,28 @@ target_compile_definitions(aethercore PUBLIC
     AETHERSDR_VERSION="${PROJECT_VERSION}"
 )
 
+# Expose the vendored ggml CPU ISA baseline to code (#4986) so the startup
+# inventory can compare it against the running CPU: GGML_NATIVE is forced OFF
+# above, which in ggml's build system enables this fixed feature set on
+# x86-64 (third_party/whisper.cpp/ggml/CMakeLists.txt, INS_ENB). On MSVC,
+# FMA/F16C have no separate options — /arch:AVX2 implies both — so the list
+# names only the options that exist. Left undefined on system-libwhisper
+# builds (their baseline is the distro's choice and unknowable here) and on
+# non-x86 hosts (all options default OFF there), which the code reports as
+# "unknown"/skips.
+set(_aether_ggml_baseline "")
+foreach(_aether_isa SSE42 AVX AVX2 FMA F16C BMI2)
+    if (DEFINED GGML_${_aether_isa} AND GGML_${_aether_isa})
+        list(APPEND _aether_ggml_baseline ${_aether_isa})
+    endif()
+endforeach()
+if (_aether_ggml_baseline)
+    list(JOIN _aether_ggml_baseline "," _aether_ggml_baseline_str)
+    target_compile_definitions(aethercore PUBLIC
+        AETHER_GGML_CPU_BASELINE="${_aether_ggml_baseline_str}"
+    )
+endif()
+
 # Compiler warnings — same flags for both first-party targets. Vendored
 # sources compiled into aethercore keep their per-source -w COMPILE_FLAGS,
 # which land after these target options and win (unchanged from monolith).
@@ -3352,6 +3375,22 @@ set_target_properties(settings_browser_dialog_test PROPERTIES AUTOMOC ON)
 add_test(NAME settings_browser_dialog COMMAND settings_browser_dialog_test)
 set_tests_properties(settings_browser_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# Startup hardware inventory (#4986): pins the baseline-comparison contracts
+# that arm the "CPU below the speech-engine baseline" warning, plus host
+# self-consistency of the detection. Compiled with the same baseline define
+# as aethercore so the host check exercises the real compiled value.
+add_executable(system_inventory_test
+    tests/system_inventory_test.cpp
+    src/core/SystemInventory.cpp
+)
+target_include_directories(system_inventory_test PRIVATE src)
+target_link_libraries(system_inventory_test PRIVATE Qt6::Core)
+if (_aether_ggml_baseline)
+    target_compile_definitions(system_inventory_test PRIVATE
+        AETHER_GGML_CPU_BASELINE="${_aether_ggml_baseline_str}")
+endif()
+add_test(NAME system_inventory_test COMMAND system_inventory_test)
 
 add_executable(app_settings_safety_test
     tests/app_settings_safety_test.cpp

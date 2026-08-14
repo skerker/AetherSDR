@@ -122,6 +122,7 @@ LogManager::LogManager()
         // one control, and someone chasing transmit telemetry will tick the
         // wrong box and conclude the logging is still broken.
         {"aether.hl2.tx",     "Hermes-Lite 2 TX", "HL2 transmit telemetry: TX IQ FIFO depth with underflow/overflow flags, and forward/reflected power counts. Separate toggle — ticking \"Hermes-Lite 2\" does NOT enable this (high-rate)"},
+        {"aether.sysinfo",    "System Info",  "Startup hardware/capability inventory: OS, CPU model + SIMD features, RAM, and the speech-engine ISA baseline check (#4986). A few lines once per launch"},
     };
 
     // QLoggingCategory objects are defined above via Q_LOGGING_CATEGORY macros.
@@ -387,7 +388,7 @@ void LogManager::loadSettings()
     // Default Discovery, Commands, and Status to on
     static const QStringList defaultOn = {
         "aether.discovery", "aether.connection", "aether.protocol",
-        "aether.audio.summary", "aether.kiwisdr"
+        "aether.audio.summary", "aether.kiwisdr", "aether.sysinfo"
     };
     for (auto& c : m_categories) {
         QString def = defaultOn.contains(c.id) ? "True" : "False";
