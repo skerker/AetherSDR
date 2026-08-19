@@ -581,9 +581,13 @@ std::vector<AsrGpuDevice> asrGpuDevices()
                             << "- not offered, and not retried this session";
                     }
                 }
-                // One inventory line per device — name, VRAM, verdict — so a
-                // support log answers "which GPU, how much memory" without a
-                // follow-up ask (#4986).
+                // One line per device — name, VRAM, verdict — so a support log
+                // answers "which GPU, how much memory" without a follow-up ask
+                // (#4986). Per enumeration, not once per session: this runs at
+                // Copy Assist discovery and again on every model load, via
+                // asrGpuAvailable() in load(). The repeat is the useful half —
+                // a load that dies for memory is diagnosed by the figures read
+                // at that load, not by startup's.
                 if (d.vramTotalBytes > 0) {
                     qCInfo(lcAsrWhisper)
                         << "GPU device" << d.index << d.name

@@ -2951,11 +2951,23 @@ target_compile_definitions(aethercore PUBLIC
 # builds (their baseline is the distro's choice and unknowable here) and on
 # non-x86 hosts (all options default OFF there), which the code reports as
 # "unknown"/skips.
+#
+# Every branch below has to hold for a RECONFIGURED build tree, not just a
+# fresh one: ggml's GGML_* switches are cache options, so they outlive a
+# reconfigure that stops building ggml at all. Record a baseline only when
+# this configure is the one compiling the engine it describes.
 set(_aether_ggml_baseline_str "")
 if (NOT ENABLE_ASR)
     # No speech engine in this binary — never record a baseline, even if a
     # stale cache still carries GGML_* entries from an earlier ASR configure
     # (which would otherwise arm an ASR warning in an ASR-less build).
+elseif (USE_SYSTEM_LIBWHISPER)
+    # Distro libwhisper: which ISA extensions it carries is the packager's
+    # choice and is not visible from here. Same stale-cache hazard as the
+    # branch above — this path never adds the vendored tree, so GGML_* entries
+    # left by an earlier vendored configure of the same build dir would be
+    # scanned below and stamp that engine's baseline onto a binary now linking
+    # someone else's.
 elseif (DEFINED _aether_prebuilt_ggml_baseline)
     # Prebuilt whisper-gpu pack (Windows release): ggml's CMake never ran, so
     # the baseline comes from the pack's recorded build settings above.
@@ -2966,6 +2978,21 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
     # OFF on a native build), so on ARM they sit ON in the cache while the
     # compile ignores them — scanning them there would stamp an x86 baseline
     # into an ARM binary.
+    #
+    # Two known limits of this scan, both benign, neither worth more machinery
+    # than the note:
+    #  - CMAKE_SYSTEM_PROCESSOR names the HOST on an Apple multi-arch build
+    #    (-DCMAKE_OSX_ARCHITECTURES=...), which sets neither it nor
+    #    CMAKE_CROSSCOMPILING per target slice. An arm64 slice built on Intel
+    #    therefore records an x86 baseline that its runtime ignores anyway
+    #    (missingCpuFeatures() exempts non-x86), and an x86_64 slice built on
+    #    Apple Silicon records none. CI builds each arch natively.
+    #  - MSVC has no GGML_FMA/GGML_F16C options to scan (both are implied by
+    #    /arch:AVX2), so an in-tree MSVC build records four tokens where the
+    #    prebuilt pack above records six for the very same instruction set.
+    #    The warning can name fewer missing features than are truly missing;
+    #    no shipping x86-64 part has AVX2 without FMA and F16C, so no real
+    #    machine is misjudged.
     set(_aether_ggml_baseline "")
     foreach(_aether_isa SSE42 AVX AVX2 FMA F16C BMI2)
         if (DEFINED GGML_${_aether_isa} AND GGML_${_aether_isa})
@@ -2973,6 +3000,12 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
         endif()
     endforeach()
     list(JOIN _aether_ggml_baseline "," _aether_ggml_baseline_str)
+    # Empty here is a real answer, not a failure: SOURCE_DATE_EPOCH or a
+    # cross-compile turns ggml's INS_ENB off (ggml/CMakeLists.txt:105, :140),
+    # so the engine is built with no ISA extensions and has no floor to warn
+    # about. The runtime prints "not recorded for this build" and skips the
+    # comparison, which is the safe direction — a build with no requirements
+    # can never produce a false "would fault" warning.
 else()
     set(_aether_ggml_baseline_str "")
 endif()

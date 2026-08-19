@@ -3,10 +3,11 @@
 // The detection half (cpuid, RAM syscalls) is measured on whatever machine
 // runs the suite, so these tests pin the *contracts* that don't depend on the
 // host: the baseline-comparison logic that decides the "this binary cannot
-// run on this CPU" warning (the #4509 class), and the self-consistency of
-// detection on the running host (present features never contradict the
-// feature flags; a host below the compiled baseline could not be running
-// this test binary, so its own baseline check must come back clean).
+// run on this CPU" warning (the #4509 class), the "unknown" formatting of a
+// failed RAM query, and the self-consistency of detection on the running host
+// (present features never contradict the feature flags, and no feature is
+// reported both present and missing) — invariants that hold whatever CPU the
+// suite lands on, including one below the compiled baseline.
 
 #include "core/SystemInventory.h"
 
@@ -118,18 +119,43 @@ int main()
               "presentFeatures lists all six when all are set");
     }
 
-    // Host self-consistency: this binary is running, so the host cannot be
-    // missing any feature of the baseline it was compiled with.
+    // Host self-consistency: invariants that hold on ANY hardware, checked
+    // against the really-detected CpuInfo.
+    //
+    // Deliberately NOT "the host satisfies its own compiled baseline". That
+    // assertion looks like a contract and is really a claim about the build
+    // machine: this test binary compiles SystemInventory.cpp against Qt Core
+    // alone, with none of the ISA flags the baseline names — only the vendored
+    // ggml objects carry those. A genuinely below-baseline host, or a VM
+    // masking AVX state, runs this binary perfectly well, so asserting it
+    // would turn a correct detection red on precisely the machine class
+    // #4986/#4509 exist to diagnose.
     {
         const SystemInventory::CpuInfo host = SystemInventory::detectCpu();
         CHECK(!host.arch.isEmpty(), "host arch detected");
-        CHECK(SystemInventory::missingCpuFeatures(
-                  host, SystemInventory::compiledGgmlBaseline()).isEmpty(),
-              "running host satisfies its own compiled baseline");
-        // presentFeatures agrees with the individual flags on the real host.
+
         const QStringList present = SystemInventory::presentFeatures(host);
+        const QStringList missing = SystemInventory::missingCpuFeatures(
+            host, SystemInventory::compiledGgmlBaseline());
+
+        // The two lists are answers to the same question and must never
+        // disagree, whatever this CPU turns out to be.
+        bool overlap = false;
+        for (const QString& token : missing)
+            if (present.contains(token))
+                overlap = true;
+        CHECK(!overlap, "no feature is reported both present and missing");
+
+        // presentFeatures agrees with the individual flags on the real host.
         CHECK(present.contains(QStringLiteral("AVX2")) == host.avx2,
               "presentFeatures agrees with the host avx2 flag");
+
+        // A below-baseline builder is a legitimate configuration, not a
+        // failure — report it so the run is self-describing.
+        if (!missing.isEmpty())
+            std::printf("[note] this host is below the compiled baseline "
+                        "(missing: %s) — the startup warning would fire here\n",
+                        qPrintable(missing.join(QLatin1Char(' '))));
     }
 
     // RAM detection returns something plausible on every supported platform:
@@ -138,6 +164,14 @@ int main()
         const quint64 ram = SystemInventory::totalRamBytes();
         CHECK(ram >= 256ull * 1024 * 1024, "total RAM detected and plausible");
     }
+
+    // A failed RAM query must read as unknown in the bundle/issue-report
+    // artifacts, never as a measured "0 MB".
+    CHECK(SystemInventory::ramSummaryFor(0) == QStringLiteral("unknown"),
+          "failed RAM query formats as unknown");
+    CHECK(SystemInventory::ramSummaryFor(16ull * 1024 * 1024 * 1024)
+              == QStringLiteral("16384 MB"),
+          "a known RAM size formats as whole MB");
 
     if (g_failures != 0) {
         std::printf("%d failure(s)\n", g_failures);

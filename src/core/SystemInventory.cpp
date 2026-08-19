@@ -187,7 +187,6 @@ QString SystemInventory::compiledGgmlBaseline()
 void SystemInventory::logSystemInventory()
 {
     const CpuInfo cpu = detectCpu();
-    const quint64 ramMb = totalRamBytes() / (1024 * 1024);
 
     qCInfo(lcSysInfo).noquote()
         << "OS:" << QSysInfo::prettyProductName()
@@ -202,7 +201,7 @@ void SystemInventory::logSystemInventory()
         qCInfo(lcSysInfo).noquote()
             << "CPU:" << (cpu.brand.isEmpty() ? cpu.arch : cpu.brand);
     }
-    qCInfo(lcSysInfo).noquote() << "RAM:" << ramMb << "MB";
+    qCInfo(lcSysInfo).noquote() << "RAM:" << ramSummaryFor(totalRamBytes());
 
     const QString baseline = compiledGgmlBaseline();
     // Empty when the build can't know it: system-libwhisper builds (the
@@ -242,7 +241,19 @@ QString SystemInventory::cpuSummary()
 
 QString SystemInventory::ramSummary()
 {
-    return QStringLiteral("%1 MB").arg(totalRamBytes() / (1024 * 1024));
+    return ramSummaryFor(totalRamBytes());
+}
+
+QString SystemInventory::ramSummaryFor(quint64 bytes)
+{
+    // 0 is the failure return of every totalRamBytes() platform branch. The
+    // log block, the support bundle and the issue report all exist to carry
+    // measured hardware facts into a triage thread, so an unanswered query has
+    // to read as unanswered — "0 MB" is a measurement no machine can produce,
+    // and it would be believed.
+    if (bytes == 0)
+        return QStringLiteral("unknown");
+    return QStringLiteral("%1 MB").arg(bytes / (1024 * 1024));
 }
 
 } // namespace AetherSDR

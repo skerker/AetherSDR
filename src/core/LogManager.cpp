@@ -386,6 +386,14 @@ void LogManager::loadSettings()
 {
     auto& s = AppSettings::instance();
     // Default Discovery, Commands, and Status to on
+    //
+    // Adding a category here turns it on for EXISTING installs too, not just
+    // new ones: the per-category key stays absent until someone moves that
+    // toggle, so the default below also reaches a user who once switched
+    // everything off. Deliberate for aether.sysinfo (#4986) — a few lines once
+    // per launch, and its entire value is being already present in a log
+    // attached by someone who did not foresee the crash. Weigh that against
+    // the surprise before defaulting a chattier category on.
     static const QStringList defaultOn = {
         "aether.discovery", "aether.connection", "aether.protocol",
         "aether.audio.summary", "aether.kiwisdr", "aether.sysinfo"

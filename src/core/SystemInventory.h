@@ -56,7 +56,13 @@ public:
 
     // One-line summaries for SupportBundle / IssueReport.
     static QString cpuSummary();  // "<brand> (<arch>; SSE42 AVX AVX2 ...)"
-    static QString ramSummary();  // "<N> MB"
+    static QString ramSummary();  // "<N> MB", or "unknown"
+
+    // Formats a totalRamBytes() result. Pure, and separate from ramSummary()
+    // so the failure path is testable: 0 is what every platform branch returns
+    // when the query fails, and an artifact whose purpose is measured hardware
+    // facts must report that as unknown rather than assert "0 MB".
+    static QString ramSummaryFor(quint64 bytes);
 };
 
 } // namespace AetherSDR
