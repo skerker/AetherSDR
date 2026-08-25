@@ -206,13 +206,12 @@ QWidget* SystemInfoDialog::buildLogsTab()
     auto* filterHost = new QWidget(page);
     m_filterRow = new QHBoxLayout(filterHost);
     m_filterRow->setContentsMargins(0, 0, 0, 0);
-    auto* filterScroll = new QScrollArea(page);
-    filterScroll->setWidget(filterHost);
-    filterScroll->setWidgetResizable(true);
-    filterScroll->setFrameShape(QFrame::NoFrame);
-    filterScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    filterScroll->setFixedHeight(filterHost->sizeHint().height() + 18);
-    layout->addWidget(filterScroll);
+    m_filterScroll = new QScrollArea(page);
+    m_filterScroll->setWidget(filterHost);
+    m_filterScroll->setWidgetResizable(true);
+    m_filterScroll->setFrameShape(QFrame::NoFrame);
+    m_filterScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    layout->addWidget(m_filterScroll);
 
     // Follow the categories that are actually switched on, live. A fixed list
     // would go stale as categories are added, and — worse — would offer a
@@ -299,6 +298,15 @@ void SystemInfoDialog::rebuildCategoryFilters()
     // Drop view-filter state for categories that are no longer logged at all.
     m_enabledCategories.intersect(stillEnabled);
     m_filterRow->addStretch(1);
+
+    // Size the viewport only now the row has widgets in it. Measuring the host
+    // at construction time — before this function has ever run — reports the
+    // height of an empty widget, and the scroll area collapses to nothing but
+    // its own scrollbar.
+    if (m_filterScroll != nullptr) {
+        const QWidget* host = m_filterScroll->widget();
+        m_filterScroll->setFixedHeight(host->sizeHint().height() + 18);
+    }
 }
 
 QString SystemInfoDialog::categoryFromLine(const QString& line)

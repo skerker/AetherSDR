@@ -13,6 +13,7 @@ class QCheckBox;
 class QHBoxLayout;
 class QLabel;
 class QPlainTextEdit;
+class QScrollArea;
 class QTableWidget;
 class QThread;
 class QTimer;
@@ -68,6 +69,7 @@ private:
     QWidget*        m_logsPage{nullptr};   // parent for dynamically rebuilt filters
     QPlainTextEdit* m_logViewer{nullptr};
     QHBoxLayout*    m_filterRow{nullptr};
+    QScrollArea*    m_filterScroll{nullptr};
     QTimer*         m_logTimer{nullptr};
     QFile           m_logFile;
     QVector<QPair<QString, QString>> m_logLines;  // category, text
