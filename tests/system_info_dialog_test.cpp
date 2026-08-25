@@ -55,7 +55,20 @@ int main(int argc, char** argv)
     auto* table = dialog.findChild<QTableWidget*>();
     report("the thread table exists", table != nullptr);
     if (table != nullptr) {
-        report("the thread table has four columns", table->columnCount() == 4);
+        // Four data columns plus a trailing spacer that absorbs slack on a wide
+        // window — assert the shape, not a magic number, so a future column is a
+        // deliberate edit here rather than a silent count change.
+        report("the table has four data columns plus a spacer", table->columnCount() == 5);
+        report("column 0 is Thread",
+               table->horizontalHeaderItem(0)->text() == QLatin1String("Thread"));
+        report("column 1 is TID",
+               table->horizontalHeaderItem(1)->text() == QLatin1String("TID"));
+        report("column 2 is CPU %",
+               table->horizontalHeaderItem(2)->text() == QLatin1String("CPU %"));
+        report("column 3 is Total CPU (s)",
+               table->horizontalHeaderItem(3)->text() == QLatin1String("Total CPU (s)"));
+        report("the last column is an unlabelled spacer",
+               table->horizontalHeaderItem(4)->text().isEmpty());
         report("the table is sortable", table->isSortingEnabled());
     }
 

@@ -27,7 +27,10 @@ constexpr int kLogPollMs = 500;
 constexpr qint64 kInitialTailBytes = 64 * 1024;
 constexpr qsizetype kMaxStoredLines = 5000;
 
-enum Column { ColName = 0, ColTid, ColCpu, ColTotal, ColumnCount };
+// A trailing spacer column soaks up slack on a wide window. Without it the
+// stretch has to land on a real column, and the thread name — the only one
+// that varies — ends up several hundred pixels wider than the longest name.
+enum Column { ColName = 0, ColTid, ColCpu, ColTotal, ColSpacer, ColumnCount };
 
 }  // namespace
 
@@ -62,7 +65,7 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     m_threadTable = new QTableWidget(0, ColumnCount, page);
     m_threadTable->setHorizontalHeaderLabels(
         {QStringLiteral("Thread"), QStringLiteral("TID"),
-         QStringLiteral("CPU %"), QStringLiteral("Total CPU (s)")});
+         QStringLiteral("CPU %"), QStringLiteral("Total CPU (s)"), QString()});
     m_threadTable->horizontalHeaderItem(ColCpu)->setToolTip(
         QStringLiteral("Share of ONE core, 0-100. Not a share of the machine: a "
                        "single thread pinning one core reads 100 % here however "
@@ -77,13 +80,14 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     // The name absorbs slack; the three numeric columns get fixed, readable
     // widths. Sizing them to content instead made them collapse to the width of
     // "0" and pushed Total CPU off the right edge of a wide window.
-    m_threadTable->horizontalHeader()->setStretchLastSection(false);
-    m_threadTable->horizontalHeader()->setSectionResizeMode(ColName, QHeaderView::Stretch);
+    m_threadTable->horizontalHeader()->setStretchLastSection(true);   // the spacer
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColName, QHeaderView::Interactive);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColTid, QHeaderView::Interactive);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColCpu, QHeaderView::Interactive);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColTotal, QHeaderView::Interactive);
+    m_threadTable->setColumnWidth(ColName, 300);
     m_threadTable->setColumnWidth(ColTid, 90);
-    m_threadTable->setColumnWidth(ColCpu, 90);
+    m_threadTable->setColumnWidth(ColCpu, 80);
     m_threadTable->setColumnWidth(ColTotal, 110);
     // The hot thread is the question being asked, so it starts at the top.
     m_threadTable->sortItems(ColCpu, Qt::DescendingOrder);
