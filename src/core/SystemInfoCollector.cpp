@@ -39,16 +39,6 @@ void SystemInfoCollector::init()
     m_timer->start();
 }
 
-void SystemInfoCollector::shutdown()
-{
-    if (m_timer != nullptr) {
-        m_timer->stop();
-        m_timer->deleteLater();
-        m_timer = nullptr;
-    }
-    m_previous.clear();
-}
-
 void SystemInfoCollector::sampleOnce()
 {
     const QVector<ThreadTimes> current = SystemInfo::enumerateThreads();

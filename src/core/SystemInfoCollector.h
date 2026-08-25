@@ -41,10 +41,6 @@ public slots:
     // this object.
     void init();
 
-    // Stop sampling without destroying the object, so a caller can gate on
-    // dialog visibility. Safe to call from the owning thread.
-    void shutdown();
-
 signals:
     // Queued to the GUI thread by Qt, since emitter and receiver differ.
     void sampleReady(const QVector<AetherSDR::ThreadCpuSample>& threads);
