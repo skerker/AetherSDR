@@ -10,6 +10,8 @@
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QRegularExpression>
+#include <QFrame>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -72,11 +74,17 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     // their content. Stretching the last section instead left Total CPU
     // enormous and clipped the CPU % header, which is the column the table
     // exists to rank by.
+    // The name absorbs slack; the three numeric columns get fixed, readable
+    // widths. Sizing them to content instead made them collapse to the width of
+    // "0" and pushed Total CPU off the right edge of a wide window.
     m_threadTable->horizontalHeader()->setStretchLastSection(false);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColName, QHeaderView::Stretch);
-    m_threadTable->horizontalHeader()->setSectionResizeMode(ColTid, QHeaderView::ResizeToContents);
-    m_threadTable->horizontalHeader()->setSectionResizeMode(ColCpu, QHeaderView::ResizeToContents);
-    m_threadTable->horizontalHeader()->setSectionResizeMode(ColTotal, QHeaderView::ResizeToContents);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColTid, QHeaderView::Interactive);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColCpu, QHeaderView::Interactive);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColTotal, QHeaderView::Interactive);
+    m_threadTable->setColumnWidth(ColTid, 90);
+    m_threadTable->setColumnWidth(ColCpu, 90);
+    m_threadTable->setColumnWidth(ColTotal, 110);
     // The hot thread is the question being asked, so it starts at the top.
     m_threadTable->sortItems(ColCpu, Qt::DescendingOrder);
     layout->addWidget(m_threadTable, 1);
@@ -118,6 +126,10 @@ void SystemInfoDialog::applySample(const QVector<ThreadCpuSample>& threads)
         auto* totalItem = new QTableWidgetItem;
         totalItem->setData(Qt::DisplayRole,
                            QString::number(static_cast<double>(sample.cpuUsecs) / 1e6, 'f', 1).toDouble());
+
+        tidItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        cpuItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        totalItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
         m_threadTable->setItem(row, ColName, nameItem);
         m_threadTable->setItem(row, ColTid, tidItem);
@@ -188,8 +200,19 @@ QWidget* SystemInfoDialog::buildLogsTab()
     m_logsPage = page;
     auto* layout = new QVBoxLayout(page);
 
-    m_filterRow = new QHBoxLayout;
-    layout->addLayout(m_filterRow);
+    // Every enabled category gets a checkbox, and an operator with a dozen
+    // categories on overflows any window. Scroll the row rather than clipping
+    // it — a filter you cannot reach is the same as one that does not exist.
+    auto* filterHost = new QWidget(page);
+    m_filterRow = new QHBoxLayout(filterHost);
+    m_filterRow->setContentsMargins(0, 0, 0, 0);
+    auto* filterScroll = new QScrollArea(page);
+    filterScroll->setWidget(filterHost);
+    filterScroll->setWidgetResizable(true);
+    filterScroll->setFrameShape(QFrame::NoFrame);
+    filterScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    filterScroll->setFixedHeight(filterHost->sizeHint().height() + 18);
+    layout->addWidget(filterScroll);
 
     // Follow the categories that are actually switched on, live. A fixed list
     // would go stale as categories are added, and — worse — would offer a
@@ -358,6 +381,10 @@ void SystemInfoDialog::appendLogLine(const QString& line)
     m_logViewer->appendPlainText(line);
     m_logViewer->verticalScrollBar()->setValue(
         m_logViewer->verticalScrollBar()->maximum());
+    // appendPlainText leaves the cursor at the end of the line, which scrolls a
+    // no-wrap viewport right and hides the timestamp and category — the two
+    // fields you read first. Pin the view back to the left margin.
+    m_logViewer->horizontalScrollBar()->setValue(0);
 }
 
 void SystemInfoDialog::rebuildLogView()
