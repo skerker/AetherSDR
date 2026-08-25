@@ -21,21 +21,6 @@ namespace AetherSDR {
 
 namespace {
 
-// The categories a performance investigation actually reads. Not every category
-// in the app: an unfiltered tail buries the render and audio lines this dialog
-// exists to surface, which is the same burying that made aether.render worth
-// splitting out of aether.gui in the first place.
-const QStringList& perfCategories()
-{
-    static const QStringList categories{
-        QStringLiteral("aether.perf"),
-        QStringLiteral("aether.render"),
-        QStringLiteral("aether.audio"),
-        QStringLiteral("aether.gui"),
-    };
-    return categories;
-}
-
 constexpr int kLogPollMs = 500;
 constexpr qint64 kInitialTailBytes = 64 * 1024;
 constexpr qsizetype kMaxStoredLines = 5000;
@@ -48,10 +33,6 @@ SystemInfoDialog::SystemInfoDialog(QWidget* parent)
     : PersistentDialog(QStringLiteral("System Info"),
                        QStringLiteral("SystemInfoDialogGeometry"), parent)
 {
-    for (const QString& category : perfCategories()) {
-        m_enabledCategories.insert(category);
-    }
-
     auto* layout = new QVBoxLayout(bodyWidget());
     auto* tabs = new QTabWidget(bodyWidget());
     tabs->addTab(buildThreadsTab(), QStringLiteral("Threads"));
@@ -79,12 +60,23 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     m_threadTable = new QTableWidget(0, ColumnCount, page);
     m_threadTable->setHorizontalHeaderLabels(
         {QStringLiteral("Thread"), QStringLiteral("TID"),
-         QStringLiteral("CPU % of one core"), QStringLiteral("Total CPU (s)")});
+         QStringLiteral("CPU %"), QStringLiteral("Total CPU (s)")});
+    m_threadTable->horizontalHeaderItem(ColCpu)->setToolTip(
+        QStringLiteral("Share of ONE core, 0-100. Not a share of the machine: a "
+                       "single thread pinning one core reads 100 % here however "
+                       "many cores are idle."));
     m_threadTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_threadTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_threadTable->setSortingEnabled(true);
-    m_threadTable->horizontalHeader()->setStretchLastSection(true);
+    // The name is the variable-width column; the three numeric ones size to
+    // their content. Stretching the last section instead left Total CPU
+    // enormous and clipped the CPU % header, which is the column the table
+    // exists to rank by.
+    m_threadTable->horizontalHeader()->setStretchLastSection(false);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColName, QHeaderView::Stretch);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColTid, QHeaderView::ResizeToContents);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColCpu, QHeaderView::ResizeToContents);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColTotal, QHeaderView::ResizeToContents);
     // The hot thread is the question being asked, so it starts at the top.
     m_threadTable->sortItems(ColCpu, Qt::DescendingOrder);
     layout->addWidget(m_threadTable, 1);
@@ -189,24 +181,20 @@ QWidget* SystemInfoDialog::buildLogsTab()
     auto* page = new QWidget;
     auto* layout = new QVBoxLayout(page);
 
-    auto* filters = new QHBoxLayout;
-    filters->addWidget(new QLabel(QStringLiteral("Show:"), page));
-    for (const QString& category : perfCategories()) {
-        auto* box = new QCheckBox(category, page);
-        box->setChecked(true);
-        connect(box, &QCheckBox::toggled, this, [this, category](bool on) {
-            if (on) {
-                m_enabledCategories.insert(category);
-            } else {
-                m_enabledCategories.remove(category);
-            }
-            rebuildLogView();
-        });
-        m_categoryBoxes.insert(category, box);
-        filters->addWidget(box);
-    }
-    filters->addStretch(1);
-    layout->addLayout(filters);
+    m_filterRow = new QHBoxLayout;
+    layout->addLayout(m_filterRow);
+
+    // Follow the categories that are actually switched on, live. A fixed list
+    // would go stale as categories are added, and — worse — would offer a
+    // ticked box above an empty pane whenever the category behind it was not
+    // being logged at all, which says "showing" while meaning "nothing is
+    // being written".
+    connect(&LogManager::instance(), &LogManager::categoryChanged,
+            this, [this](const QString&, bool) {
+                rebuildCategoryFilters();
+                rebuildLogView();
+            });
+    rebuildCategoryFilters();
 
     m_logViewer = new QPlainTextEdit(page);
     m_logViewer->setReadOnly(true);
@@ -216,6 +204,72 @@ QWidget* SystemInfoDialog::buildLogsTab()
     layout->addWidget(m_logViewer, 1);
 
     return page;
+}
+
+void SystemInfoDialog::rebuildCategoryFilters()
+{
+    if (m_filterRow == nullptr) {
+        return;
+    }
+
+    // Snapshot which categories we already had boxes for BEFORE clearing them:
+    // it is the only way to tell "new category, show it" from "the operator
+    // unticked this one, leave it unticked".
+    QSet<QString> previouslyKnown;
+    for (auto it = m_categoryBoxes.constBegin(); it != m_categoryBoxes.constEnd(); ++it) {
+        previouslyKnown.insert(it.key());
+    }
+
+    while (QLayoutItem* item = m_filterRow->takeAt(0)) {
+        delete item->widget();
+        delete item;
+    }
+    m_categoryBoxes.clear();
+
+    const QList<LogManager::Category> categories = LogManager::instance().categories();
+    QSet<QString> stillEnabled;
+    m_filterRow->addWidget(new QLabel(QStringLiteral("Show:"), m_logViewer->parentWidget()));
+
+    for (const LogManager::Category& category : categories) {
+        if (!category.enabled) {
+            continue;   // not being logged, so there is nothing to offer
+        }
+        stillEnabled.insert(category.id);
+
+        auto* box = new QCheckBox(category.label, m_logViewer->parentWidget());
+        box->setToolTip(QStringLiteral("%1 — %2").arg(category.id, category.description));
+        // A category newly switched on starts visible; one the operator has
+        // deliberately unticked here stays hidden across rebuilds.
+        box->setChecked(previouslyKnown.contains(category.id)
+                            ? m_enabledCategories.contains(category.id)
+                            : true);
+        if (box->isChecked()) {
+            m_enabledCategories.insert(category.id);
+        }
+        const QString id = category.id;
+        connect(box, &QCheckBox::toggled, this, [this, id](bool on) {
+            if (on) {
+                m_enabledCategories.insert(id);
+            } else {
+                m_enabledCategories.remove(id);
+            }
+            rebuildLogView();
+        });
+        m_categoryBoxes.insert(category.id, box);
+        m_filterRow->addWidget(box);
+    }
+
+    if (m_categoryBoxes.isEmpty()) {
+        auto* hint = new QLabel(
+            QStringLiteral("No log categories are switched on — enable them in "
+                           "Help \u2192 Support."),
+            m_logViewer->parentWidget());
+        m_filterRow->addWidget(hint);
+    }
+
+    // Drop view-filter state for categories that are no longer logged at all.
+    m_enabledCategories.intersect(stillEnabled);
+    m_filterRow->addStretch(1);
 }
 
 QString SystemInfoDialog::categoryFromLine(const QString& line)

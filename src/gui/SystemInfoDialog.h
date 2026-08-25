@@ -10,6 +10,7 @@
 #include <QVector>
 
 class QCheckBox;
+class QHBoxLayout;
 class QLabel;
 class QPlainTextEdit;
 class QTableWidget;
@@ -49,6 +50,7 @@ private:
     void stopSampling();
     void applySample(const QVector<ThreadCpuSample>& threads);
 
+    void rebuildCategoryFilters();
     void openLogTail();
     void closeLogTail();
     void pollLog();
@@ -64,6 +66,7 @@ private:
 
     // Logs tab
     QPlainTextEdit* m_logViewer{nullptr};
+    QHBoxLayout*    m_filterRow{nullptr};
     QTimer*         m_logTimer{nullptr};
     QFile           m_logFile;
     QVector<QPair<QString, QString>> m_logLines;  // category, text
