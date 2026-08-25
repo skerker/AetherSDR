@@ -65,6 +65,7 @@ private:
     SystemInfoCollector* m_collector{nullptr};
 
     // Logs tab
+    QWidget*        m_logsPage{nullptr};   // parent for dynamically rebuilt filters
     QPlainTextEdit* m_logViewer{nullptr};
     QHBoxLayout*    m_filterRow{nullptr};
     QTimer*         m_logTimer{nullptr};

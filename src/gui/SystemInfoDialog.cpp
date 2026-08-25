@@ -162,12 +162,18 @@ void SystemInfoDialog::stopSampling()
     if (m_collectorThread == nullptr) {
         return;
     }
+    // Tear the timer down on the worker thread FIRST. It was created there, and
+    // a QTimer destroyed from another thread is undefined behaviour — Qt reports
+    // it as "Timers cannot be stopped from another thread".
+    if (m_collector != nullptr && m_collector->thread() != QThread::currentThread()) {
+        QMetaObject::invokeMethod(m_collector, "shutdown", Qt::BlockingQueuedConnection);
+    }
+
     m_collectorThread->quit();
     m_collectorThread->wait();
     // Deleted outright rather than via the usual finished→deleteLater: once
     // wait() returns, the worker's event loop is gone, so a deferred delete has
-    // nothing left to run it. The thread is stopped here, so this is both safe
-    // and deterministic.
+    // nothing left to run it. The collector owns no timer by this point.
     delete m_collector;
     m_collector = nullptr;
     delete m_collectorThread;
@@ -179,6 +185,7 @@ void SystemInfoDialog::stopSampling()
 QWidget* SystemInfoDialog::buildLogsTab()
 {
     auto* page = new QWidget;
+    m_logsPage = page;
     auto* layout = new QVBoxLayout(page);
 
     m_filterRow = new QHBoxLayout;
@@ -194,8 +201,6 @@ QWidget* SystemInfoDialog::buildLogsTab()
                 rebuildCategoryFilters();
                 rebuildLogView();
             });
-    rebuildCategoryFilters();
-
     m_logViewer = new QPlainTextEdit(page);
     m_logViewer->setReadOnly(true);
     m_logViewer->setLineWrapMode(QPlainTextEdit::NoWrap);
@@ -203,13 +208,14 @@ QWidget* SystemInfoDialog::buildLogsTab()
     new LogSyntaxHighlighter(m_logViewer->document());
     layout->addWidget(m_logViewer, 1);
 
+    rebuildCategoryFilters();
     return page;
 }
 
 void SystemInfoDialog::rebuildCategoryFilters()
 {
-    if (m_filterRow == nullptr) {
-        return;
+    if (m_filterRow == nullptr || m_logsPage == nullptr) {
+        return;   // called before the page exists; nothing to parent widgets to
     }
 
     // Snapshot which categories we already had boxes for BEFORE clearing them:
@@ -228,7 +234,7 @@ void SystemInfoDialog::rebuildCategoryFilters()
 
     const QList<LogManager::Category> categories = LogManager::instance().categories();
     QSet<QString> stillEnabled;
-    m_filterRow->addWidget(new QLabel(QStringLiteral("Show:"), m_logViewer->parentWidget()));
+    m_filterRow->addWidget(new QLabel(QStringLiteral("Show:"), m_logsPage));
 
     for (const LogManager::Category& category : categories) {
         if (!category.enabled) {
@@ -236,7 +242,7 @@ void SystemInfoDialog::rebuildCategoryFilters()
         }
         stillEnabled.insert(category.id);
 
-        auto* box = new QCheckBox(category.label, m_logViewer->parentWidget());
+        auto* box = new QCheckBox(category.label, m_logsPage);
         box->setToolTip(QStringLiteral("%1 — %2").arg(category.id, category.description));
         // A category newly switched on starts visible; one the operator has
         // deliberately unticked here stays hidden across rebuilds.
@@ -263,7 +269,7 @@ void SystemInfoDialog::rebuildCategoryFilters()
         auto* hint = new QLabel(
             QStringLiteral("No log categories are switched on — enable them in "
                            "Help \u2192 Support."),
-            m_logViewer->parentWidget());
+            m_logsPage);
         m_filterRow->addWidget(hint);
     }
 

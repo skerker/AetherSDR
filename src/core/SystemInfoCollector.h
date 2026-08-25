@@ -41,6 +41,13 @@ public slots:
     // this object.
     void init();
 
+    // Stop and destroy the timer ON THE THREAD THAT CREATED IT. A QTimer belongs
+    // to its owning thread; deleting the collector from the GUI thread after the
+    // worker has exited destroys a timer whose thread is gone, which Qt reports
+    // as "Timers cannot be stopped from another thread" and is undefined
+    // behaviour. Invoke this with a blocking queued connection before quit().
+    void shutdown();
+
 signals:
     // Queued to the GUI thread by Qt, since emitter and receiver differ.
     void sampleReady(const QVector<AetherSDR::ThreadCpuSample>& threads);
