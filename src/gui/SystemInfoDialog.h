@@ -11,6 +11,7 @@
 #include <QVector>
 
 class QCheckBox;
+class QPushButton;
 class QHBoxLayout;
 class QLabel;
 class QPlainTextEdit;
@@ -77,6 +78,10 @@ private:
     void closeLogTail();
     void pollLog();
     void rebuildLogView();
+    // One place that owns the follow state, its button's text and tooltip, and
+    // the jump to the newest line — so the button, the scrollbar and the
+    // append path cannot end up disagreeing about whether we are following.
+    void setLogFollowLive(bool on);
     static QString categoryFromLine(const QString& line);
 
     // Threads tab
@@ -100,6 +105,12 @@ private:
     QPlainTextEdit* m_logViewer{nullptr};
     QHBoxLayout*    m_filterRow{nullptr};
     QScrollArea*    m_filterScroll{nullptr};
+    QPushButton*    m_logLiveToggle{nullptr};
+    bool            m_logFollowLive{true};
+    // Guards the scrollbar handler against our OWN scrolling: every jump to the
+    // bottom fires valueChanged, and without this the first appended line would
+    // look like the operator scrolling and switch following off.
+    bool            m_handlingLogScroll{false};
     QTimer*         m_logTimer{nullptr};
     QFile           m_logFile;
     QVector<QPair<QString, QString>> m_logLines;  // category, text

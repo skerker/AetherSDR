@@ -11,6 +11,8 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QPlainTextEdit>
+#include <QPushButton>
+#include <QSignalBlocker>
 #include <QRegularExpression>
 #include <QFrame>
 #include <QScrollArea>
@@ -386,6 +388,18 @@ QWidget* SystemInfoDialog::buildLogsTab()
                 rebuildCategoryFilters();
                 rebuildLogView();
             });
+    auto* infoRow = new QHBoxLayout;
+    infoRow->addStretch(1);
+    m_logLiveToggle = new QPushButton(QStringLiteral("Live"), page);
+    m_logLiveToggle->setObjectName(QStringLiteral("systemInfoLogLiveToggle"));
+    m_logLiveToggle->setCheckable(true);
+    m_logLiveToggle->setChecked(true);
+    m_logLiveToggle->setFixedWidth(92);
+    connect(m_logLiveToggle, &QPushButton::toggled,
+            this, [this](bool live) { setLogFollowLive(live); });
+    infoRow->addWidget(m_logLiveToggle);
+    layout->addLayout(infoRow);
+
     m_logViewer = new QPlainTextEdit(page);
     m_logViewer->setObjectName(QStringLiteral("systemInfoLogViewer"));
     m_logViewer->setReadOnly(true);
@@ -393,6 +407,22 @@ QWidget* SystemInfoDialog::buildLogsTab()
     m_logViewer->setMaximumBlockCount(static_cast<int>(kMaxStoredLines));
     new LogSyntaxHighlighter(m_logViewer->document());
     layout->addWidget(m_logViewer, 1);
+
+    // Scrolling up IS the pause gesture. Reading a stall means holding still on
+    // the lines around it, and a view that yanks itself back to the bottom
+    // every 500 ms cannot be read at all — the operator would have to find the
+    // button before the log became legible.
+    connect(m_logViewer->verticalScrollBar(), &QScrollBar::valueChanged,
+            this, [this](int value) {
+                if (m_handlingLogScroll || m_logViewer == nullptr) {
+                    return;
+                }
+                if (value < m_logViewer->verticalScrollBar()->maximum()) {
+                    setLogFollowLive(false);
+                }
+            });
+
+    setLogFollowLive(true);   // establishes the button's text and tooltip
 
     rebuildCategoryFilters();
     return page;
@@ -593,12 +623,17 @@ void SystemInfoDialog::appendLogLine(const QString& line)
     while (m_logLines.size() > kMaxStoredLines) {
         m_logLines.removeFirst();
     }
-    if (m_logViewer == nullptr || !m_enabledCategories.contains(category)) {
+    // Retained either way: pausing must not lose the lines that arrive while
+    // the operator is reading, or turning Live back on would show a gap.
+    if (m_logViewer == nullptr || !m_logFollowLive
+        || !m_enabledCategories.contains(category)) {
         return;
     }
     m_logViewer->appendPlainText(line);
+    m_handlingLogScroll = true;
     m_logViewer->verticalScrollBar()->setValue(
         m_logViewer->verticalScrollBar()->maximum());
+    m_handlingLogScroll = false;
     // appendPlainText leaves the cursor at the end of the line, which scrolls a
     // no-wrap viewport right and hides the timestamp and category — the two
     // fields you read first. Pin the view back to the left margin.
@@ -612,14 +647,44 @@ void SystemInfoDialog::rebuildLogView()
     }
     // Re-filtering replays what was kept rather than re-reading the file, so
     // toggling a category cannot lose lines that have already rolled past.
+    m_handlingLogScroll = true;
     m_logViewer->clear();
     for (const auto& entry : m_logLines) {
         if (m_enabledCategories.contains(entry.first)) {
             m_logViewer->appendPlainText(entry.second);
         }
     }
-    m_logViewer->verticalScrollBar()->setValue(
-        m_logViewer->verticalScrollBar()->maximum());
+    // Only jump to the newest line if we are following it. Ticking a category
+    // while paused would otherwise throw the operator back to the bottom,
+    // which is precisely what pausing was for.
+    if (m_logFollowLive) {
+        m_logViewer->verticalScrollBar()->setValue(
+            m_logViewer->verticalScrollBar()->maximum());
+    }
+    m_logViewer->horizontalScrollBar()->setValue(0);
+    m_handlingLogScroll = false;
+}
+
+void SystemInfoDialog::setLogFollowLive(bool on)
+{
+    m_logFollowLive = on;
+    if (m_logLiveToggle != nullptr) {
+        // Blocked: this is also called BY the button, and re-entering its
+        // toggled signal would fight the scrollbar handler.
+        const QSignalBlocker blocker(m_logLiveToggle);
+        m_logLiveToggle->setChecked(on);
+        m_logLiveToggle->setText(on ? QStringLiteral("Live") : QStringLiteral("Paused"));
+        m_logLiveToggle->setToolTip(
+            on ? QStringLiteral("Following the newest output. Scroll up, or turn "
+                                "this off, to hold still on older lines.")
+               : QStringLiteral("Paused. Lines are still being collected — turn "
+                                "Live back on to catch up to the newest."));
+    }
+    // Catching up replays everything retained while paused, so resuming shows
+    // the lines that arrived rather than resuming from wherever the file is now.
+    if (on) {
+        rebuildLogView();
+    }
 }
 
 // ── Visibility ──────────────────────────────────────────────────────────────

@@ -20,6 +20,8 @@
 #include <QCheckBox>
 #include <QLabel>
 #include <QPlainTextEdit>
+#include <QPushButton>
+#include <QScrollBar>
 #include <QPainter>
 #include <QPixmap>
 #include <QTabWidget>
@@ -312,6 +314,63 @@ int main(int argc, char** argv)
                box("aether.audio") != nullptr && box("aether.audio")->isChecked());
         report("a category outside that set is offered but not ticked",
                box("aether.cw") != nullptr && !box("aether.cw")->isChecked());
+
+        // ── Follow-live ──────────────────────────────────────────────────────
+        //
+        // Promised on the issue on 2026-08-25 and not built: the view scrolled
+        // itself to the newest line on every append, so a stall could not be
+        // read without the log yanking itself away every 500 ms.
+        auto* live = dialog.findChild<QPushButton*>(
+            QStringLiteral("systemInfoLogLiveToggle"));
+        report("the Logs tab has a Live toggle", live != nullptr);
+        if (live != nullptr && viewer != nullptr && general != nullptr) {
+            report("it starts following", live->isChecked()
+                       && live->text() == QLatin1String("Live"));
+
+            live->setChecked(false);
+            report("turning it off reads as Paused",
+                   live->text() == QLatin1String("Paused"));
+
+            feed(QStringLiteral("[00:00:03.000] WRN default: arrived while paused"));
+            report("a line arriving while paused stays out of the view",
+                   !viewer->toPlainText().contains(QLatin1String("while paused")));
+
+            // Retained, not dropped: resuming must show what was missed rather
+            // than picking up from wherever the file has reached.
+            live->setChecked(true);
+            report("resuming catches up on what arrived while paused",
+                   viewer->toPlainText().contains(QLatin1String("while paused")));
+
+            // Scrolling up is the pause gesture, so it has to disengage
+            // following without the button being touched.
+            dialog.show();
+            QCoreApplication::processEvents();
+            viewer->setFixedHeight(40);
+            for (int i = 0; i < 200; ++i) {
+                feed(QStringLiteral("[00:00:04.%1] WRN default: filler line %2")
+                         .arg(i, 3, 10, QLatin1Char('0')).arg(i));
+            }
+            QCoreApplication::processEvents();
+            if (viewer->verticalScrollBar()->maximum() > 0) {
+                viewer->verticalScrollBar()->setValue(0);
+                QCoreApplication::processEvents();
+                report("scrolling up turns following off by itself",
+                       !live->isChecked() && live->text() == QLatin1String("Paused"));
+            } else {
+                report("the viewer became scrollable so the gesture can be tested",
+                       false);
+            }
+
+            // And our OWN jump to the bottom must not read as that gesture, or
+            // the first appended line would switch following off.
+            live->setChecked(true);
+            feed(QStringLiteral("[00:00:05.000] WRN default: still following"));
+            QCoreApplication::processEvents();
+            report("appending while live does not switch following off",
+                   live->isChecked());
+            dialog.hide();
+            QCoreApplication::processEvents();
+        }
     }
 
     std::printf("%s\n", g_failures == 0 ? "system_info_dialog_test: all passed"
