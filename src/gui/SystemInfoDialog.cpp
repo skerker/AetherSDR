@@ -26,6 +26,25 @@ namespace AetherSDR {
 namespace {
 
 constexpr int kLogPollMs = 500;
+
+// The categories the issue names for this tab: "Live tail of perf-related
+// logging categories: lcPerf, lcRender, lcAudio." They are ticked by default
+// and grouped first, so the pane an operator lands on is the focused one the
+// design asks for.
+//
+// Every OTHER category is offered too, unticked. The Threads tab beside this
+// one enumerates every thread in the process — KiwiSdrClients, hl2-io,
+// SpotClients, ExtControllers all appear — and a log restricted to three
+// categories has nothing to say about most of the rows it is meant to explain.
+// The tabs were justified as a pair; a pane that can only answer for three of
+// thirty-three rows does not complete it.
+const char* const kPerfCategories[] = {"aether.perf", "aether.render", "aether.audio"};
+
+// Qt files uncategorized output under this name (LogManager.cpp:305-307). It is
+// not in LogManager's list, so it needs a box of its own or those lines can
+// never be displayed at all — the same hand-built "General" box the network
+// dialog carries (NetworkDiagnosticsDialog.cpp:1500).
+const char* const kUncategorized = "default";
 constexpr qint64 kInitialTailBytes = 64 * 1024;
 constexpr qsizetype kMaxStoredLines = 5000;
 
@@ -368,6 +387,7 @@ QWidget* SystemInfoDialog::buildLogsTab()
                 rebuildLogView();
             });
     m_logViewer = new QPlainTextEdit(page);
+    m_logViewer->setObjectName(QStringLiteral("systemInfoLogViewer"));
     m_logViewer->setReadOnly(true);
     m_logViewer->setLineWrapMode(QPlainTextEdit::NoWrap);
     m_logViewer->setMaximumBlockCount(static_cast<int>(kMaxStoredLines));
@@ -385,8 +405,8 @@ void SystemInfoDialog::rebuildCategoryFilters()
     }
 
     // Snapshot which categories we already had boxes for BEFORE clearing them:
-    // it is the only way to tell "new category, show it" from "the operator
-    // unticked this one, leave it unticked".
+    // it is the only way to tell "new box, apply its default" from "the
+    // operator unticked this one, leave it unticked".
     QSet<QString> previouslyKnown;
     for (auto it = m_categoryBoxes.constBegin(); it != m_categoryBoxes.constEnd(); ++it) {
         previouslyKnown.insert(it.key());
@@ -398,27 +418,39 @@ void SystemInfoDialog::rebuildCategoryFilters()
     }
     m_categoryBoxes.clear();
 
-    const QList<LogManager::Category> categories = LogManager::instance().categories();
-    QSet<QString> stillEnabled;
     m_filterRow->addWidget(new QLabel(QStringLiteral("Show:"), m_logsPage));
 
-    for (const LogManager::Category& category : categories) {
-        if (!category.enabled) {
-            continue;   // not being logged, so there is nothing to offer
-        }
-        stillEnabled.insert(category.id);
+    const auto addBox = [&](const QString& id, const QString& label,
+                            const QString& description, bool fullyEnabled,
+                            bool defaultOn) {
+        auto* box = new QCheckBox(label, m_logsPage);
 
-        auto* box = new QCheckBox(category.label, m_logsPage);
-        box->setToolTip(QStringLiteral("%1 — %2").arg(category.id, category.description));
-        // A category newly switched on starts visible; one the operator has
-        // deliberately unticked here stays hidden across rebuilds.
-        box->setChecked(previouslyKnown.contains(category.id)
-                            ? m_enabledCategories.contains(category.id)
-                            : true);
-        if (box->isChecked()) {
-            m_enabledCategories.insert(category.id);
+        // A category switched OFF in LogManager still writes warnings and
+        // criticals — "Default state: all debug logging DISABLED.
+        // Warnings/criticals always pass" (LogManager.h:58). Offering no box
+        // for it, as this tab used to, made those lines undisplayable: the most
+        // important lines in the file, hidden by the filter meant to reveal
+        // them. It gets a box, dimmed, saying what it will and will not show.
+        if (fullyEnabled) {
+            box->setToolTip(QStringLiteral("%1 — %2").arg(id, description));
+        } else {
+            ThemeManager::instance().applyStyleSheet(
+                box, QStringLiteral("QCheckBox { color: {{color.text.disabled}}; }"));
+            box->setToolTip(
+                QStringLiteral("%1 — %2\n\nWarnings and criticals only: this "
+                               "category's full logging is switched off. Turn it "
+                               "on in Help \u2192 Support.")
+                    .arg(id, description));
         }
-        const QString id = category.id;
+
+        box->setChecked(previouslyKnown.contains(id)
+                            ? m_enabledCategories.contains(id)
+                            : defaultOn);
+        if (box->isChecked()) {
+            m_enabledCategories.insert(id);
+        } else {
+            m_enabledCategories.remove(id);
+        }
         connect(box, &QCheckBox::toggled, this, [this, id](bool on) {
             if (on) {
                 m_enabledCategories.insert(id);
@@ -427,21 +459,55 @@ void SystemInfoDialog::rebuildCategoryFilters()
             }
             rebuildLogView();
         });
-        m_categoryBoxes.insert(category.id, box);
+        // Addressable by name, for the tests and the automation bridge.
+        box->setObjectName(QStringLiteral("logFilter_%1").arg(id));
+        m_categoryBoxes.insert(id, box);
         m_filterRow->addWidget(box);
+    };
+
+    const QList<LogManager::Category> categories = LogManager::instance().categories();
+    QHash<QString, LogManager::Category> byId;
+    for (const LogManager::Category& category : categories) {
+        byId.insert(category.id, category);
     }
 
-    if (m_categoryBoxes.isEmpty()) {
-        auto* hint = new QLabel(
-            QStringLiteral("No log categories are switched on — enable them in "
-                           "Help \u2192 Support."),
-            m_logsPage);
-        m_filterRow->addWidget(hint);
+    // Group one: the categories the issue names for this tab, in its order.
+    QSet<QString> perfIds;
+    for (const char* const id : kPerfCategories) {
+        const QString key = QString::fromLatin1(id);
+        perfIds.insert(key);
+        const auto found = byId.constFind(key);
+        if (found != byId.constEnd()) {
+            addBox(key, found->label, found->description, found->enabled, true);
+        }
     }
 
-    // Drop view-filter state for categories that are no longer logged at all.
-    m_enabledCategories.intersect(stillEnabled);
+    // The separator earns its place: it is what makes "these three are on by
+    // default" legible as a decision rather than an arbitrary set of ticks.
+    auto* separator = new QFrame(m_logsPage);
+    separator->setFrameShape(QFrame::VLine);
+    separator->setFrameShadow(QFrame::Sunken);
+    m_filterRow->addWidget(separator);
+
+    addBox(QString::fromLatin1(kUncategorized), QStringLiteral("General"),
+           QStringLiteral("Uncategorized output, including Qt's own"), true, false);
+
+    for (const LogManager::Category& category : categories) {
+        if (!perfIds.contains(category.id)) {
+            addBox(category.id, category.label, category.description,
+                   category.enabled, false);
+        }
+    }
+
     m_filterRow->addStretch(1);
+    auto* legend = new QLabel(QStringLiteral("dimmed = warnings only"), m_logsPage);
+    ThemeManager::instance().applyStyleSheet(
+        legend, QStringLiteral("QLabel { color: {{color.text.disabled}}; }"));
+    legend->setToolTip(
+        QStringLiteral("A dimmed category is switched off in Help \u2192 Support, "
+                       "so only its warnings and criticals reach the log at all. "
+                       "Ticking it here shows those."));
+    m_filterRow->addWidget(legend);
 
     // Size the viewport only now the row has widgets in it. Measuring the host
     // at construction time — before this function has ever run — reports the

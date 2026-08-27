@@ -58,6 +58,11 @@ private slots:
     // can actually saturate a core on demand.
     void onThresholdExceeded(const QString& threadName, double percentOfCore);
 
+    // A slot for the same reason as applySample: the two defects this tab
+    // shipped with were both about which lines reach the view, and a test can
+    // only pin that if it can hand the tab a line.
+    void appendLogLine(const QString& line);
+
 private:
     QWidget* buildThreadsTab();
     QWidget* buildLogsTab();
@@ -71,7 +76,6 @@ private:
     void openLogTail();
     void closeLogTail();
     void pollLog();
-    void appendLogLine(const QString& line);
     void rebuildLogView();
     static QString categoryFromLine(const QString& line);
 

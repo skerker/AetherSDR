@@ -11,12 +11,15 @@
 
 #include "TestSettingsProfile.h"
 #include "core/AppSettings.h"
+#include "core/LogManager.h"
 #include "core/ThreadCpuRing.h"
 #include "gui/SparklineDelegate.h"
 #include "gui/SystemInfoDialog.h"
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QLabel>
+#include <QPlainTextEdit>
 #include <QPainter>
 #include <QPixmap>
 #include <QTabWidget>
@@ -246,6 +249,69 @@ int main(int argc, char** argv)
                summary->toolTip().isEmpty());
     } else {
         report("the thread summary label is addressable by name", false);
+    }
+
+    // ── Logs tab: the two classes of line the filter used to hide ────────────
+    //
+    // Both were found by re-reading LogManager rather than by running the
+    // dialog, which is why they are pinned here: neither shows up as a crash or
+    // a failing build, only as a line that quietly never appears.
+    {
+        auto* viewer = dialog.findChild<QPlainTextEdit*>(
+            QStringLiteral("systemInfoLogViewer"));
+        report("the log viewer is addressable by name", viewer != nullptr);
+
+        const auto box = [&dialog](const char* id) {
+            return dialog.findChild<QCheckBox*>(
+                QStringLiteral("logFilter_%1").arg(QLatin1String(id)));
+        };
+        const auto feed = [&dialog](const QString& line) {
+            QMetaObject::invokeMethod(&dialog, "appendLogLine", Qt::DirectConnection,
+                                      Q_ARG(QString, line));
+        };
+
+        // Defect 1: Qt files uncategorized output under "default", which is not
+        // in LogManager's list. With no box for it those lines were unreachable
+        // — stored, filtered out, and impossible to switch on.
+        auto* general = box("default");
+        report("uncategorized output has a filter box at all", general != nullptr);
+        if (general != nullptr && viewer != nullptr) {
+            report("General starts unticked, off the default perf view",
+                   !general->isChecked());
+            feed(QStringLiteral("[00:00:01.000] WRN default: uncategorized warning"));
+            report("an unticked category's line stays out of the view",
+                   !viewer->toPlainText().contains(QLatin1String("uncategorized warning")));
+            general->setChecked(true);
+            report("ticking General reveals the line already received",
+                   viewer->toPlainText().contains(QLatin1String("uncategorized warning")));
+        }
+
+        // Defect 2: a category switched OFF in LogManager still writes warnings
+        // and criticals (LogManager.h:58). The row used to skip those
+        // categories entirely, so the most important lines in the file had no
+        // box that could show them.
+        const bool daxOff = !LogManager::instance().isEnabled(QStringLiteral("aether.dax"));
+        auto* dax = box("aether.dax");
+        report("a switched-off category still gets a filter box",
+               dax != nullptr && daxOff);
+        if (dax != nullptr && viewer != nullptr) {
+            feed(QStringLiteral("[00:00:02.000] WRN aether.dax: sink negotiation failed"));
+            report("its warning is hidden while its box is unticked",
+                   !viewer->toPlainText().contains(QLatin1String("sink negotiation")));
+            dax->setChecked(true);
+            report("ticking it reveals the warning that was always being written",
+                   viewer->toPlainText().contains(QLatin1String("sink negotiation")));
+        }
+
+        // The design's named set is what an operator lands on.
+        report("aether.perf is ticked by default",
+               box("aether.perf") != nullptr && box("aether.perf")->isChecked());
+        report("aether.render is ticked by default",
+               box("aether.render") != nullptr && box("aether.render")->isChecked());
+        report("aether.audio is ticked by default",
+               box("aether.audio") != nullptr && box("aether.audio")->isChecked());
+        report("a category outside that set is offered but not ticked",
+               box("aether.cw") != nullptr && !box("aether.cw")->isChecked());
     }
 
     std::printf("%s\n", g_failures == 0 ? "system_info_dialog_test: all passed"
