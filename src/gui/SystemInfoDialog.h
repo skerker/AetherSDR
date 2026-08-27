@@ -64,6 +64,10 @@ private slots:
     // only pin that if it can hand the tab a line.
     void appendLogLine(const QString& line);
 
+    // A slot so a test can step the tail deterministically instead of waiting
+    // on the 500 ms timer — which is how the rotation path gets exercised.
+    void pollLog();
+
 private:
     QWidget* buildThreadsTab();
     QWidget* buildLogsTab();
@@ -76,7 +80,10 @@ private:
     void rebuildCategoryFilters();
     void openLogTail();
     void closeLogTail();
-    void pollLog();
+    // Reopen after the file underneath us was rotated, restarted or replaced.
+    // Returns false when there is nothing to follow.
+    bool reopenLogTail(const QString& path);
+    void setAllCategoriesVisible(bool visible);
     void rebuildLogView();
     // One place that owns the follow state, its button's text and tooltip, and
     // the jump to the newest line — so the button, the scrollbar and the
@@ -111,6 +118,7 @@ private:
     // bottom fires valueChanged, and without this the first appended line would
     // look like the operator scrolling and switch following off.
     bool            m_handlingLogScroll{false};
+    QLabel*         m_logPathLabel{nullptr};
     QTimer*         m_logTimer{nullptr};
     QFile           m_logFile;
     QVector<QPair<QString, QString>> m_logLines;  // category, text

@@ -14,6 +14,7 @@
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QRegularExpression>
+#include <QFileInfo>
 #include <QFrame>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -47,6 +48,13 @@ const char* const kPerfCategories[] = {"aether.perf", "aether.render", "aether.a
 // never be displayed at all — the same hand-built "General" box the network
 // dialog carries (NetworkDiagnosticsDialog.cpp:1500).
 const char* const kUncategorized = "default";
+
+// The tab's own notices — currently just "the log was reset" — ride the same
+// path as real log lines so that replaying the buffer keeps them in place. They
+// get no checkbox and are permanently visible: a notice explaining why the pane
+// just emptied is useless if it lands behind a filter the operator has not
+// ticked, and after this commit "default" is unticked by default.
+const char* const kNoticeCategory = "systeminfo";
 constexpr qint64 kInitialTailBytes = 64 * 1024;
 constexpr qsizetype kMaxStoredLines = 5000;
 
@@ -94,6 +102,15 @@ SystemInfoDialog::SystemInfoDialog(QWidget* parent)
     tabs->addTab(buildThreadsTab(), QStringLiteral("Threads"));
     tabs->addTab(buildLogsTab(), QStringLiteral("Logs"));
     layout->addWidget(tabs);
+
+    auto* buttonRow = new QHBoxLayout;
+    buttonRow->addStretch(1);
+    auto* closeButton = new QPushButton(QStringLiteral("Close"), bodyWidget());
+    closeButton->setObjectName(QStringLiteral("systemInfoCloseButton"));
+    connect(closeButton, &QPushButton::clicked, this, &QDialog::close);
+    buttonRow->addWidget(closeButton);
+    layout->addLayout(buttonRow);
+
     resize(900, 600);
 }
 
@@ -388,8 +405,30 @@ QWidget* SystemInfoDialog::buildLogsTab()
                 rebuildCategoryFilters();
                 rebuildLogView();
             });
+    auto* buttonRow = new QHBoxLayout;
+    auto* selectAll = new QPushButton(QStringLiteral("Select All"), page);
+    selectAll->setObjectName(QStringLiteral("systemInfoSelectAllCategories"));
+    connect(selectAll, &QPushButton::clicked, this,
+            [this]() { setAllCategoriesVisible(true); });
+    auto* deselectAll = new QPushButton(QStringLiteral("Deselect All"), page);
+    deselectAll->setObjectName(QStringLiteral("systemInfoDeselectAllCategories"));
+    connect(deselectAll, &QPushButton::clicked, this,
+            [this]() { setAllCategoriesVisible(false); });
+    buttonRow->addWidget(selectAll);
+    buttonRow->addWidget(deselectAll);
+    buttonRow->addStretch(1);
+    layout->addLayout(buttonRow);
+
     auto* infoRow = new QHBoxLayout;
-    infoRow->addStretch(1);
+    // Which file this is. Without it an empty pane is ambiguous between "no
+    // matching lines" and "following something other than what you think".
+    m_logPathLabel = new QLabel(page);
+    m_logPathLabel->setObjectName(QStringLiteral("systemInfoLogPath"));
+    m_logPathLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ThemeManager::instance().applyStyleSheet(
+        m_logPathLabel,
+        QStringLiteral("QLabel { color: {{color.text.secondary}}; font-size: 11px; }"));
+    infoRow->addWidget(m_logPathLabel, 1);
     m_logLiveToggle = new QPushButton(QStringLiteral("Live"), page);
     m_logLiveToggle->setObjectName(QStringLiteral("systemInfoLogLiveToggle"));
     m_logLiveToggle->setCheckable(true);
@@ -424,8 +463,23 @@ QWidget* SystemInfoDialog::buildLogsTab()
 
     setLogFollowLive(true);   // establishes the button's text and tooltip
 
+    // No checkbox, never removed — see kNoticeCategory.
+    m_enabledCategories.insert(QString::fromLatin1(kNoticeCategory));
+
     rebuildCategoryFilters();
     return page;
+}
+
+void SystemInfoDialog::setAllCategoriesVisible(bool visible)
+{
+    // Through the boxes rather than the set directly, so each one's toggled
+    // handler keeps m_enabledCategories in step and the view rebuilds once at
+    // the end rather than per category.
+    for (auto it = m_categoryBoxes.constBegin(); it != m_categoryBoxes.constEnd(); ++it) {
+        if (it.value() != nullptr) {
+            it.value()->setChecked(visible);
+        }
+    }
 }
 
 void SystemInfoDialog::rebuildCategoryFilters()
@@ -568,20 +622,8 @@ void SystemInfoDialog::openLogTail()
     if (m_logFile.isOpen()) {
         return;
     }
-    const QString path = LogManager::instance().logFilePath();
-    if (path.isEmpty()) {
+    if (!reopenLogTail(LogManager::instance().logFilePath())) {
         return;
-    }
-    m_logFile.setFileName(path);
-    if (!m_logFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        return;
-    }
-    // Start from the tail, not the beginning: a long session's log is tens of
-    // megabytes and none of it is the stall being investigated right now.
-    const qint64 size = m_logFile.size();
-    if (size > kInitialTailBytes) {
-        m_logFile.seek(size - kInitialTailBytes);
-        m_logFile.readLine();  // discard the partial line the seek landed in
     }
     pollLog();
 
@@ -591,6 +633,33 @@ void SystemInfoDialog::openLogTail()
         connect(m_logTimer, &QTimer::timeout, this, &SystemInfoDialog::pollLog);
     }
     m_logTimer->start();
+}
+
+bool SystemInfoDialog::reopenLogTail(const QString& path)
+{
+    if (m_logPathLabel != nullptr) {
+        m_logPathLabel->setText(path.isEmpty()
+                                    ? QStringLiteral("Log: (not writing to a file)")
+                                    : QStringLiteral("Log: %1").arg(path));
+    }
+    if (path.isEmpty()) {
+        return false;
+    }
+    m_logFile.close();
+    m_logFile.setFileName(path);
+    if (!m_logFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return false;
+    }
+    // Start from the tail, not the beginning: a long session's log is tens of
+    // megabytes and none of it is the stall being investigated right now. A
+    // file shorter than the window is read whole, which is also what a
+    // just-rotated log wants.
+    const qint64 size = m_logFile.size();
+    if (size > kInitialTailBytes) {
+        m_logFile.seek(size - kInitialTailBytes);
+        m_logFile.readLine();  // discard the partial line the seek landed in
+    }
+    return true;
 }
 
 void SystemInfoDialog::closeLogTail()
@@ -608,6 +677,27 @@ void SystemInfoDialog::pollLog()
     if (!m_logFile.isOpen()) {
         return;
     }
+
+    // The file can move out from under a tail that has been running for hours:
+    // rotated, restarted by LogManager, or replaced at the same path. Reading
+    // from a stale handle looks exactly like a log that simply stopped — the
+    // pane goes quiet and nothing says why, which during an investigation reads
+    // as "the app stopped logging" rather than "this view is stuck".
+    const QString currentPath = LogManager::instance().logFilePath();
+    const QFileInfo info(currentPath);
+    const bool pathChanged = m_logFile.fileName() != currentPath;
+    const bool truncated = info.exists() && info.size() < m_logFile.pos();
+    if (pathChanged || truncated) {
+        if (!reopenLogTail(currentPath)) {
+            return;
+        }
+        appendLogLine(QStringLiteral("[--:--:--.---] INF %1: Log file was %2; "
+                                     "following the current one from here")
+                          .arg(QLatin1String(kNoticeCategory),
+                               pathChanged ? QStringLiteral("replaced")
+                                           : QStringLiteral("reset")));
+    }
+
     while (!m_logFile.atEnd()) {
         const QString line = QString::fromUtf8(m_logFile.readLine()).trimmed();
         if (!line.isEmpty()) {

@@ -21,7 +21,10 @@
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QDir>
+#include <QFile>
 #include <QScrollBar>
+#include <QTemporaryDir>
 #include <QPainter>
 #include <QPixmap>
 #include <QTabWidget>
@@ -371,6 +374,86 @@ int main(int argc, char** argv)
             dialog.hide();
             QCoreApplication::processEvents();
         }
+    }
+
+    // ── The tail survives the file moving underneath it ──────────────────────
+    //
+    // A tail running for hours outlives log rotation. Reading on from a stale
+    // handle looks exactly like a log that stopped: the pane goes quiet and
+    // nothing says why, which during an investigation reads as "the app stopped
+    // logging" rather than "this view is stuck".
+    {
+        QTemporaryDir tempDir;
+        report("a temporary log directory is available", tempDir.isValid());
+        const QString logPath = tempDir.filePath(QStringLiteral("aethersdr.log"));
+        // Seeded AFTER startLogging, which opens the file for writing and
+        // truncates it — a line written before that call does not survive to be
+        // tailed.
+        LogManager::instance().startLogging(logPath, false);
+        {
+            QFile seed(logPath);
+            seed.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text);
+            seed.write("[00:00:00.000] WRN aether.perf: before the reset\n");
+        }
+
+        SystemInfoDialog tailing;
+        tailing.show();
+        QCoreApplication::processEvents();
+
+        auto* path = tailing.findChild<QLabel*>(QStringLiteral("systemInfoLogPath"));
+        report("the Logs tab names the file it is following",
+               path != nullptr && path->text().contains(logPath));
+
+        auto* view = tailing.findChild<QPlainTextEdit*>(
+            QStringLiteral("systemInfoLogViewer"));
+        report("the seeded line is tailed",
+               view != nullptr
+                   && view->toPlainText().contains(QLatin1String("before the reset")));
+
+        // Rotation: the file is replaced by a shorter one at the same path, so
+        // the handle's position is now past its end.
+        {
+            QFile rotated(logPath);
+            rotated.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
+            rotated.write("[00:00:01.000] WRN aether.perf: after the reset\n");
+        }
+        QMetaObject::invokeMethod(&tailing, "pollLog", Qt::DirectConnection);
+        QCoreApplication::processEvents();
+
+        if (view != nullptr) {
+            report("lines written after a reset are picked up",
+                   view->toPlainText().contains(QLatin1String("after the reset")));
+            // The notice rides a reserved category with no checkbox, so it is
+            // visible even though "default" is unticked by default.
+            report("the reset is announced rather than passing silently",
+                   view->toPlainText().contains(QLatin1String("Log file was reset")));
+        }
+
+        // Select All / Deselect All reach every box, dimmed ones included.
+        auto* selectAll = tailing.findChild<QPushButton*>(
+            QStringLiteral("systemInfoSelectAllCategories"));
+        auto* deselectAll = tailing.findChild<QPushButton*>(
+            QStringLiteral("systemInfoDeselectAllCategories"));
+        auto* cwBox = tailing.findChild<QCheckBox*>(
+            QStringLiteral("logFilter_aether.cw"));
+        report("the filter row has Select All and Deselect All",
+               selectAll != nullptr && deselectAll != nullptr);
+        if (selectAll != nullptr && deselectAll != nullptr && cwBox != nullptr) {
+            report("a non-default category starts unticked", !cwBox->isChecked());
+            selectAll->click();
+            report("Select All reaches a category outside the perf set",
+                   cwBox->isChecked());
+            deselectAll->click();
+            report("Deselect All clears it again", !cwBox->isChecked());
+        }
+
+        report("the dialog has a Close button",
+               tailing.findChild<QPushButton*>(
+                   QStringLiteral("systemInfoCloseButton")) != nullptr);
+
+        tailing.hide();
+        QCoreApplication::processEvents();
+        LogManager::instance().shutdownLogging();
     }
 
     std::printf("%s\n", g_failures == 0 ? "system_info_dialog_test: all passed"
