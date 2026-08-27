@@ -30,7 +30,15 @@ constexpr qsizetype kMaxStoredLines = 5000;
 // A trailing spacer column soaks up slack on a wide window. Without it the
 // stretch has to land on a real column, and the thread name — the only one
 // that varies — ends up several hundred pixels wider than the longest name.
-enum Column { ColName = 0, ColTid, ColCpu, ColTotal, ColSpacer, ColumnCount };
+// An unnamed row is a raw std::thread Qt never saw — say so rather than leaving
+// a blank cell that reads as a rendering fault. Shared so the table cell and the
+// summary line cannot describe the same thread differently.
+QString displayName(const ThreadCpuSample& sample)
+{
+    return sample.name.isEmpty() ? QStringLiteral("(unnamed)") : sample.name;
+}
+
+enum Column { ColName = 0, ColTid, ColCpu, ColPeak, ColTotal, ColSpacer, ColumnCount };
 
 }  // namespace
 
@@ -65,11 +73,21 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     m_threadTable = new QTableWidget(0, ColumnCount, page);
     m_threadTable->setHorizontalHeaderLabels(
         {QStringLiteral("Thread"), QStringLiteral("TID"),
-         QStringLiteral("CPU %"), QStringLiteral("Total CPU (s)"), QString()});
+         QStringLiteral("CPU %"), QStringLiteral("Peak 60 s"),
+         QStringLiteral("Total CPU (s)"), QString()});
     m_threadTable->horizontalHeaderItem(ColCpu)->setToolTip(
         QStringLiteral("Share of ONE core, 0-100. Not a share of the machine: a "
                        "single thread pinning one core reads 100 % here however "
                        "many cores are idle."));
+    m_threadTable->horizontalHeaderItem(ColPeak)->setToolTip(
+        QStringLiteral("Highest CPU % this thread reached in the last 60 s "
+                       "(%1 samples at %2 ms). A spike between two glances at "
+                       "the CPU % column is invisible without it.\n\nReset "
+                       "when the dialog is hidden: sampling stops there, so a "
+                       "peak carried across the gap would describe a minute "
+                       "nobody observed.")
+            .arg(ThreadCpuRing::kSamples)
+            .arg(SystemInfoCollector::kSampleIntervalMs));
     m_threadTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_threadTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_threadTable->setSortingEnabled(true);
@@ -84,10 +102,12 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColName, QHeaderView::Interactive);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColTid, QHeaderView::Interactive);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColCpu, QHeaderView::Interactive);
+    m_threadTable->horizontalHeader()->setSectionResizeMode(ColPeak, QHeaderView::Interactive);
     m_threadTable->horizontalHeader()->setSectionResizeMode(ColTotal, QHeaderView::Interactive);
-    m_threadTable->setColumnWidth(ColName, 300);
+    m_threadTable->setColumnWidth(ColName, 280);
     m_threadTable->setColumnWidth(ColTid, 90);
     m_threadTable->setColumnWidth(ColCpu, 80);
+    m_threadTable->setColumnWidth(ColPeak, 90);
     m_threadTable->setColumnWidth(ColTotal, 110);
     // The hot thread is the question being asked, so it starts at the top.
     m_threadTable->sortItems(ColCpu, Qt::DescendingOrder);
@@ -109,17 +129,15 @@ void SystemInfoDialog::applySample(const QVector<ThreadCpuSample>& threads)
     m_threadTable->setSortingEnabled(false);
     m_threadTable->setRowCount(threads.size());
 
-    double busiest = 0.0;
-    QString busiestName;
+    // Before the rows are filled: Peak reads from the ring, so the newest
+    // reading has to be in it first or every peak lags one interval behind the
+    // CPU % beside it.
+    m_ring.update(threads);
+
     for (int row = 0; row < threads.size(); ++row) {
         const ThreadCpuSample& sample = threads.at(row);
 
-        // An unnamed row is a raw std::thread Qt never saw — say so rather than
-        // leaving a blank cell that reads as a rendering fault.
-        const QString name = sample.name.isEmpty()
-            ? QStringLiteral("(unnamed)")
-            : sample.name;
-        auto* nameItem = new QTableWidgetItem(name);
+        auto* nameItem = new QTableWidgetItem(displayName(sample));
 
         // setData rather than setText for the numeric columns: a text item
         // sorts lexicographically, which puts 9 % above 80 %.
@@ -127,34 +145,42 @@ void SystemInfoDialog::applySample(const QVector<ThreadCpuSample>& threads)
         tidItem->setData(Qt::DisplayRole, static_cast<qulonglong>(sample.tid));
         auto* cpuItem = new QTableWidgetItem;
         cpuItem->setData(Qt::DisplayRole, QString::number(sample.cpuPercentOfCore, 'f', 1).toDouble());
+        auto* peakItem = new QTableWidgetItem;
+        peakItem->setData(Qt::DisplayRole,
+                          QString::number(m_ring.peakFor(sample.tid), 'f', 1).toDouble());
         auto* totalItem = new QTableWidgetItem;
         totalItem->setData(Qt::DisplayRole,
                            QString::number(static_cast<double>(sample.cpuUsecs) / 1e6, 'f', 1).toDouble());
 
         tidItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         cpuItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        peakItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         totalItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
         m_threadTable->setItem(row, ColName, nameItem);
         m_threadTable->setItem(row, ColTid, tidItem);
         m_threadTable->setItem(row, ColCpu, cpuItem);
+        m_threadTable->setItem(row, ColPeak, peakItem);
         m_threadTable->setItem(row, ColTotal, totalItem);
-
-        if (sample.cpuPercentOfCore > busiest) {
-            busiest = sample.cpuPercentOfCore;
-            busiestName = name;
-        }
     }
 
     m_threadTable->setSortingEnabled(true);
     m_threadTable->sortItems(sortColumn, sortOrder);
 
     if (m_threadSummary != nullptr) {
+        // The shared helper rather than a second inline scan, so the summary
+        // line and thresholdExceeded can never disagree about which thread is
+        // busiest. It also names an all-idle table's busiest thread instead of
+        // falling back to a dash: at 0.0 % that is a reading, not an absence.
+        const int busiest = SystemInfo::busiestThreadIndex(threads);
+        const QString busiestName = busiest < 0
+            ? QStringLiteral("—")
+            : displayName(threads.at(busiest));
         m_threadSummary->setText(
             QStringLiteral("%1 threads · busiest %2 at %3 % of one core")
                 .arg(threads.size())
-                .arg(busiestName.isEmpty() ? QStringLiteral("—") : busiestName)
-                .arg(busiest, 0, 'f', 1));
+                .arg(busiestName)
+                .arg(busiest < 0 ? 0.0 : threads.at(busiest).cpuPercentOfCore, 0, 'f', 1));
     }
 }
 
@@ -194,6 +220,11 @@ void SystemInfoDialog::stopSampling()
     m_collector = nullptr;
     delete m_collectorThread;
     m_collectorThread = nullptr;
+
+    // Peak claims "the last 60 s". Nothing is sampled while the dialog is
+    // hidden, so a ring carried across that gap would describe a minute nobody
+    // observed.
+    m_ring.clear();
 }
 
 // ── Logs ────────────────────────────────────────────────────────────────────
