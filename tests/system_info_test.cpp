@@ -120,6 +120,88 @@ void testPercentMaths()
     }
 }
 
+const char* stateName(ThreadRunState state)
+{
+    switch (state) {
+    case ThreadRunState::Unknown:         return "Unknown";
+    case ThreadRunState::Running:         return "Running";
+    case ThreadRunState::Waiting:         return "Waiting";
+    case ThreadRunState::Uninterruptible: return "Uninterruptible";
+    case ThreadRunState::Stopped:         return "Stopped";
+    case ThreadRunState::Halted:          return "Halted";
+    case ThreadRunState::Zombie:          return "Zombie";
+    }
+    return "?";
+}
+
+void testRunState()
+{
+    // The /proc state character mapping is pure and platform-free, so it is
+    // tested on every host rather than only on the kernel that writes it.
+    report("'R' is Running",
+           SystemInfo::runStateFromProcChar('R') == ThreadRunState::Running);
+    report("'S' is Waiting",
+           SystemInfo::runStateFromProcChar('S') == ThreadRunState::Waiting);
+    report("'I' — the idle sleep variant — is also Waiting",
+           SystemInfo::runStateFromProcChar('I') == ThreadRunState::Waiting);
+    report("'D' is Uninterruptible",
+           SystemInfo::runStateFromProcChar('D') == ThreadRunState::Uninterruptible);
+    report("'T' and 't' are both Stopped",
+           SystemInfo::runStateFromProcChar('T') == ThreadRunState::Stopped
+               && SystemInfo::runStateFromProcChar('t') == ThreadRunState::Stopped);
+    report("'Z' is Zombie",
+           SystemInfo::runStateFromProcChar('Z') == ThreadRunState::Zombie);
+
+    // The point of the default arm: an unrecognised character must not be
+    // mapped to whichever state looks closest. 'X' is dead, which is not the
+    // same claim as Halted, and a character the parse never found at all is a
+    // failure to read rather than a state.
+    report("'X' (dead) is Unknown, not Halted",
+           SystemInfo::runStateFromProcChar('X') == ThreadRunState::Unknown);
+    report("an absent character is Unknown",
+           SystemInfo::runStateFromProcChar('\0') == ThreadRunState::Unknown);
+    report("an unrecognised character is Unknown",
+           SystemInfo::runStateFromProcChar('?') == ThreadRunState::Unknown);
+
+    // State rides the delta the same way the name does, and it comes from the
+    // CURRENT snapshot — what the thread is doing now, not an average.
+    {
+        ThreadTimes before = makeThread(3, 0);
+        before.state = ThreadRunState::Waiting;
+        ThreadTimes after = makeThread(3, 1000);
+        after.state = ThreadRunState::Running;
+        const auto samples = SystemInfo::cpuPercentBetween({before}, {after}, 1000);
+        report("the run state is carried through, taken from the newer snapshot",
+               !samples.isEmpty() && samples.first().state == ThreadRunState::Running);
+    }
+
+    // The live check: this thread is executing enumerateThreads(), so on a
+    // platform that can answer it cannot be anything but Running. Windows has
+    // no per-thread state to read, and asserting Unknown there is the point —
+    // it pins that the column stays honest rather than acquiring a derived
+    // value later.
+    ThreadRunState own = ThreadRunState::Unknown;
+    bool foundOwn = false;
+    // Named so the row can be identified; there is no portable "which row am
+    // I" other than the name this very file already proves round-trips.
+    SystemInfo::setCurrentThreadName("aether-state");
+    for (const ThreadTimes& times : SystemInfo::enumerateThreads()) {
+        if (times.name.startsWith(QLatin1String("aether-state"))) {
+            own = times.state;
+            foundOwn = true;
+        }
+    }
+    std::printf("[info] this thread's own reported run state: %s\n", stateName(own));
+    report("the calling thread finds its own row", foundOwn);
+#if defined(Q_OS_WIN)
+    report("Windows reports Unknown rather than a derived value",
+           own == ThreadRunState::Unknown);
+#else
+    report("the thread doing the enumerating reports Running",
+           own == ThreadRunState::Running);
+#endif
+}
+
 void testEnumeration()
 {
     const QVector<ThreadTimes> threads = SystemInfo::enumerateThreads();
@@ -224,6 +306,7 @@ int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
     testPercentMaths();
+    testRunState();
     testEnumeration();
     testNaming();
     testQtNamesItsOwnThreads();
