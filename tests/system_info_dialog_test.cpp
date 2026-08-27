@@ -275,48 +275,47 @@ int main(int argc, char** argv)
                                       Q_ARG(QString, line));
         };
 
-        // Defect 1: Qt files uncategorized output under "default", which is not
-        // in LogManager's list. With no box for it those lines were unreachable
-        // — stored, filtered out, and impossible to switch on.
-        auto* general = box("default");
-        report("uncategorized output has a filter box at all", general != nullptr);
-        if (general != nullptr && viewer != nullptr) {
-            report("General starts unticked, off the default perf view",
-                   !general->isChecked());
-            feed(QStringLiteral("[00:00:01.000] WRN default: uncategorized warning"));
-            report("an unticked category's line stays out of the view",
+        // Scope: the three categories the issue names for this tab, and no
+        // others. Threads enumerates every thread; the log answers what the
+        // perf subsystem was doing. Offering the whole registry here would make
+        // the tab a duplicate of the network dialog's log viewer.
+        report("aether.perf is offered", box("aether.perf") != nullptr);
+        report("aether.render is offered", box("aether.render") != nullptr);
+        report("aether.audio is offered", box("aether.audio") != nullptr);
+        report("a category outside the perf set is NOT offered here",
+               box("aether.cw") == nullptr && box("aether.dax") == nullptr);
+        report("all three start ticked",
+               box("aether.perf")->isChecked() && box("aether.render")->isChecked()
+                   && box("aether.audio")->isChecked());
+
+        // The defect this tab shipped with, on the categories it actually
+        // offers: a category switched OFF still writes warnings and criticals
+        // (LogManager.h:58). The row used to skip those categories entirely, so
+        // the most important lines in the file had no box that could show them
+        // — and aether.perf is switched off by default, so this is the common
+        // case rather than an edge one.
+        const bool perfOff = !LogManager::instance().isEnabled(QStringLiteral("aether.perf"));
+        report("aether.perf is switched off by default, so this case is real", perfOff);
+        if (viewer != nullptr) {
+            feed(QStringLiteral("[00:00:01.000] WRN aether.perf: frame budget exceeded"));
+            report("a warnings-only category's warning is shown, not filtered away",
+                   viewer->toPlainText().contains(QLatin1String("frame budget")));
+            box("aether.perf")->setChecked(false);
+            report("unticking it hides the line again",
+                   !viewer->toPlainText().contains(QLatin1String("frame budget")));
+            box("aether.perf")->setChecked(true);
+        }
+
+        // Out of scope by design, and asserted so the decision is visible in
+        // the suite rather than only in a commit message: uncategorized output
+        // has no box here, so it does not appear.
+        report("uncategorized output is not offered on this tab",
+               box("default") == nullptr);
+        if (viewer != nullptr) {
+            feed(QStringLiteral("[00:00:02.000] WRN default: uncategorized warning"));
+            report("and does not reach the view",
                    !viewer->toPlainText().contains(QLatin1String("uncategorized warning")));
-            general->setChecked(true);
-            report("ticking General reveals the line already received",
-                   viewer->toPlainText().contains(QLatin1String("uncategorized warning")));
         }
-
-        // Defect 2: a category switched OFF in LogManager still writes warnings
-        // and criticals (LogManager.h:58). The row used to skip those
-        // categories entirely, so the most important lines in the file had no
-        // box that could show them.
-        const bool daxOff = !LogManager::instance().isEnabled(QStringLiteral("aether.dax"));
-        auto* dax = box("aether.dax");
-        report("a switched-off category still gets a filter box",
-               dax != nullptr && daxOff);
-        if (dax != nullptr && viewer != nullptr) {
-            feed(QStringLiteral("[00:00:02.000] WRN aether.dax: sink negotiation failed"));
-            report("its warning is hidden while its box is unticked",
-                   !viewer->toPlainText().contains(QLatin1String("sink negotiation")));
-            dax->setChecked(true);
-            report("ticking it reveals the warning that was always being written",
-                   viewer->toPlainText().contains(QLatin1String("sink negotiation")));
-        }
-
-        // The design's named set is what an operator lands on.
-        report("aether.perf is ticked by default",
-               box("aether.perf") != nullptr && box("aether.perf")->isChecked());
-        report("aether.render is ticked by default",
-               box("aether.render") != nullptr && box("aether.render")->isChecked());
-        report("aether.audio is ticked by default",
-               box("aether.audio") != nullptr && box("aether.audio")->isChecked());
-        report("a category outside that set is offered but not ticked",
-               box("aether.cw") != nullptr && !box("aether.cw")->isChecked());
 
         // ── Follow-live ──────────────────────────────────────────────────────
         //
@@ -326,7 +325,7 @@ int main(int argc, char** argv)
         auto* live = dialog.findChild<QPushButton*>(
             QStringLiteral("systemInfoLogLiveToggle"));
         report("the Logs tab has a Live toggle", live != nullptr);
-        if (live != nullptr && viewer != nullptr && general != nullptr) {
+        if (live != nullptr && viewer != nullptr) {
             report("it starts following", live->isChecked()
                        && live->text() == QLatin1String("Live"));
 
@@ -334,7 +333,7 @@ int main(int argc, char** argv)
             report("turning it off reads as Paused",
                    live->text() == QLatin1String("Paused"));
 
-            feed(QStringLiteral("[00:00:03.000] WRN default: arrived while paused"));
+            feed(QStringLiteral("[00:00:03.000] WRN aether.perf: arrived while paused"));
             report("a line arriving while paused stays out of the view",
                    !viewer->toPlainText().contains(QLatin1String("while paused")));
 
@@ -350,7 +349,7 @@ int main(int argc, char** argv)
             QCoreApplication::processEvents();
             viewer->setFixedHeight(40);
             for (int i = 0; i < 200; ++i) {
-                feed(QStringLiteral("[00:00:04.%1] WRN default: filler line %2")
+                feed(QStringLiteral("[00:00:04.%1] WRN aether.perf: filler line %2")
                          .arg(i, 3, 10, QLatin1Char('0')).arg(i));
             }
             QCoreApplication::processEvents();
@@ -367,7 +366,7 @@ int main(int argc, char** argv)
             // And our OWN jump to the bottom must not read as that gesture, or
             // the first appended line would switch following off.
             live->setChecked(true);
-            feed(QStringLiteral("[00:00:05.000] WRN default: still following"));
+            feed(QStringLiteral("[00:00:05.000] WRN aether.perf: still following"));
             QCoreApplication::processEvents();
             report("appending while live does not switch following off",
                    live->isChecked());
@@ -427,24 +426,6 @@ int main(int argc, char** argv)
             // visible even though "default" is unticked by default.
             report("the reset is announced rather than passing silently",
                    view->toPlainText().contains(QLatin1String("Log file was reset")));
-        }
-
-        // Select All / Deselect All reach every box, dimmed ones included.
-        auto* selectAll = tailing.findChild<QPushButton*>(
-            QStringLiteral("systemInfoSelectAllCategories"));
-        auto* deselectAll = tailing.findChild<QPushButton*>(
-            QStringLiteral("systemInfoDeselectAllCategories"));
-        auto* cwBox = tailing.findChild<QCheckBox*>(
-            QStringLiteral("logFilter_aether.cw"));
-        report("the filter row has Select All and Deselect All",
-               selectAll != nullptr && deselectAll != nullptr);
-        if (selectAll != nullptr && deselectAll != nullptr && cwBox != nullptr) {
-            report("a non-default category starts unticked", !cwBox->isChecked());
-            selectAll->click();
-            report("Select All reaches a category outside the perf set",
-                   cwBox->isChecked());
-            deselectAll->click();
-            report("Deselect All clears it again", !cwBox->isChecked());
         }
 
         report("the dialog has a Close button",

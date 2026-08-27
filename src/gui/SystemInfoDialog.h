@@ -15,7 +15,6 @@ class QPushButton;
 class QHBoxLayout;
 class QLabel;
 class QPlainTextEdit;
-class QScrollArea;
 class QTableWidget;
 class QThread;
 class QTimer;
@@ -83,7 +82,6 @@ private:
     // Reopen after the file underneath us was rotated, restarted or replaced.
     // Returns false when there is nothing to follow.
     bool reopenLogTail(const QString& path);
-    void setAllCategoriesVisible(bool visible);
     void rebuildLogView();
     // One place that owns the follow state, its button's text and tooltip, and
     // the jump to the newest line — so the button, the scrollbar and the
@@ -111,7 +109,6 @@ private:
     QWidget*        m_logsPage{nullptr};   // parent for dynamically rebuilt filters
     QPlainTextEdit* m_logViewer{nullptr};
     QHBoxLayout*    m_filterRow{nullptr};
-    QScrollArea*    m_filterScroll{nullptr};
     QPushButton*    m_logLiveToggle{nullptr};
     bool            m_logFollowLive{true};
     // Guards the scrollbar handler against our OWN scrolling: every jump to the
