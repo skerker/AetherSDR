@@ -52,9 +52,17 @@ private slots:
     // reach.
     void applySample(const QVector<AetherSDR::ThreadCpuSample>& threads);
 
+    // Acceptance criterion 3, in its minimal form: the summary line goes red
+    // when a thread crosses 90 % of one core. A slot for the same reason
+    // applySample is one — a test can raise the alert without a machine that
+    // can actually saturate a core on demand.
+    void onThresholdExceeded(const QString& threadName, double percentOfCore);
+
 private:
     QWidget* buildThreadsTab();
     QWidget* buildLogsTab();
+
+    void applyAlertStyle();
 
     void startSampling();
     void stopSampling();
@@ -73,6 +81,13 @@ private:
     // Recent readings per thread, for the Peak column. Cleared when sampling
     // stops — see stopSampling().
     ThreadCpuRing m_ring;
+    // Raised by the collector's crossing signal, cleared by the first sample
+    // that comes back below the threshold. The signal is edge-triggered — one
+    // event per crossing rather than one per sample — so the level it implies
+    // has to be held here.
+    bool    m_thresholdAlert{false};
+    QString m_alertThreadName;
+    double  m_alertPercent{0.0};
     QThread*      m_collectorThread{nullptr};
     SystemInfoCollector* m_collector{nullptr};
 
