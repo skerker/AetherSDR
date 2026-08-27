@@ -12,9 +12,12 @@
 #include "TestSettingsProfile.h"
 #include "core/AppSettings.h"
 #include "core/ThreadCpuRing.h"
+#include "gui/SparklineDelegate.h"
 #include "gui/SystemInfoDialog.h"
 
 #include <QApplication>
+#include <QPainter>
+#include <QPixmap>
 #include <QTabWidget>
 #include <QTableWidget>
 
@@ -59,7 +62,7 @@ int main(int argc, char** argv)
         // Four data columns plus a trailing spacer that absorbs slack on a wide
         // window — assert the shape, not a magic number, so a future column is a
         // deliberate edit here rather than a silent count change.
-        report("the table has five data columns plus a spacer", table->columnCount() == 6);
+        report("the table has six data columns plus a spacer", table->columnCount() == 7);
         report("column 0 is Thread",
                table->horizontalHeaderItem(0)->text() == QLatin1String("Thread"));
         report("column 1 is TID",
@@ -70,8 +73,12 @@ int main(int argc, char** argv)
                table->horizontalHeaderItem(3)->text() == QLatin1String("Peak 60 s"));
         report("column 4 is Total CPU (s)",
                table->horizontalHeaderItem(4)->text() == QLatin1String("Total CPU (s)"));
+        report("column 5 is the sparkline",
+               table->horizontalHeaderItem(5)->text() == QLatin1String("Last 60 s"));
         report("the last column is an unlabelled spacer",
-               table->horizontalHeaderItem(5)->text().isEmpty());
+               table->horizontalHeaderItem(6)->text().isEmpty());
+        report("the sparkline column has its own delegate",
+               dynamic_cast<SparklineDelegate*>(table->itemDelegateForColumn(5)) != nullptr);
         report("the table is sortable", table->isSortingEnabled());
     }
 
@@ -143,6 +150,42 @@ int main(int argc, char** argv)
         report("Peak holds the earlier spike after CPU % falls",
                table->item(0, 3) != nullptr
                    && qAbs(table->item(0, 3)->data(Qt::DisplayRole).toDouble() - 91.5) < 0.05);
+
+        // The delegate draws from this role, so it has to survive the trip
+        // through QVariant intact and in order — oldest first.
+        const QList<double> series =
+            table->item(0, 5)->data(SparklineDelegate::kSeriesRole).value<QList<double>>();
+        report("the sparkline series round-trips through the item role",
+               series.size() == 2 && qAbs(series.first() - 91.5) < 0.05
+                   && qAbs(series.last() - 3.0) < 0.05);
+        report("the sparkline column sorts by peak",
+               qAbs(table->item(0, 5)->data(Qt::DisplayRole).toDouble() - 91.5) < 0.05);
+
+        // Painting is where a delegate crashes, and the two cases that reach
+        // the awkward code are the ones a live dialog hits first: a thread seen
+        // for the very first time, and one with a single reading — a polyline
+        // of one point draws nothing, so it is handled separately.
+        SparklineDelegate delegate;
+        QPixmap canvas(140, 20);
+        canvas.fill(Qt::black);
+        QStyleOptionViewItem option;
+        option.rect = QRect(0, 0, 140, 20);
+        {
+            QPainter painter(&canvas);
+            delegate.paint(&painter, option, table->model()->index(0, 5));
+            delegate.paint(&painter, option, table->model()->index(1, 5));
+        }
+        report("painting a populated and an empty series does not crash", true);
+
+        // A degenerate cell — zero height and width — must not divide by a
+        // zero span. It happens while a column is being dragged closed.
+        {
+            QPainter painter(&canvas);
+            QStyleOptionViewItem collapsed;
+            collapsed.rect = QRect(0, 0, 0, 0);
+            delegate.paint(&painter, collapsed, table->model()->index(0, 5));
+        }
+        report("painting into a collapsed cell does not crash", true);
     }
 
     std::printf("%s\n", g_failures == 0 ? "system_info_dialog_test: all passed"

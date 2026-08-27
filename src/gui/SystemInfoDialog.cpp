@@ -1,6 +1,7 @@
 #include "SystemInfoDialog.h"
 
 #include "LogSyntaxHighlighter.h"
+#include "SparklineDelegate.h"
 #include "core/LogManager.h"
 #include "core/SystemInfoCollector.h"
 
@@ -38,7 +39,9 @@ QString displayName(const ThreadCpuSample& sample)
     return sample.name.isEmpty() ? QStringLiteral("(unnamed)") : sample.name;
 }
 
-enum Column { ColName = 0, ColTid, ColCpu, ColPeak, ColTotal, ColSpacer, ColumnCount };
+// Column order follows the issue's own list for the Threads tab.
+enum Column { ColName = 0, ColTid, ColCpu, ColPeak, ColTotal, ColSpark, ColSpacer,
+              ColumnCount };
 
 }  // namespace
 
@@ -74,7 +77,7 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     m_threadTable->setHorizontalHeaderLabels(
         {QStringLiteral("Thread"), QStringLiteral("TID"),
          QStringLiteral("CPU %"), QStringLiteral("Peak 60 s"),
-         QStringLiteral("Total CPU (s)"), QString()});
+         QStringLiteral("Total CPU (s)"), QStringLiteral("Last 60 s"), QString()});
     m_threadTable->horizontalHeaderItem(ColCpu)->setToolTip(
         QStringLiteral("Share of ONE core, 0-100. Not a share of the machine: a "
                        "single thread pinning one core reads 100 % here however "
@@ -88,6 +91,13 @@ QWidget* SystemInfoDialog::buildThreadsTab()
                        "nobody observed.")
             .arg(ThreadCpuRing::kSamples)
             .arg(SystemInfoCollector::kSampleIntervalMs));
+    m_threadTable->horizontalHeaderItem(ColSpark)->setToolTip(
+        QStringLiteral("The same 60 s as Peak, drawn. The vertical scale is "
+                       "fixed at 0-100 % of one core on every row, so a tall "
+                       "line means a busy thread rather than a thread whose "
+                       "own quiet range happened to be scaled up.\n\nSorting "
+                       "this column sorts by peak."));
+    m_threadTable->setItemDelegateForColumn(ColSpark, new SparklineDelegate(m_threadTable));
     m_threadTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_threadTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_threadTable->setSortingEnabled(true);
@@ -109,6 +119,7 @@ QWidget* SystemInfoDialog::buildThreadsTab()
     m_threadTable->setColumnWidth(ColCpu, 80);
     m_threadTable->setColumnWidth(ColPeak, 90);
     m_threadTable->setColumnWidth(ColTotal, 110);
+    m_threadTable->setColumnWidth(ColSpark, 130);
     // The hot thread is the question being asked, so it starts at the top.
     m_threadTable->sortItems(ColCpu, Qt::DescendingOrder);
     layout->addWidget(m_threadTable, 1);
@@ -152,6 +163,14 @@ void SystemInfoDialog::applySample(const QVector<ThreadCpuSample>& threads)
         totalItem->setData(Qt::DisplayRole,
                            QString::number(static_cast<double>(sample.cpuUsecs) / 1e6, 'f', 1).toDouble());
 
+        // The delegate draws the series; the display value exists only so the
+        // column has something to sort by, and peak is the reading a sorted
+        // sparkline column is being asked about.
+        auto* sparkItem = new QTableWidgetItem;
+        sparkItem->setData(Qt::DisplayRole, m_ring.peakFor(sample.tid));
+        sparkItem->setData(SparklineDelegate::kSeriesRole,
+                           QVariant::fromValue(m_ring.seriesFor(sample.tid)));
+
         tidItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         cpuItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
         peakItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -162,6 +181,7 @@ void SystemInfoDialog::applySample(const QVector<ThreadCpuSample>& threads)
         m_threadTable->setItem(row, ColCpu, cpuItem);
         m_threadTable->setItem(row, ColPeak, peakItem);
         m_threadTable->setItem(row, ColTotal, totalItem);
+        m_threadTable->setItem(row, ColSpark, sparkItem);
     }
 
     m_threadTable->setSortingEnabled(true);
