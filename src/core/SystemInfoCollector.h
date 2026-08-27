@@ -32,6 +32,12 @@ public:
     // CPU/Mem refresh so the two surfaces cannot disagree about "now".
     static constexpr int kSampleIntervalMs = 1500;
 
+    // Acceptance criterion 3, verbatim: "Max-thread % alerts when any single
+    // thread exceeds 90% of one core". Maintainer-authored and quoted here so
+    // the number's provenance travels with it — unlike the Overview card
+    // thresholds, which are invented values still awaiting a measured session.
+    static constexpr double kMaxThreadPercentOfCore = 90.0;
+
     explicit SystemInfoCollector(QObject* parent = nullptr);
 
 public slots:
@@ -52,12 +58,23 @@ signals:
     // Queued to the GUI thread by Qt, since emitter and receiver differ.
     void sampleReady(const QVector<AetherSDR::ThreadCpuSample>& threads);
 
+    // The crossing, not the condition: emitted once when the busiest thread
+    // goes above kMaxThreadPercentOfCore, and not again until it has come back
+    // down. A thread pinned at 95 % for a minute is one event, not forty.
+    //
+    // Separate from sampleReady because it is the seam the analysis asked for
+    // ("cheap to add now; expensive to retrofit later"): what an alert should
+    // LOOK like is still open on the issue, and a consumer that wants a badge
+    // or a toast attaches here without the collector having to know.
+    void thresholdExceeded(const QString& threadName, double percentOfCore);
+
 private:
     void sampleOnce();
 
     QTimer* m_timer{nullptr};
     QVector<ThreadTimes> m_previous;   // last raw snapshot, for the delta
     QElapsedTimer m_sinceLastSample;
+    double m_previousBusiestPercent{0.0};   // the latch behind thresholdExceeded
 };
 
 }  // namespace AetherSDR

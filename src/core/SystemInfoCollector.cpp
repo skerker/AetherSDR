@@ -47,6 +47,10 @@ void SystemInfoCollector::shutdown()
         m_timer = nullptr;
     }
     m_previous.clear();
+    // Reset with the rest of the state: a collector restarted after the dialog
+    // was hidden would otherwise inherit "already above the threshold" and
+    // swallow the next crossing.
+    m_previousBusiestPercent = 0.0;
 }
 
 void SystemInfoCollector::sampleOnce()
@@ -64,8 +68,24 @@ void SystemInfoCollector::sampleOnce()
     m_sinceLastSample.restart();
 
     if (!m_previous.isEmpty() && elapsedUsecs > 0) {
-        emit sampleReady(SystemInfo::cpuPercentBetween(
-            m_previous, current, static_cast<quint64>(elapsedUsecs)));
+        const QVector<ThreadCpuSample> samples = SystemInfo::cpuPercentBetween(
+            m_previous, current, static_cast<quint64>(elapsedUsecs));
+        emit sampleReady(samples);
+
+        // The crossing is evaluated here rather than by the consumer so that
+        // every consumer sees the same event. The latch lives in this object,
+        // which is the only thing that sees every sample — a dialog that was
+        // hidden for a minute would otherwise re-announce a condition that had
+        // been true the whole time.
+        const int busiest = SystemInfo::busiestThreadIndex(samples);
+        if (busiest >= 0) {
+            const double percent = samples.at(busiest).cpuPercentOfCore;
+            if (SystemInfo::crossedThreshold(m_previousBusiestPercent, percent,
+                                             kMaxThreadPercentOfCore)) {
+                emit thresholdExceeded(samples.at(busiest).name, percent);
+            }
+            m_previousBusiestPercent = percent;
+        }
     }
     m_previous = current;
 }
