@@ -8,6 +8,7 @@
 // values that would differ between them.
 
 #include "core/SystemInfo.h"
+#include "core/ThreadCpuRing.h"
 
 #include <QCoreApplication>
 #include <QHash>
@@ -202,6 +203,93 @@ void testRunState()
 #endif
 }
 
+ThreadCpuSample makeSample(quint64 tid, double percent)
+{
+    ThreadCpuSample sample;
+    sample.tid = tid;
+    sample.cpuPercentOfCore = percent;
+    return sample;
+}
+
+void testThreadCpuRing()
+{
+    // A thread seen for the first time has no series, so the sparkline draws
+    // nothing rather than a flat line at zero — which would read as an idle
+    // thread rather than an unknown one.
+    {
+        ThreadCpuRing ring;
+        report("an unseen thread has an empty series", ring.seriesFor(1).isEmpty());
+        report("an unseen thread peaks at 0", qAbs(ring.peakFor(1)) < 0.001);
+    }
+
+    // Order is what the sparkline draws, so it is asserted rather than assumed.
+    {
+        ThreadCpuRing ring;
+        ring.update({makeSample(1, 10.0)});
+        ring.update({makeSample(1, 20.0)});
+        ring.update({makeSample(1, 15.0)});
+        const QVector<double> series = ring.seriesFor(1);
+        report("samples accumulate oldest-first",
+               series.size() == 3 && qAbs(series.first() - 10.0) < 0.001
+                   && qAbs(series.last() - 15.0) < 0.001);
+        report("peak is the highest reading in the window",
+               qAbs(ring.peakFor(1) - 20.0) < 0.001);
+    }
+
+    // The window is bounded, and the sample that falls off the end takes its
+    // peak with it: this is the difference between "peak in the last minute"
+    // and "peak ever", and only the first is what the column claims.
+    {
+        ThreadCpuRing ring;
+        ring.update({makeSample(1, 99.0)});          // the spike
+        for (int i = 0; i < ThreadCpuRing::kSamples; ++i) {
+            ring.update({makeSample(1, 1.0)});       // push it out
+        }
+        const QVector<double> series = ring.seriesFor(1);
+        report("the window never exceeds kSamples", series.size() == ThreadCpuRing::kSamples);
+        report("a reading older than the window stops counting toward peak",
+               qAbs(ring.peakFor(1) - 1.0) < 0.001);
+    }
+
+    // Exactly at the boundary, the oldest reading is still inside.
+    {
+        ThreadCpuRing ring;
+        ring.update({makeSample(1, 99.0)});
+        for (int i = 0; i < ThreadCpuRing::kSamples - 1; ++i) {
+            ring.update({makeSample(1, 1.0)});
+        }
+        report("a full-but-not-overflowing window keeps its oldest reading",
+               ring.seriesFor(1).size() == ThreadCpuRing::kSamples
+                   && qAbs(ring.peakFor(1) - 99.0) < 0.001);
+    }
+
+    // Retirement. Without it the ring would hold a reading for every thread
+    // that had ever existed, and peak would keep reporting the high-water mark
+    // of a thread that exited long ago.
+    {
+        ThreadCpuRing ring;
+        ring.update({makeSample(1, 50.0), makeSample(2, 60.0)});
+        report("both threads are tracked", ring.trackedThreads() == 2);
+        ring.update({makeSample(1, 10.0)});
+        report("a thread absent from the newest sample is retired",
+               ring.trackedThreads() == 1 && ring.seriesFor(2).isEmpty());
+        report("its peak goes with it", qAbs(ring.peakFor(2)) < 0.001);
+        report("the surviving thread keeps its history",
+               ring.seriesFor(1).size() == 2 && qAbs(ring.peakFor(1) - 50.0) < 0.001);
+    }
+
+    // clear() is what runs when the dialog is hidden: a peak spanning a gap in
+    // which nothing was sampled would describe a minute nobody observed.
+    {
+        ThreadCpuRing ring;
+        ring.update({makeSample(1, 80.0)});
+        ring.clear();
+        report("clear() drops every thread",
+               ring.trackedThreads() == 0 && ring.seriesFor(1).isEmpty()
+                   && qAbs(ring.peakFor(1)) < 0.001);
+    }
+}
+
 void testEnumeration()
 {
     const QVector<ThreadTimes> threads = SystemInfo::enumerateThreads();
@@ -307,6 +395,7 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     testPercentMaths();
     testRunState();
+    testThreadCpuRing();
     testEnumeration();
     testNaming();
     testQtNamesItsOwnThreads();
