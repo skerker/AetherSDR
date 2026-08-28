@@ -360,10 +360,21 @@ void SystemInfoDialog::startSampling()
     m_collector = new SystemInfoCollector;   // no parent — moved to the thread
     m_collector->moveToThread(m_collectorThread);
     connect(m_collectorThread, &QThread::started, m_collector, &SystemInfoCollector::init);
-    connect(m_collector, &SystemInfoCollector::sampleReady,
-            this, &SystemInfoDialog::applySample);
-    connect(m_collector, &SystemInfoCollector::thresholdExceeded,
-            this, &SystemInfoDialog::onThresholdExceeded);
+    // Queued to this thread; see m_samplingGeneration for why each delivery
+    // checks it still belongs to the run that produced it.
+    const quint64 generation = ++m_samplingGeneration;
+    connect(m_collector, &SystemInfoCollector::sampleReady, this,
+            [this, generation](const QVector<ThreadCpuSample>& threads) {
+                if (generation == m_samplingGeneration) {
+                    applySample(threads);
+                }
+            });
+    connect(m_collector, &SystemInfoCollector::thresholdExceeded, this,
+            [this, generation](const QString& threadName, double percentOfCore) {
+                if (generation == m_samplingGeneration) {
+                    onThresholdExceeded(threadName, percentOfCore);
+                }
+            });
     m_collectorThread->start();
 }
 
@@ -372,6 +383,8 @@ void SystemInfoDialog::stopSampling()
     if (m_collectorThread == nullptr) {
         return;
     }
+    // Anything the collector has already queued to us is now stale.
+    ++m_samplingGeneration;
     // Tear the timer down on the worker thread FIRST. It was created there, and
     // a QTimer destroyed from another thread is undefined behaviour — Qt reports
     // it as "Timers cannot be stopped from another thread".

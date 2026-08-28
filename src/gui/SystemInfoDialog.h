@@ -104,6 +104,13 @@ private:
     double  m_alertPercent{0.0};
     QThread*      m_collectorThread{nullptr};
     SystemInfoCollector* m_collector{nullptr};
+    // Bumped on every start AND stop. A sampleReady already queued to this
+    // thread when stopSampling() runs is still delivered afterwards — Qt does
+    // not withdraw posted calls when the sender dies — and would refill the
+    // ring just cleared, or re-raise the alert on a hidden dialog. The
+    // connections compare the generation they were made under and drop what
+    // no longer belongs to a live sampling run.
+    quint64       m_samplingGeneration{0};
 
     // Logs tab
     QWidget*        m_logsPage{nullptr};   // parent for dynamically rebuilt filters
