@@ -1737,7 +1737,6 @@ target_include_directories(client_pudu_test PRIVATE src)
 add_executable(client_reverb_test
     tests/client_reverb_test.cpp
     src/core/ClientReverb.cpp
-    src/core/ThreadName.cpp
 )
 target_include_directories(client_reverb_test PRIVATE src)
 
@@ -2487,7 +2486,6 @@ add_test(NAME cw_sidetone_test COMMAND cw_sidetone_test)
 # pins the documented reach of the fix.
 add_executable(cw_sidetone_start_policy_test
     tests/cw_sidetone_start_policy_test.cpp
-    src/core/ThreadName.cpp
 )
 target_include_directories(cw_sidetone_start_policy_test PRIVATE src)
 add_test(NAME cw_sidetone_start_policy_test COMMAND cw_sidetone_start_policy_test)
@@ -3366,7 +3364,9 @@ endif()
 set_target_properties(transmit_model_apd_test PROPERTIES AUTOMOC ON)
 add_test(NAME transmit_model_apd_test COMMAND transmit_model_apd_test)
 
-# Help guide search tests - needs QApplication + Widgets.
+# Runtime Monitor dialog (#2554): construct/show/hide, synthetic samples driven into
+# the thread table, the threshold alert, the Logs filters and the tail across a reset.
+# Needs QApplication + Widgets; offscreen.
 add_executable(system_info_dialog_test
     tests/system_info_dialog_test.cpp
     src/gui/SystemInfoDialog.cpp
@@ -3389,6 +3389,7 @@ add_test(NAME system_info_dialog_test COMMAND system_info_dialog_test)
 set_tests_properties(system_info_dialog_test PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+# Help guide search tests - needs QApplication + Widgets.
 add_executable(help_dialog_test
     tests/help_dialog_test.cpp
     src/gui/HelpDialog.cpp
@@ -4070,10 +4071,9 @@ set(AETHER_TEST_WISDOM_DIR "${CMAKE_BINARY_DIR}/test-fftw-wisdom")
 set(AETHER_TEST_FFTW_TIMELIMIT "0.001" CACHE STRING
     "Seconds FFTW may spend measuring each plan under test (empty = unbounded)")
 
-# Startup hardware inventory (#4986): pins the baseline-comparison contracts
-# that arm the "CPU below the speech-engine baseline" warning, plus host
-# self-consistency of the detection. Compiled with the same baseline define as
-# aethercore so the host check exercises the real compiled value.
+# Per-thread CPU accounting behind the Runtime Monitor (#2554): percent maths,
+# /proc state mapping, ring eviction and peak, the threshold latch, and the
+# kernel-name round-trip on the host platform.
 add_executable(system_info_test
     tests/system_info_test.cpp
     src/core/SystemInfo.cpp
@@ -4084,6 +4084,10 @@ target_link_libraries(system_info_test PRIVATE Qt6::Core)
 set_target_properties(system_info_test PROPERTIES AUTOMOC ON)
 add_test(NAME system_info_test COMMAND system_info_test)
 
+# Startup hardware inventory (#4986): pins the baseline-comparison contracts
+# that arm the "CPU below the speech-engine baseline" warning, plus host
+# self-consistency of the detection. Compiled with the same baseline define as
+# aethercore so the host check exercises the real compiled value.
 add_executable(system_inventory_test
     tests/system_inventory_test.cpp
     src/core/SystemInventory.cpp
