@@ -125,6 +125,11 @@ private:
     QLabel*         m_logPathLabel{nullptr};
     QTimer*         m_logTimer{nullptr};
     QFile           m_logFile;
+    // Bytes after the last newline read so far. The writer flushes whole
+    // lines, but a poll can still land between two writes of one batch; the
+    // fragment waits here for its newline rather than being shown as a line
+    // and its remainder filed under "default", which has no box.
+    QByteArray      m_logPartialLine;
     QVector<QPair<QString, QString>> m_logLines;  // category, text
     QSet<QString>   m_enabledCategories;
     QHash<QString, QCheckBox*> m_categoryBoxes;

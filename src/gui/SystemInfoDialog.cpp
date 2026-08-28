@@ -606,10 +606,13 @@ void SystemInfoDialog::openLogTail()
     if (m_logFile.isOpen()) {
         return;
     }
-    if (!reopenLogTail(LogManager::instance().logFilePath())) {
-        return;
+    // The poll runs whether or not the first open succeeded: logFilePath()
+    // always names a file, and one that does not exist yet — logging switched
+    // on after the dialog opened, or a rotation in flight — is retried by
+    // pollLog() rather than left dead until the dialog is hidden and shown.
+    if (reopenLogTail(LogManager::instance().logFilePath())) {
+        pollLog();
     }
-    pollLog();
 
     if (m_logTimer == nullptr) {
         m_logTimer = new QTimer(this);
@@ -630,6 +633,7 @@ bool SystemInfoDialog::reopenLogTail(const QString& path)
         return false;
     }
     m_logFile.close();
+    m_logPartialLine.clear();
     m_logFile.setFileName(path);
     if (!m_logFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return false;
@@ -659,7 +663,11 @@ void SystemInfoDialog::closeLogTail()
 void SystemInfoDialog::pollLog()
 {
     if (!m_logFile.isOpen()) {
-        return;
+        // Not open yet — see openLogTail(). Keep trying at the poll cadence.
+        reopenLogTail(LogManager::instance().logFilePath());
+        if (!m_logFile.isOpen()) {
+            return;
+        }
     }
 
     // The file can move out from under a tail that has been running for hours:
@@ -682,8 +690,15 @@ void SystemInfoDialog::pollLog()
                                            : QStringLiteral("reset")));
     }
 
-    while (!m_logFile.atEnd()) {
-        const QString line = QString::fromUtf8(m_logFile.readLine()).trimmed();
+    // Whole lines only. Whatever follows the last newline stays in
+    // m_logPartialLine until the writer completes it; the network dialog's
+    // tail does the same, and without it a line caught mid-write would be
+    // shown truncated and its tail dropped as an uncategorised fragment.
+    m_logPartialLine += m_logFile.readAll();
+    int newline = -1;
+    while ((newline = m_logPartialLine.indexOf('\n')) >= 0) {
+        const QString line = QString::fromUtf8(m_logPartialLine.left(newline)).trimmed();
+        m_logPartialLine.remove(0, newline + 1);
         if (!line.isEmpty()) {
             appendLogLine(line);
         }
