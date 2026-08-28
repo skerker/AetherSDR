@@ -533,7 +533,7 @@ void SystemInfoDialog::rebuildCategoryFilters()
             box->setToolTip(
                 QStringLiteral("%1 — %2\n\nWarnings and criticals only: this "
                                "category's full logging is switched off. Turn it "
-                               "on in Help \u2192 Support.")
+                               "on in Help \u2192 Support & Diagnostics.")
                     .arg(key, found->description));
         }
 
@@ -568,7 +568,7 @@ void SystemInfoDialog::rebuildCategoryFilters()
             legend, QStringLiteral("QLabel { color: {{color.text.disabled}}; }"));
         legend->setToolTip(
             QStringLiteral("A dimmed category is switched off in Help \u2192 "
-                           "Support, so only its warnings and criticals reach the "
+                           "Support & Diagnostics, so only its warnings and criticals reach the "
                            "log at all. Ticking it here shows those."));
         m_filterRow->addWidget(legend);
     }
