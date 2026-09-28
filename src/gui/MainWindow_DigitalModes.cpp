@@ -55,13 +55,71 @@
 #include "models/SliceModel.h"
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QFile>
 #include <QMessageBox>
 #include <QTimer>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <memory>
 
 namespace AetherSDR {
+
+namespace {
+// LOCAL TEST HARNESS (branch local/rade-wav-inject, never pushed).
+// AETHER_RADE_WAV=<file> replaces the RADE slice's DAX RX audio with a WAV,
+// fed to RADEEngine::feedRxAudio() on channel 1 in real time, looping.
+// The file must already be 24 kHz stereo float32 (feedRxAudio's input format),
+// e.g. `afconvert -f WAVE -d LEF32@24000 -c 2 in.wav out.wav`.
+// Sample used: drowe67/freedv-gui wav/all_radev1.wav, commit facbf5e8 (#998),
+// kept with its source note in Ham-Radio/rade-samples/ (machine-local).
+QString radeWavInjectPath()
+{
+    return QString::fromLocal8Bit(qgetenv("AETHER_RADE_WAV"));
+}
+
+// Returns the interleaved float32 sample bytes of a 24 kHz stereo float WAV,
+// or an empty array (with a warning) if the file is not in that format.
+QByteArray loadRadeInjectWav(const QString& path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        qWarning() << "RADE WAV injection: cannot open" << path;
+        return {};
+    }
+    const QByteArray all = f.readAll();
+    if (all.size() < 12 || !all.startsWith("RIFF") || all.mid(8, 4) != "WAVE") {
+        qWarning() << "RADE WAV injection: not a RIFF/WAVE file" << path;
+        return {};
+    }
+    auto le16 = [&](int at) { quint16 v; std::memcpy(&v, all.constData() + at, 2); return v; };
+    auto le32 = [&](int at) { quint32 v; std::memcpy(&v, all.constData() + at, 4); return v; };
+    bool fmtOk = false;
+    for (int pos = 12; pos + 8 <= all.size();) {
+        const QByteArray id = all.mid(pos, 4);
+        const int len = static_cast<int>(le32(pos + 4));
+        const int body = pos + 8;
+        if (id == "fmt " && len >= 16) {
+            const quint16 format = le16(body), channels = le16(body + 2), bits = le16(body + 14);
+            const quint32 rate = le32(body + 4);
+            // 3 = IEEE float; 0xFFFE = WAVE_FORMAT_EXTENSIBLE (afconvert may write either)
+            fmtOk = (format == 3 || format == 0xFFFE) && channels == 2 && rate == 24000 && bits == 32;
+            if (!fmtOk) {
+                qWarning() << "RADE WAV injection: need 24 kHz stereo float32, got format" << format
+                           << "channels" << channels << "rate" << rate << "bits" << bits;
+                return {};
+            }
+        } else if (id == "data" && fmtOk) {
+            return all.mid(body, std::min(len, static_cast<int>(all.size()) - body));
+        }
+        pos = body + len + (len & 1);
+    }
+    qWarning() << "RADE WAV injection: no fmt/data chunk found" << path;
+    return {};
+}
+} // namespace
 
 namespace {
 struct DecoderInputHint {
@@ -710,8 +768,12 @@ void MainWindow::activateRADE(int sliceId)
     // Filter by the RADE slice's DAX channel so other slices' DAX audio is ignored.
     // Look up the channel live so it tracks if the user changes DAX assignment.
     int sid = sliceId;
+    const bool radeWavInject = !radeWavInjectPath().isEmpty();  // LOCAL TEST HARNESS
     connect(m_radioModel.panStream(), &PanadapterStream::daxPcmReady,
-            m_radeEngine, [this, sid](int channel, const PcmFrame& frame) {
+            m_radeEngine, [this, sid, radeWavInject](int channel, const PcmFrame& frame) {
+        if (radeWavInject) {
+            return;  // LOCAL TEST HARNESS: the WAV replaces the radio's DAX audio
+        }
         const QByteArray pcm = frame.legacyStereo24();
         if (pcm.isEmpty()) {
             return;
@@ -722,6 +784,46 @@ void MainWindow::activateRADE(int sliceId)
     }, Qt::QueuedConnection);
     connect(m_radeEngine, &RADEEngine::rxSpeechReady,
             m_audio, &AudioEngine::feedDecodedSpeech, Qt::QueuedConnection);
+
+    // LOCAL TEST HARNESS: feed the WAV in real time (elapsed-time paced, 20 ms
+    // ticks), looping with 2 s of silence between passes. Stopped and deleted
+    // in deactivateRADE() by object name.
+    if (radeWavInject) {
+        const QString path = radeWavInjectPath();
+        const QByteArray wav = loadRadeInjectWav(path);
+        if (!wav.isEmpty()) {
+            constexpr int kRate = 24000;
+            constexpr int kFrameBytes = 2 * static_cast<int>(sizeof(float));
+            QByteArray loop = wav;
+            loop.append(QByteArray(2 * kRate * kFrameBytes, '\0'));  // 2 s silence
+            auto* timer = new QTimer(this);
+            timer->setObjectName(QStringLiteral("radeWavInjectTimer"));
+            timer->setTimerType(Qt::PreciseTimer);
+            auto clock = std::make_shared<QElapsedTimer>();
+            auto sentFrames = std::make_shared<qint64>(0);
+            clock->start();
+            connect(timer, &QTimer::timeout, this, [this, loop, clock, sentFrames]() {
+                if (!m_radeEngine) return;
+                const qint64 due = clock->elapsed() * kRate / 1000;
+                const int n = static_cast<int>(std::min<qint64>(due - *sentFrames, kRate));
+                if (n <= 0) return;
+                QByteArray pcm;
+                pcm.reserve(n * kFrameBytes);
+                const int loopFrames = loop.size() / kFrameBytes;
+                for (int i = 0; i < n; ++i) {
+                    const int at = static_cast<int>((*sentFrames + i) % loopFrames) * kFrameBytes;
+                    pcm.append(loop.constData() + at, kFrameBytes);
+                }
+                *sentFrames += n;
+                QMetaObject::invokeMethod(m_radeEngine, [engine = m_radeEngine, pcm]() {
+                    engine->feedRxAudio(1, pcm);  // feedRxAudio only processes channel 1
+                }, Qt::QueuedConnection);
+            });
+            timer->start(20);
+            qInfo() << "RADE WAV injection active:" << path << "("
+                    << (wav.size() / kFrameBytes) / double(kRate) << "s per pass, looping)";
+        }
+    }
 
     // Hold the RADE slice's DAX channel via the centralized manager (#3305).
     // It creates the radio-side stream only if no other consumer (TCI, the
@@ -830,6 +932,14 @@ void MainWindow::deactivateRADE()
 {
     // Capture slice ID before any field mutations below clear it.
     const int radeSliceId = m_radeSliceId;
+
+    // LOCAL TEST HARNESS: stop the WAV feed before the engine is torn down.
+    if (auto* timer = findChild<QTimer*>(QStringLiteral("radeWavInjectTimer"),
+                                         Qt::FindDirectChildrenOnly)) {
+        timer->stop();
+        timer->deleteLater();
+        qInfo() << "RADE WAV injection stopped";
+    }
 
     // Restore audio mute state on the RADE slice
     if (m_radeSliceId >= 0) {
