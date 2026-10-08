@@ -8,30 +8,23 @@ class QJsonObject;
 
 namespace AetherSDR {
 
-// Owned configuration for the Icom networked-radio backend, per Constitution
-// Principle V: one nested JSON object under a single root key ("Icom"), read
-// and written atomically, with one place to default.
-//
-// THE PASSWORD IS NOT HERE, and its absence is the point.
-//
-// RFC #4603 proposal E: no credential is ever stored in the settings database —
-// QtKeychain is the only persistent credential store. `IcomCredentials` owns
-// the password. As defence in depth, ("Icom", "Password") is also registered in
-// SettingsCredentialPolicy::kDocFieldCredentials, so if any future caller ever
-// writes a Password field into this document, AppSettings strips it at the seam
-// and SettingsSanitizer redacts it from exports and logs.
-//
-// That matters more here than for most credentials: the Icom protocol
-// obfuscates the password with a fixed substitution table rather than
-// encrypting it (see icom-oracle §2.5), so anyone with a packet capture on the
-// LAN already has it. Writing it to a settings file that gets attached to bug
-// reports would widen that exposure considerably, for no benefit.
+// Owned configuration for the Icom backend: one nested JSON object under the
+// root key "Icom", read and written atomically, with one place to default.
+// THE PASSWORD IS NOT HERE (RFC #4603 E): IcomCredentials owns it in
+// QtKeychain. ("Icom", "Password") is registered in
+// SettingsCredentialPolicy::kDocFieldCredentials, so AppSettings strips it and
+// SettingsSanitizer redacts it if ever written. The protocol only obfuscates
+// the password with a reversible substitution table.
 class IcomSettings {
 public:
     // The operator's network username on the radio. NOT a secret — the radio
     // pairs it with a password and the username alone grants nothing.
     static QString username();
     static void setUsername(const QString& username);
+
+    // Client-owned, opt-in connection policy, stored in the Icom document.
+    static bool wakeOnConnect();
+    static void setWakeOnConnect(bool enabled);
 
     // The last host connected to, so the connect dialog can offer it back.
     static QString lastHost();
@@ -46,29 +39,27 @@ public:
     static quint16 audioPort();
     static void setPorts(quint16 control, quint16 serial, quint16 audio);
 
+    // Connect-by-IP NAT convenience: the public forwards are one sequential
+    // triplet (control, CI-V, audio). The highest valid base is 65533 so the
+    // derived audio port remains inside the UDP port range.
+    static quint16 defaultBasePort();
+    static quint16 maximumBasePort();
+    static bool usesDefaultPorts();
+    static void setBasePort(quint16 basePort);
+
     // The radio's CI-V address. Seeded here and CORRECTED at runtime from the
     // 0x19 0x00 reply — never trusted as final, because the address is
     // user-changeable and several Icom models speak this same transport.
     static std::uint8_t civAddress();
 
-    // HOW the operator expressed that address, which decides whether the wire
-    // is allowed to overrule it. Three states, not two, because "A2" means
-    // different things depending on where it was typed:
-    //
-    //   Auto    nobody chose. Seed from the model the handshake names, then
-    //           adopt whatever answers the broadcast 0x19 0x00.
-    //   Model   the operator picked a model from the list. That is a SHORTCUT
-    //           for an address, not a device selection, so a radio that reports
-    //           a different address is correcting a stale pick and wins.
-    //   Custom  the operator typed a hex address. On a shared CI-V bus — Icom's
-    //           own RS-BA1 server can front one — that is the operator SELECTING
-    //           WHICH DEVICE to talk to, so it must survive contact with a
-    //           broadcast reply from some other device on the same bus.
-    //
-    // Collapsing Model and Custom loses exactly one of those two behaviours, and
-    // which one you lose is not a matter of taste: keeping Custom overridable
-    // breaks device selection, and keeping Model pinned breaks the operator who
-    // changed the address on the radio after picking its model here.
+    // How the operator expressed the CI-V address, deciding whether the wire may
+    // overrule it:
+    //   Auto    nobody chose: query 19 00 at broadcast, adopt the sole responder.
+    //   Model   picked from the model list — a shortcut for an address, so a radio
+    //           reporting a different address corrects it and wins.
+    //   Custom  typed hex — on a shared CI-V bus (e.g. behind Icom's RS-BA1 server)
+    //           this SELECTS THE DEVICE and must survive other devices' replies.
+    // Model and Custom can't be merged: each needs the opposite override rule.
     enum class CivSelection { Auto, Model, Custom };
     static CivSelection civSelection();
 

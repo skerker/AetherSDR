@@ -12,16 +12,11 @@ class QTextEdit;
 
 namespace AetherSDR {
 
-// Copy Assist — the speech-to-text decode panel (RFC #4333, Phase 5), modeled
-// on the CW (ggmorse) decode panel in PanadapterApplet: a scrolling, read-only
-// transcript whose text is color-coded by whisper's per-utterance confidence
-// (green = high … red = low, the inverse of the CW decoder's cost coloring),
-// plus enable / model-tier / clear controls and a status line.
-//
-// Pure view: it emits intent (enableToggled / tierChanged / clearRequested) and
-// renders whatever appendText()/setStatus() it is given. The controller owns the
-// ASR engine and wiring, so this widget links no ASR/whisper code and could be
-// driven by streamed results in the thin-UI/aetherd future.
+// Copy Assist speech-to-text decode panel (RFC #4333), modeled on the CW decode
+// panel: read-only transcript coloured by whisper per-utterance confidence
+// (green high … red low), plus enable / model-tier / clear and a status line.
+// Pure view: emits intent and renders appendText()/setStatus(); the controller
+// owns the ASR engine, so this links no ASR code.
 class CopyAssistPanel : public QWidget {
     Q_OBJECT
 public:
@@ -36,6 +31,9 @@ public:
     // Set the always-visible transcription backlog (seconds of received audio not
     // yet transcribed). Colour escalates amber→red as it grows.
     void setBacklog(double seconds);
+    // Seconds of audio the engine dropped at its backlog ceiling (#5730); shown
+    // beside the queue while non-zero so a gapped transcript is never silent.
+    void setDroppedAudio(double seconds);
     // Show/hide the indeterminate loading indicator (model download/verify/load).
     void setBusy(bool on);
     bool isAsrEnabled() const;
@@ -110,6 +108,10 @@ private:
     QPushButton* m_settings = nullptr; // ⚙: opens the modeless settings dialog
     QLabel* m_status = nullptr;
     QLabel* m_backlog = nullptr; // always-visible transcription backlog (seconds)
+    double m_backlogSeconds = 0.0;
+    double m_droppedSeconds = 0.0;
+    QString m_backlogColor;      // last applied label colour ("" = theme default)
+    void renderBacklog(); // m_backlog text + colour from the two values above
     QPushButton* m_clear = nullptr;
     QSlider* m_buffer = nullptr;
     QLabel* m_bufferValue = nullptr;

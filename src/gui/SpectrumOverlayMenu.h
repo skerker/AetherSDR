@@ -16,12 +16,15 @@ class QComboBox;
 class QSlider;
 class QLabel;
 class QCheckBox;
+class FrontEndOverloadIndicator;
+namespace AetherSDR { struct FrontEndOverload; }
 class QDoubleSpinBox;
 class QScrollArea;
 
 namespace AetherSDR {
 
 class MemoryBrowsePanel;
+class BandPlanManager;
 class KiwiSdrManager;
 class SliceModel;
 class SpectrumOverlayWheelGuard;
@@ -37,7 +40,7 @@ public:
 
     // Raise this widget and all floating panels above sibling widgets.
     void raiseAll();
-    void setMemories(const QMap<int, MemoryEntry>& memories);
+    void setMemories(const QMap<int, MemoryEntry>& memories, bool writable = true);
 
     // Set the antenna list (from RadioModel::antListChanged).
     void setAntennaList(const QStringList& ants);
@@ -84,12 +87,61 @@ public:
     void setPanId(const QString& id);
     QString panId() const { return m_panId; }
 
+    // Set the panadapter's stable client-side slot index (SpectrumWidget::panIndex()
+    // — 0, 1, 2, 3 by layout position, distinct from the radio-assigned m_panId
+    // string above). Used to key the persisted collapsed/expanded state of this
+    // menu so each panadapter slot remembers its own preference across restarts
+    // (client-side UI preference, not radio-authoritative — see AGENTS.md
+    // "Settings Authority Policy"). Restores the saved state on first call.
+    void setPanSlotIndex(int idx);
+
     // Connect/disconnect the ANT panel to a slice model.
     void setSlice(SliceModel* slice);
-    void setWnbState(bool on, int level);
+    // Use the active regional plan when mapping the slice frequency to a
+    // native band button. The manager is owned by MainWindow.
+    void setBandPlanManager(BandPlanManager* manager);
     // Show/hide the whole WNB row (button + level slider + readout) based on
     // whether the radio runs its own DSP (RadioCapabilities::hasRadioSideDsp).
     void setRadioSideDspAvailable(bool available);
+    // Whether the connected backend drives its own receive RF gain
+    // (IRadioBackend::autoRfGainControl). False HIDES the Auto checkbox beside
+    // the RF Gain slider rather than disabling it: on a family with no such
+    // loop it would be a control wired to nothing, which is the HERMES 17
+    // failure the capability comments repeatedly warn against.
+    void setAutoRfGainAvailable(bool available);
+    // Reflect the armed state without emitting. Used by the settings restore
+    // and by a backend that declined to arm. Arming ALSO clears any standing
+    // refusal description -- see the definition for why that lives here rather
+    // than at the call site.
+    void setAutoRfGainEnabled(bool on);
+    // Carry WHY a tick was refused on a channel AT clients read. A transient
+    // card and a status-bar message are both effectively invisible to a screen
+    // reader, and the operator who cannot see the panadapter is the one least
+    // able to guess why the box sprang back.
+    //
+    // Empty clears it, and the clear RESTORES rather than blanks: the tooltip
+    // goes back to the standing help text. Callers do not normally have to
+    // clear by hand -- setAutoRfGainEnabled(true) and
+    // setAutoRfGainAvailable(false) both do it.
+    void setAutoRfGainRefusalDescription(const QString& why);
+    // Speak the refusal now, once. A description is read on arrival at the
+    // control; on a refused tick the operator is already on it, so without
+    // this the sentence sits unread until they leave and come back. No-op
+    // when no AT client is active or `why` is empty.
+    void announceAutoRfGainRefusal(const QString& why);
+    // RFC #5535's visibility condition: what the front end is doing, and what
+    // the loop has done about it. No-op on a family that never showed the
+    // indicator.
+    void setFrontEndOverload(const AetherSDR::FrontEndOverload& state);
+
+private:
+    // The RF Gain slider is a readout while the loop owns the gain. See the
+    // definition for why leaving it live is not a cosmetic question.
+    void applyAutoRfGainToSlider(bool autoOn);
+    // The range text, from the slider's published range and unit.
+    void applyRfGainRangeText();
+
+public:
     // Whether this radio has DAX audio/IQ channels at all
     // (RadioCapabilities::hasDaxStreams). Hides the per-pan DAX button and its
     // panel: the channel selectors reach a radio-side routing feature that a
@@ -107,6 +159,7 @@ public:
     // the Black Level button's cycle and moves off it if it was selected —
     // the SW estimate is untouched and stays available on every family.
     void setRadioSideAutoBlackAvailable(bool available);
+    void setFftAverageDescriptions(const QString& average, const QString& weighted);
     void syncWnbState(bool on, int level, bool updating);
     void setRfGain(int gain);
     void setRfGainRange(int low, int high, int step,
@@ -145,7 +198,8 @@ public:
     // gateway presenting non-Flex hardware offers its true band set (e.g.
     // an IC-9700's 2m/440/23cm).  Empty (all real Flex radios): the grid
     // is unchanged.  Triggers a band-panel rebuild on change.
-    void setDeclaredBands(const QStringList& bands);
+    void setDeclaredBands(const QStringList& bands,
+                          const QVector<DeclaredBandRange>& ranges = {});
     void syncDaxIqChannel(int channel);
     // Reflect the real WFM demodulator state onto the DAX-panel WFM toggle
     // WITHOUT re-emitting wfmToggleRequested. Self-gated on this menu's slice,
@@ -222,6 +276,8 @@ signals:
     void wnbLevelChanged(int level);
     // Emitted when RF gain slider changes (panadapter-level).
     void rfGainChanged(int gain);
+    // The operator ticked or unticked Auto beside the RF Gain slider.
+    void autoRfGainChanged(bool on);
     // Step index into the label list this menu was given, never a dB value.
     void preampStepChanged(int step);
     void attenuatorStepChanged(int step);
@@ -235,6 +291,11 @@ signals:
     void swrSweepSaveCsvRequested();
     void kiwiRxAntennaSelected(int sliceId, const QString& profileId);
     void flexRxAntennaSelected(int sliceId);
+    // The radio published no antenna port to choose and there is no virtual
+    // (Kiwi) receiver on offer, so the RX (tx=false) or TX (tx=true) antenna
+    // pick was refused rather than offering invented ANT1/ANT2
+    // (AntennaChoiceGate.h). MainWindow announces it.
+    void antennaChoiceRefused(bool tx);
     // NB Waterfall Blanker (#277)
     void wfBlankerEnabledChanged(bool on);
     void wfBlankerThresholdChanged(float threshold);
@@ -254,6 +315,7 @@ signals:
 
 private:
     QString m_panId;
+    int m_panSlotIndex{-1};
     QPointer<PanadapterModel> m_panadapter;
     QMetaObject::Connection m_panRxAntennaConnection;
     QMetaObject::Connection m_panLoopConnection;
@@ -310,12 +372,23 @@ private:
     // deleteLater() on every rebuild, so entries can outlive their buttons by a
     // full event-loop turn if a range update lands in that window.
     QVector<QPair<QPointer<QPushButton>, double>> m_bandBtnFreqs;
+    struct BandButtonEntry {
+        QPointer<QPushButton> button;
+        QString bandName;
+    };
+    QVector<BandButtonEntry> m_bandButtons;
+    QString m_lastHighlightedBand;
+    BandPlanManager* m_bandPlanManager{nullptr};
     double m_tuningMinMhz{0.0};
     double m_tuningMaxMhz{0.0};
     // True until a connected backend says otherwise, so a disconnected session
     // keeps the button rather than having it appear on connect.
     bool m_notchesSupported{true};
+    // Mirrors setDaxStreamsAvailable(). updateLayout() owns every menu
+    // button's visibility, so the capability has to live where it can see it.
+    bool m_daxStreamsAvailable{true};
     void applyTuningRangeToBandButtons();
+    void updateActiveBandHighlight();
 
     // Cached state for band-panel rebuilds — setXvtrBands() and
     // setRadioCapabilities() each store their argument and trigger
@@ -324,6 +397,7 @@ private:
     QVector<XvtrBand>  m_lastXvtrBands;
     ModelCapabilities  m_radioCapabilities;
     QStringList        m_declaredBands;   // radio-declared band set (see setDeclaredBands)
+    QVector<DeclaredBandRange> m_declaredBandRanges;
 
     // ANT sub-panel
     QWidget*     m_antPanel{nullptr};
@@ -334,6 +408,11 @@ private:
     QPushButton* m_loopBBtn{nullptr};
     QSlider*     m_rfGainSlider{nullptr};
     QLabel*      m_rfGainLabel{nullptr};
+    // Born HIDDEN, like the front-end rows below: a control that has never
+    // shipped must not appear on a family that does not claim it.
+    QCheckBox*   m_autoRfGainCheck{nullptr};
+    // RFC #5535's condition. Born hidden with the checkbox above it.
+    FrontEndOverloadIndicator* m_frontEndIndicator{nullptr};
     // What the RF-gain readout appends. " dB" on a radio with a real gain
     // register, "%" on one whose gain is an opaque scale.
     QString      m_rfGainUnitSuffix{QStringLiteral(" dB")};

@@ -3,7 +3,10 @@
 #include <QWidget>
 #include <QTimer>
 #include <QElapsedTimer>
+#include <QMetaObject>
+#include "models/TxController.h"
 
+class QMenu;
 class QPushButton;
 class QLabel;
 class QSlider;
@@ -18,18 +21,8 @@ class RadioModel;
 class TransmitModel;
 class TunerModel;
 
-// TX applet — transmit controls matching the SmartSDR TX panel.
-//
-// Layout (top to bottom):
-//  - Title bar: "TX"
-//  - Forward Power horizontal gauge (0–120 W, red > 100 W)
-//  - SWR horizontal gauge (1.0–3.0, red > 2.5)
-//  - RF Power slider (0–100%)
-//  - Tune Power slider (0–100%)
-//  - TX Profile dropdown + Success/Byp/Mem indicators
-//  - TUNE / MOX / ATU / MEM buttons
-//  - Active / Cal / Avail indicators
-//  - APD button
+// TX applet: transmit controls matching the SmartSDR TX panel (power/SWR
+// gauges, RF and Tune power, TX profile, TUNE/MOX/ATU/MEM, APD).
 class TxApplet : public QWidget {
     Q_OBJECT
 
@@ -45,6 +38,16 @@ public:
     void setRadioModel(RadioModel* radio);
     void setBandPlanManager(BandPlanManager* bandPlan);
 
+    // Building a context menu is split from showing it so the actions, their
+    // enabled state and their explanatory tooltips can be asserted without
+    // entering the modal QMenu::exec() loop. The show* slots build then exec.
+    // (#5510)
+    void buildAtuContextMenu(QMenu& menu);
+    void buildTuneContextMenu(QMenu& menu);
+    // Shared entry points for the ATU context menu and main Tools menu.
+    void openPreTuneDialog();
+    void confirmAndClearAtuMemories();
+
 public slots:
     void updateMeters(float fwdPower, float swr, bool swrValid);
     // Capture raw pre-smoothed FWDPWR for PEP peak-hold tick. (#2561)
@@ -56,6 +59,11 @@ public slots:
 
 private:
     void buildUI();
+    void configureTxActions();
+    TxController::Input localTxInput(TxController::Activity activity);
+    void requestTune(bool on, const TxController::Input& input);
+    void requestMox(bool on, const TxController::Input& input);
+    void requestAtu(const TxController::Input& input);
     void syncFromModel();
     void syncAtuIndicators();
     // Single owner of the ATU/MEM enabled state.
@@ -69,8 +77,6 @@ private:
     // Right-click menu on the ATU button — exposes Pre-tune Bands and
     // Clear ATU Memories. Pre-tune is grayed when MEM is off. (#2624)
     void showAtuContextMenu(const QPoint& pos);
-    void openPreTuneDialog();
-    void confirmAndClearAtuMemories();
     // Right-click menu on the TUNE button — picks the carrier shape for
     // the *next* tune cycle: "Mono Tone" (single_tone) or "Two Tone".
     // Nothing is persisted — selecting Two Tone is a transient one-shot
@@ -79,6 +85,7 @@ private:
 
     TransmitModel* m_model{nullptr};
     RadioModel*       m_radioModel{nullptr};
+    std::shared_ptr<TxController> m_txController;
     BandPlanManager*  m_bandPlanMgr{nullptr};
     AtuPreTuneDialog* m_preTuneDialog{nullptr};
 
@@ -89,10 +96,11 @@ private:
     // change between clicks falls back to "atu start". (#1993)
     double m_atuTunedFreqMhz{-1.0};
 
-    // Inputs to updateAtuAvailability(). Both default to the permissive value
-    // so an applet built before either model has reported looks exactly as it
-    // did before this gate existed.
+    // Capability inputs to updateAtuAvailability(). Matching and Flex-style
+    // memory operations are separate claims; both default permissive so an
+    // applet built before a model reports retains the disconnected presentation.
     bool m_radioHasTuner{true};
+    bool m_radioHasTunerMemories{true};
     bool m_tgxlOperate{false};
 
     // Gauges (HGauge*)
@@ -124,18 +132,10 @@ private:
     QPushButton* m_apdBtn{nullptr};
     QWidget*     m_apdRow{nullptr};
 public:
-    // The APD row has TWO inputs and therefore ONE owner, for the same reason
-    // the ATU button does: two callers each doing setVisible() means whichever
-    // fires last wins.
-    //
-    //   apdConfigurable   the connected Flex reports `apd configurable=1`
-    //   hasRadioSideDsp   the radio runs its own DSP at all
-    //
-    // Both are needed. apdConfigurable alone was already correct in practice on
-    // an HL2 — nothing sets it — but only because the row's state carried over
-    // from a previous session: it arrives ONLY in Flex TransmitDelta status, so a
-    // backend that never sends it leaves the value to history, and m_apdRow is
-    // constructed visible. The capability makes it deterministic.
+    // The APD row has one owner for two inputs (as with the ATU button):
+    // apdConfigurable (Flex reports `apd configurable=1`, only via TransmitDelta
+    // status) and hasRadioSideDsp. Both are required so a backend that never sends
+    // apd (HL2) gets a deterministic hidden row; m_apdRow is constructed visible.
     void setApdVisible(bool v)
     {
         m_apdConfigurable = v;
@@ -164,22 +164,9 @@ private:
     // across an un-key, so stopping the poller alone cannot prevent a late
     // non-zero sample from repainting an idle gauge.
     bool m_transmitting{false};
-
-    // PEP peak-hold for the FWDPWR gauge — mirrors the SMeterWidget RX
-    // peak-hold pattern.  The peak captures the highest pre-smoothed FWDPWR
-    // sample, holds for ~2 s, then decays linearly toward the current
-    // smoothed reading.  See HGauge::setPeakValue for the tick rendering and
-    // SMeterWidget.cpp peak hold for the prior-art ballistics. (#2561)
-    float m_smoothedPower{0.0f};
-    float m_peakPower{0.0f};
-    float m_peakDecayStart{0.0f};
-    // Decay rate scaled to the gauge full-scale by setPowerScale so the
-    // ~2.5 s visual feel stays consistent across rig classes.  Default
-    // matches barefoot (120 W / 2.5 s) for the pre-connect case.
-    float m_peakDecayWattsPerSec{48.0f};
-    QElapsedTimer m_peakHoldTimer;
-    bool m_peakHoldRunning{false};
-    QTimer m_peakTick;
+    bool m_forwardPowerRequiresSmoothing{true};
+    bool m_forwardPowerScaleFollowsBandRating{false};
+    QMetaObject::Connection m_capabilitiesConnection;
 
     // setPowerScale() no-ops when neither input moved (#4845) — it's called
     // on every RadioModel::infoChanged, most of which carry no scale-relevant

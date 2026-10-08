@@ -7,6 +7,7 @@
 
 #include <QHash>
 #include <QHostAddress>
+#include <QList>
 #include <QObject>
 #include <QString>
 
@@ -19,15 +20,9 @@ namespace AetherSDR::hl2 {
 // discovery: it emits RadioInfo with family="hl2" so ConnectionPanel's existing
 // onRadioDiscovered/onRadioUpdated/onRadioLost slots consume it unchanged.
 //
-// Asynchronous by construction. MetisClient::discover() blocks for its whole
-// timeout, which is fine for a one-shot probe but would stall the UI on a
-// periodic sweep, so this class drives the same exchange off the socket's
-// readyRead signal instead: broadcast one discovery datagram per sweep, collect
-// replies until the next sweep, and age out radios that stop answering.
-//
-// A radio that is streaming to somebody else answers with status byte 0x03; that
-// surfaces as RadioInfo::status "In_Use" rather than being hidden, so the
-// operator can see the radio exists but is taken.
+// Asynchronous (MetisClient::discover() blocks): one broadcast per sweep,
+// replies collected off readyRead, silent radios aged out. Status byte 0x03
+// (streaming to another host) surfaces as RadioInfo::status "In_Use".
 class Hl2Discovery : public QObject {
     Q_OBJECT
 
@@ -90,6 +85,8 @@ private slots:
     void onSweepTimer();
 
 private:
+    void refreshSockets();
+
     // Radios not seen for this many consecutive sweeps are reported lost. Two
     // sweeps of slack absorbs a single dropped reply on a busy LAN.
     static constexpr int kMissedSweepsBeforeLost = 3;
@@ -99,7 +96,11 @@ private:
         int missedSweeps = 0;
     };
 
-    QUdpSocket* m_socket = nullptr;
+    // One socket per eligible local IPv4 address. Binding the discovery socket
+    // to the interface is important on multi-homed Windows hosts: a wildcard
+    // bind lets the route table choose an interface, which can leave a
+    // link-local HL2 invisible until another client has discovered it first.
+    QList<QUdpSocket*> m_sockets;
     QTimer* m_timer = nullptr;
     QHash<QString, Seen> m_seen;   // keyed by serial (the MAC string)
 };

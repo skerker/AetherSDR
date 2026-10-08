@@ -1,4 +1,5 @@
 #include "StripRxOutputPanel.h"
+#include "PanelTick.h"
 
 #include "ClientCompKnob.h"
 #include "EditorFramelessTitleBar.h"
@@ -38,17 +39,9 @@ float dbToRatio(float db)
     return (db - kMeterMinDb) / (kMeterMaxDb - kMeterMinDb);
 }
 
-// RX-side gradient meter — visual mirror of the TX HorizMeter (gradient
-// fill, dB tick scale, peak-hold hairline) minus the limiter-specific
-// bits (no ceiling drag handle, no GR overlay, no input-peak backdrop,
-// no LIMIT band).  Single child widget; reads m_rms on the
-// parent through references so it has no internal state of its own.
-//
-// Bar gradient renders RMS (the slow, average-loudness reading), with
-// a thin white hairline drawn at the bar's leading edge so the eye
-// gets a precise level tick where the colour fades.  The cyan hairline
-// holds the highest raw peak in the trailing 1.5 s window — the only
-// visual indicator of instantaneous peaks.
+// RX gradient meter: the TX HorizMeter look without limiter bits. Reads the
+// parent's m_rms by reference (no own state). Bar = RMS with a white leading-
+// edge hairline; cyan hairline = highest raw peak over the trailing 1.5 s.
 class RxGradientMeter : public QWidget {
 public:
     RxGradientMeter(const float& rms, QWidget* parent)
@@ -326,15 +319,16 @@ StripRxOutputPanel::StripRxOutputPanel(AudioEngine* engine, QWidget* parent)
                 Qt::QueuedConnection);
     }
 
-    // 120 Hz animation tick — kMeterSmootherIntervalMs is the project's
-    // canonical poll rate so this panel's ballistics match every other
-    // meter in the app.
+    // The shared panel cadence, so this meter steps in time with every
+    // other one in the window. MeterSmoother integrates against wall clock,
+    // so the ballistics are the ones it always had.
     m_animTimer = new QTimer(this);
-    m_animTimer->setInterval(kMeterSmootherIntervalMs);
+    m_animTimer->setInterval(kPanelTickMs);
     connect(m_animTimer, &QTimer::timeout,
             this, &StripRxOutputPanel::tick);
     m_animClock.start();
-    m_animTimer->start();
+    // Not started here: showEvent does that, and only once the page is on
+    // screen. See PanelTick.h.
 }
 
 StripRxOutputPanel::~StripRxOutputPanel() = default;
@@ -444,6 +438,22 @@ void StripRxOutputPanel::tick()
         }
     }
     if (m_meter)   m_meter->update();
+}
+
+
+void StripRxOutputPanel::showEvent(QShowEvent* ev)
+{
+    QWidget::showEvent(ev);
+    // Restart the clock as well as the timer: the elapsed time across a
+    // spell of being hidden is not time the ballistics should integrate.
+    m_animClock.restart();
+    if (m_animTimer) m_animTimer->start();
+}
+
+void StripRxOutputPanel::hideEvent(QHideEvent* ev)
+{
+    if (m_animTimer) m_animTimer->stop();
+    QWidget::hideEvent(ev);
 }
 
 } // namespace AetherSDR

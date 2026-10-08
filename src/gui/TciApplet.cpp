@@ -156,6 +156,10 @@ void TciApplet::buildUI()
 
             QMenu menu(this);
             menu.setTitle("TX overflow handling");
+            // Every entry below carries the explanation of what its overflow
+            // mode does to the samples; without the opt-in Qt renders none of
+            // them (#5546).
+            menu.setToolTipsVisible(true);
             auto* group = new QActionGroup(&menu);
             group->setExclusive(true);
 
@@ -320,11 +324,11 @@ void TciApplet::setRadioModel(RadioModel* model)
     }
 
     // Slice → DAX channel mapping drives both DAX and TCI RX indicators.
-    // TCI RX1-8 carry the same DAX channels (PanadapterStream::daxAudioReady
+    // TCI RX1-8 carry the same DAX channels (PanadapterStream::daxPcmReady
     // fans out to both DaxBridge and TciServer), so reuse the DAX channel
     // assignments for the slice letters here. The TCI receiver (trx) index is
     // NOT capped at 4: trx is a positional slice index bounded by
-    // slices.size() (up to 8 on a 6700), and TciServer::onDaxAudioReady /
+    // slices.size() (up to 8 on a 6700), and TciServer::onDaxPcmReady /
     // setRxChannelGain already span channels 1-8 — so DAX 5-8 do have TCI
     // representation. (The old "RX1-4" was stale from the 4-DAX era.)
     auto updateRxLabels = [this]() {

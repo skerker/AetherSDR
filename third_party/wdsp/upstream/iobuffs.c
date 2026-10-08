@@ -26,6 +26,12 @@ warren@wpratt.com
 
 #include "comm.h"
 
+// AetherSDR patch 13: the port's test-only pause, called from dexchange().
+// Declared here rather than in a port header so the same line serves the POSIX
+// port and the native Windows build alike.
+void wdspPortHandoffPauseForTest (void);
+void wdspPortOutputCopyHoldForTest (void);
+
 /********************************************************************************************************
 *																										*
 *										    Begin Slew Code												*
@@ -399,16 +405,16 @@ void create_iobuffs (int channel)
 		a->r2_size = a->out_size;
 	else
 		a->r2_size = a->r2_insize;
-	a->r1_active_buffsize = DSP_MULT * a->r1_size;
-	a->r2_active_buffsize = DSP_MULT * a->r2_size;
+	a->r1_active_buffsize = ch[channel].exchangeDepth * a->r1_size;
+	a->r2_active_buffsize = ch[channel].exchangeDepth * a->r2_size;
 	a->r1_baseptr = (double*) malloc0 (a->r1_active_buffsize * sizeof (complex));
 	a->r2_baseptr = (double*) malloc0 (a->r2_active_buffsize * sizeof (complex));
 	a->r1_inidx = 0;
 	a->r1_outidx = 0;
 	a->r1_unqueuedsamps = 0;
-	a->r2_inidx = (DSP_MULT - 1) * a->r2_size;
+	a->r2_inidx = (a->r2_active_buffsize - a->r2_size);
 	a->r2_outidx = 0;
-	a->r2_havesamps = (DSP_MULT - 1) * a->r2_size;
+	a->r2_havesamps = (a->r2_active_buffsize - a->r2_size);
 	n = a->r2_havesamps / a->out_size;
 	a->r2_unqueuedsamps = a->r2_havesamps - n * a->out_size;
 	InitializeCriticalSectionAndSpinCount(&a->r2_ControlSection, 2500);
@@ -418,17 +424,67 @@ void create_iobuffs (int channel)
 	create_slews (a);
 
 	InterlockedBitTestAndReset(&a->flush_bypass, 0);
+	// AetherSDR patch 9: explicit, alongside upstream's flush_bypass reset. The
+	// iob comes from malloc0 so this is already zero, but the handshake reads
+	// it and the reset above sets the convention for this pair of flags.
+	InterlockedBitTestAndReset(&a->flush_quiesced, 0);
 	a->Sem_Flush = CreateSemaphore(0, 0, 1, 0);
 	_beginthread(flushChannel, 0, (void*)(uintptr_t)a->channel);
+}
+
+// AetherSDR patch 9: THE flushChannel EXIT HANDSHAKE, LIFTED OUT OF
+// destroy_iobuffs() SO IT CAN RUN ON THE OTHER SIDE OF destroy_main().
+//
+// The handshake itself is upstream's, moved rather than invented: set
+// flush_bypass, release Sem_Flush so a parked thread wakes and sees it, and
+// wait for the thread's own reset of flush_bypass at the tail of
+// flushChannel() (channel.c). What was wrong was WHERE upstream ran it.
+// destroy_iobuffs() is reached only from post_main_destroy(), and CloseChannel()
+// is pre_main_destroy(); destroy_main(); post_main_destroy() — so the flush
+// thread was still live across destroy_main(), which is destroy_rxa()/
+// destroy_txa(), exactly the chain flush_main() -> flush_rxa() walks. See
+// AETHERSDR-PATCHES.md patch 9 for the measurement.
+//
+// BOUNDED, where upstream's spin was not, for the reason patch 4 gives for
+// bounding its worker handshake: upstream ignores _beginthread() failure, and
+// an unbounded wait on a thread that was never created would hang CloseChannel()
+// forever. NOT free, though, and the registry entry is precise about it:
+// upstream's wait could not fall through, this one can, and on exhaustion the
+// CloseHandle() in destroy_iobuffs() runs under a possibly-parked flush thread
+// -- patch 4's own failure mode, inherited. The cap is deliberately generous
+// for that reason; do not shorten it without re-reading patch 9.
+//
+// IDEMPOTENT, because both ends of the pre/post pair call it. A second pass must
+// not re-arm flush_bypass — the thread that would acknowledge it is gone, and
+// the wait would burn the whole cap on every close.
+void quiesce_flush (int channel)
+{
+	IOB a = ch[channel].iob.pc;
+	int waited = 0;
+	if (_InterlockedAnd (&a->flush_quiesced, 1)) return;
+	InterlockedBitTestAndSet (&a->flush_bypass, 0);
+	// May legitimately fail: Sem_Flush has a maximum count of 1, and a ramp that
+	// completed has already released it. That token wakes the thread just as
+	// ours would, and flush_bypass is what it reads on waking, so the wake is
+	// delivered either way.
+	ReleaseSemaphore (a->Sem_Flush, 1, 0);
+	while (InterlockedAnd (&a->flush_bypass, 0xffffffff) && waited < 1000)
+	{
+		Sleep (1);
+		waited++;
+	}
+	InterlockedBitTestAndSet (&a->flush_quiesced, 0);
 }
 
 void destroy_iobuffs (int channel)
 {
 	IOB a = ch[channel].iob.pc;
 
-	InterlockedBitTestAndSet(&a->flush_bypass, 0);
-	ReleaseSemaphore(a->Sem_Flush, 1, 0);
-	while (InterlockedAnd(&a->flush_bypass, 0xffffffff)) Sleep(1);
+	// AetherSDR patch 9: normally a no-op — pre_main_destroy() has already run
+	// the handshake, before destroy_main(). Kept here so destroy_iobuffs()
+	// remains self-sufficient for any future caller that does not pair with
+	// pre_main_destroy(); today it has exactly one, post_main_destroy().
+	quiesce_flush (channel);
 	CloseHandle(a->Sem_Flush);
 
 	destroy_slews (a);
@@ -449,9 +505,9 @@ void flush_iobuffs (int channel)
 	a->r1_inidx = 0;
 	a->r1_outidx = 0;
 	a->r1_unqueuedsamps = 0;
-	a->r2_inidx = (DSP_MULT - 1) * a->r2_size;
+	a->r2_inidx = (a->r2_active_buffsize - a->r2_size);
 	a->r2_outidx = 0;
-	a->r2_havesamps = (DSP_MULT - 1) * a->r2_size;
+	a->r2_havesamps = (a->r2_active_buffsize - a->r2_size);
 	while (!WaitForSingleObject (a->Sem_BuffReady, 1));
 	n = a->r2_havesamps / a->out_size;
 	a->r2_unqueuedsamps = a->r2_havesamps - n * a->out_size;
@@ -513,6 +569,21 @@ void fexchange0 (int channel, double* in, double* out, int* error)
 			a->r2_outidx = 0;
 		LeaveCriticalSection (&ch[channel].csEXCH);
 	}
+}
+
+// AetherSDR patch 15: would the next fexchange* find a whole output block?
+// Read-only. A non-blocking host (bfo = 0) asks before each exchange: an
+// underrun advances r2_outidx without consuming, and the two-slot ring is read
+// out of step from then on. See AETHERSDR-PATCHES.md patch 15.
+PORT
+int GetChannelOutputReady (int channel)
+{
+	int ready;
+	IOB a = ch[channel].iob.pe;
+	EnterCriticalSection (&a->r2_ControlSection);
+	ready = a->r2_havesamps >= a->out_size;
+	LeaveCriticalSection (&a->r2_ControlSection);
+	return ready;
 }
 
 PORT	//separate I/Q buffers
@@ -580,25 +651,102 @@ void fexchange2 (int channel, INREAL *Iin, INREAL *Qin, OUTREAL *Iout, OUTREAL *
 	}
 }
 
-void dexchange (int channel, double* in, double* out)
+// Test/control-thread observation only. Caller excludes channel teardown.
+// Production exchange does not call this or poll for worker readiness.
+PORT
+int GetChannelOutputSamplesForTest (int channel)
 {
-	int n;
-	IOB a = ch[channel].iob.pd;
-	if (!_InterlockedAnd (&ch[channel].run, 1)) _endthread();
-
+	IOB a = ch[channel].iob.pc;
+	int samples;
+	// flush_iobuffs resets the count under csEXCH, outside the count lock.
+	// Test-only observation takes the same order as fexchange, covering both.
+	EnterCriticalSection (&ch[channel].csEXCH);
 	EnterCriticalSection (&a->r2_ControlSection);
-	a->r2_havesamps += a->r2_insize;
+	samples = a->r2_havesamps;
 	LeaveCriticalSection (&a->r2_ControlSection);
+	LeaveCriticalSection (&ch[channel].csEXCH);
+	return samples;
+}
+
+// After the output-count barrier proves all submitted handoffs were published,
+// this control/test-only rendezvous also waits for the last hook and DSP body.
+// Never call while a test hold is armed/entered; production does not call it.
+PORT
+void SynchronizeChannelWorkerForTest (int channel)
+{
+	EnterCriticalSection (&ch[channel].csDSP);
+	LeaveCriticalSection (&ch[channel].csDSP);
+}
+
+static void copy_output_to_ring (IOB a, const double* in)
+{
+	// Default-inactive fixture rendezvous BEFORE the actual bytes are copied.
+	wdspPortOutputCopyHoldForTest ();
 	memcpy (a->r2_baseptr + 2 * a->r2_inidx, in, a->r2_insize * sizeof (complex));
 	if ((a->r2_inidx += a->r2_insize) == a->r2_active_buffsize)
 		a->r2_inidx = 0;
+}
+
+int dexchange (int channel, double* in, double* out)
+{
+	int n;
+	IOB a = ch[channel].iob.pd;
+	if (!_InterlockedAnd (&ch[channel].run, 1))
+	{
+		// AetherSDR patch 4: upstream called _endthread() here — terminating
+		// the worker mid-function, with csDSP HELD (wdspmain() calls us inside
+		// it and _endthread() does not unwind, so post_main_destroy() later
+		// found a locked section to DeleteCriticalSection), and skipping
+		// wdspmain()'s exit handshake entirely, so pre_main_destroy() waited
+		// out its full cap on a thread that was already gone and then fell
+		// through with no barrier at all.
+		//
+		// RETURN instead, and let the caller unwind. That makes wdspmain()'s
+		// tail the worker's single exit, which is what lets the handshake
+		// store a generation held in a LOCAL — shared state would be wrong
+		// here: after a fall-through the abandoned worker is still alive, and
+		// anything it reads from ch[] could belong to its successor (#5411
+		// second-opinion review).
+		return 1;
+	}
+
+	// AetherSDR patch 13: TAKE THE INPUT BEFORE RELEASING THE HOST (#5734).
+	//
+	// Upstream copies this r1 slot out AFTER releasing Sem_OutReady below. With
+	// bfo set, that release is what lets the host's blocked fexchange* return,
+	// and the host's NEXT call writes the next input block into r1 before it
+	// waits again. When in_size == dsp_insize the ring holds DSP_MULT (2) slots,
+	// so host call w+2 writes the very slot worker iteration w has not read yet:
+	// a worker preempted between the release and this copy processes block w+2
+	// (or a torn mix of w and w+2) in place of block w, and reports nothing.
+	// Idle, the window is a few instructions wide and never loses; under CPU
+	// load on Linux it lost in 33 of 600 trials. Only bfo channels release
+	// here, so this is the blocking (offline/test) mode, not live audio. See
+	// AETHERSDR-PATCHES.md patch 13.
+	//
+	// The copy is all that moves. r1_outidx is touched only by this thread and
+	// by flush_iobuffs() (which holds csDSP, as our caller does), and `out`
+	// (the chain's inbuff) is a different allocation from `in` (its outbuff) in
+	// both RXA.c and TXA.c, so the reorder changes no value -- only when the
+	// host is told it may proceed.
+	memcpy (out, a->r1_baseptr + 2 * a->r1_outidx, a->r1_outsize * sizeof (complex));
+	if ((a->r1_outidx += a->r1_outsize) == a->r1_active_buffsize)
+		a->r1_outidx = 0;
+
+	// AetherSDR patches 15/17: publish only bytes already copied. The memcpy stays
+	// OUTSIDE the existing short credit lock; no longer acquisition lock span.
+	copy_output_to_ring (a, in);
+	EnterCriticalSection (&a->r2_ControlSection);
+	a->r2_havesamps += a->r2_insize;
+	LeaveCriticalSection (&a->r2_ControlSection);
 	if (a->bfo && (a->r2_unqueuedsamps += a->r2_insize) >= a->out_size)
 	{
 		n = a->r2_unqueuedsamps / a->out_size;
 		ReleaseSemaphore(a->Sem_OutReady, n, 0);	
 		a->r2_unqueuedsamps -= n * a->out_size;
 	}
-	memcpy (out, a->r1_baseptr + 2 * a->r1_outidx, a->r1_outsize * sizeof (complex));
-	if ((a->r1_outidx += a->r1_outsize) == a->r1_active_buffsize)
-		a->r1_outidx = 0;
+	// AetherSDR patch 13: test-only; a no-op unless wdsp_channel_test sets it.
+	// Sits immediately after the release on purpose -- see wdsp_port.c.
+	wdspPortHandoffPauseForTest ();
+	return 0;
 }

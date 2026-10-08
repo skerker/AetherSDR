@@ -27,6 +27,11 @@ QString buildIssueReport(const SupportBundle::SystemInfo& sys,
     body += "### Steps to reproduce\n";
     body += "1. _First step_\n";
     body += "2. _\xE2\x80\xA6_\n\n";
+    // Release builds ship symbols as release assets, so the OS crash report is
+    // what turns "it crashed" into a stack trace (docs/debugging-crashes.md).
+    body += "_If AetherSDR crashed, please attach the crash report your system "
+            "kept: [where to find it](https://github.com/aethersdr/AetherSDR/blob/"
+            "main/docs/debugging-crashes.md#for-users-what-to-attach-to-the-issue)._\n\n";
 
     body += "### Radio model & firmware\n";
     if (radio.connected) {
@@ -53,7 +58,11 @@ QString buildIssueReport(const SupportBundle::SystemInfo& sys,
     body += QString("- AetherSDR: %1\n").arg(sys.aetherVersion);
     body += QString("- Qt: %1\n").arg(sys.qtVersion);
     body += QString("- OS: %1 (kernel %2)\n").arg(sys.osName, sys.kernelVersion);
-    body += QString("- Arch: %1\n").arg(sys.cpuArch);
+    // Model + arch + SIMD features in one line: the hardware facts that
+    // decide GPU/ISA crash reports (#4986) — not sensitive, unlike serial/IP.
+    body += QString("- CPU: %1\n").arg(sys.cpu);
+    body += QString("- RAM: %1\n").arg(sys.ram);
+    body += QString("- GPU: %1\n").arg(sys.gpu);
     body += QString("- Build: %1\n\n").arg(sys.buildDate);
 
     body += "### Recent log\n";

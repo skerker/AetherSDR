@@ -15,6 +15,7 @@
 #include <limits>
 
 #include "core/KiwiSdrProtocol.h"
+#include "core/backends/RadioCapabilities.h"
 
 class QPushButton;
 class ScrollableLabel;
@@ -27,6 +28,7 @@ class QCheckBox;
 class QGraphicsOpacityEffect;
 class QDoubleSpinBox;
 class QGridLayout;
+class QVBoxLayout;
 class QPainter;
 class QHideEvent;
 class QResizeEvent;
@@ -37,6 +39,7 @@ namespace AetherSDR {
 class SliceModel;
 class TransmitModel;
 class RadioModel;
+class ControlAvailabilityRegistry;
 class PhaseKnob;
 class RxApplet;
 class KiwiSdrManager;
@@ -52,6 +55,9 @@ class VfoWidget : public QWidget {
 public:
     explicit VfoWidget(QWidget* parent = nullptr);
     ~VfoWidget() override;
+#ifdef HAVE_DEEPFIST
+    void refreshCwDecoderControls();
+#endif
 
     void setSlice(SliceModel* slice);
     void setAntennaList(const QStringList& ants);
@@ -83,16 +89,9 @@ public:
     //   splitActive — TX is assigned to a different slice than the active one
     void updateSplitBadge(bool isTxSlice, bool splitActive);
 
-    // Flag direction hint for deconfliction.
-    //   Auto/ForceLeft/ForceRight participate in the 20-px edge-clip flip:
-    //   if the panel would overrun the spectrum edge, it flips to the other
-    //   side so the panel stays visible.
-    //   LockLeft/LockRight disable that flip and hold the requested side
-    //   even if the panel overruns the edge. Used by split pairs so the
-    //   RX/TX panels stay on their opposite sides instead of collapsing
-    //   onto the same side when the pair is near a pan edge (#2663). Also used
-    //   by attached diversity pairs, whose two flags must keep opposite sides
-    //   while overlapping nearby ordinary slices by z-order.
+    // Flag direction hint. Auto/Force* flip to the other side when the panel would
+    // overrun the spectrum edge (20 px). Lock* hold the side regardless; used by
+    // split pairs (#2663) and attached diversity pairs to keep opposite sides.
     enum FlagDir { Auto, ForceLeft, ForceRight, LockLeft, LockRight };
 
     struct FlagPlacement {
@@ -212,6 +211,16 @@ public:
         return 1000 + std::max(sliceId, 0);
     }
 
+    // Locked flag side for an attached diversity pair member, by
+    // diversityPairOrderKey index. Index 0 is the DIV parent when the radio reports
+    // diversity_parent / diversity_index (else the lower slice ID) and locks RIGHT
+    // to match SmartSDR; index 1 locks LEFT. Lock*, not Force*, so the pair keeps
+    // opposite sides at a pan edge (#2663, #3880).
+    static FlagDir diversityPairFlagDir(int orderIndex)
+    {
+        return orderIndex == 0 ? LockRight : LockLeft;
+    }
+
     static FlagPlacement placementForMarker(int markerX,
                                             int specTop,
                                             int widgetWidth,
@@ -324,6 +333,10 @@ Q_SIGNALS:
     void aetherVoiceRequested();   // user clicked the AetherVoice button on the DSP tab
     void splitToggled();
     void swapRequested();
+    // Right-click on the SPLIT/SWAP badge. The menu itself is built by
+    // MainWindow, which owns the split pair and the remembered arrangement;
+    // this widget only reports where the operator clicked. (#2242, #311)
+    void splitBadgeMenuRequested(const QPoint& globalPos);
     void autotuneRequested(bool intermittent);  // CW auto-tune: false=stop, true=loop
     void autotuneOnceRequested();               // CW auto-tune one-shot
     void zeroBeatRequested();                   // client-side CW zero-beat
@@ -331,6 +344,11 @@ Q_SIGNALS:
     void sliceActivationRequested(int sliceId);
     void kiwiRxAntennaSelected(int sliceId, const QString& profileId);
     void flexRxAntennaSelected(int sliceId);
+    // The radio published no antenna port to choose and there is no virtual
+    // (Kiwi) receiver on offer, so the RX (tx=false) or TX (tx=true) antenna
+    // pick was refused rather than offering invented ANT1/ANT2
+    // (AntennaChoiceGate.h). MainWindow announces it.
+    void antennaChoiceRefused(bool tx);
     void autoSqlMarginDbChanged(int dB);
     // Emitted when the wheel tunes by step so MainWindow can apply the shared
     // tuning/reveal policy.
@@ -395,6 +413,8 @@ private:
     void updateDspTabAccent();
     void deactivateTabButton(int closedTab);  // reset a just-closed tab's style
     void updateFreqLabel();
+    void updateCaptureStatus();
+    void updateCollapsedFrequencyLabel();
     bool cancelDirectEntry();
     void updateFilterLabel();
     void updateModeTab();
@@ -413,6 +433,13 @@ private:
     SliceModel*    m_slice{nullptr};
     TransmitModel* m_txModel{nullptr};
     RadioModel*    m_radioModel{nullptr};
+    ControlAvailabilityRegistry* m_filterAvailability{nullptr};
+    std::optional<ReceiveFilterControl> m_receiveFilterControl;
+    // exclusiveSquelchScaleValue(caps.squelchLevelScale): the receiver's own gate.
+    std::optional<SquelchLevelScale> m_exclusiveSquelch;
+    QPushButton* m_filterUnavailable{nullptr};
+    QVector<int> defaultFilterWidths(const QString& mode) const;
+    bool acceptsFilterEdges(int low, int high) const;
     KiwiSdrManager* m_kiwiSdrManager{nullptr};
     QStringList    m_antList;
     bool           m_updatingFromModel{false};
@@ -462,6 +489,7 @@ private:
 
     // Frequency / meter
     QLabel* m_freqLabel{nullptr};
+    QLabel* m_captureStatusLabel{nullptr};
     QLineEdit* m_freqEdit{nullptr};
     QStackedWidget* m_freqStack{nullptr};
     QLabel* m_dbmLabel{nullptr};
@@ -599,17 +627,12 @@ public:
     // here and the button reaches something real — the same exception the
     // manual notch and the TNF controls already make.
     void setHasHostNoiseBlanker(bool has);
-    // The filter widths the RADIO actually has
-    // (RadioCapabilities::rxFilterWidthsHz), widest first. Non-empty means
-    // the hardware has a fixed ladder and the mode-preset grid must not be
-    // offered instead: an IC-705 has three IF filters per mode, so the
-    // eight SSB presets left five buttons that snapped onto a neighbour
-    // and did nothing visible. Empty restores the operator's own presets.
-    //
-    // This is the same contract RxApplet::setRadioFilterWidths carries —
-    // the VFO grid was simply never given it, so the two filter surfaces
-    // in the app disagreed about what the radio could do.
+    // The radio's fixed filter widths (RadioCapabilities::rxFilterWidthsHz), widest
+    // first. Non-empty replaces the mode-preset grid (e.g. IC-705 has three IF
+    // filters per mode, so presets would snap onto neighbours); empty restores the
+    // operator's presets. Same contract as RxApplet::setRadioFilterWidths.
     void setRadioFilterWidths(const QList<int>& widthsHz);
+    void setRadioFilterControl(const RxFilterControl& control);
 
     // Reflect whether any client-side AetherDSP NR module (NR2 / NR4 / MNR /
     // BNR / DFNR / RN2) is active by accenting the ADSP launcher, so the cue is
@@ -621,8 +644,12 @@ public:
     // markerWidth: 0 = off, 1 = 1 px, 3 = 3 px.
     int  markerWidth() const { return m_markerWidth; }
     bool filterEdgesHidden() const { return m_filterEdgesHidden; }
-    void setMarkerWidth(int widthPx);
-    void setFilterEdgesHidden(bool hide);
+    static int defaultMarkerWidth();
+    static bool defaultFilterEdgesHidden();
+    static void setDefaultMarkerWidth(int widthPx);
+    static void setDefaultFilterEdgesHidden(bool hide);
+    void setMarkerWidth(int widthPx, bool persist = true);
+    void setFilterEdgesHidden(bool hide, bool persist = true);
 private:
     int  m_markerWidth{1};
     bool m_filterEdgesHidden{false};
@@ -633,7 +660,8 @@ private:
     // unchecked = edges hidden.
     class QPushButton* m_edgesBtn{nullptr};
     void loadDisplayPrefs();
-    void saveDisplayPrefs();
+    void saveMarkerWidthPref();
+    void saveFilterEdgesPref();
     // Adaptive RX filter controls (SSB-only, rebuilt with the Mode tab) — RFC #3878
     // Reusable adaptive-RX-filter control group (shared with the RX applet);
     // recreated on each SSB grid rebuild, bound to the slice as source of truth.
@@ -658,6 +686,9 @@ private:
     QPushButton* m_aetherDspBtn{nullptr};    // launches AetherDSP Settings dialog
     bool         m_aetherDspActive{false};   // any client NR module on (#3800)
     QPushButton* m_aetherVoiceBtn{nullptr};  // toggles Aetherial Audio Channel Strip
+    // Holds the two launchers side by side; relayoutDspGrid() spans it across
+    // whatever columns the toggles leave free, and the pair split that evenly.
+    QWidget*     m_aetherLauncherRow{nullptr};
 
     // Shared DSP-level row at the bottom of the DSP grid: one slider whose
     // target switches based on which leveled DSP the user most recently
@@ -683,6 +714,14 @@ private:
     // Pick a sensible initial target from the current slice's enable
     // flags; called when m_slice is set and on mode-driven re-visibility.
     void refreshDspLevelTarget();
+    // NB2's fill row. Visible only while NB2 is the running blanker; see
+    // refreshNbControls().
+    QWidget*   m_nbFillContainer{nullptr};
+    QComboBox* m_nbFillCombo{nullptr};
+    // Button text, visibility of the fill row and the combo's index, from
+    // whatever the slice now says. One place, called from the click handler, the
+    // model signals and the slice-switch sync, so the three cannot disagree.
+    void refreshNbControls();
     QWidget* m_apfContainer{nullptr};
     QSlider* m_apfSlider{nullptr};
     QLabel*  m_apfValueLbl{nullptr};
@@ -693,6 +732,10 @@ private:
     // (NRS/RNN/NRF) — one place so setSlice/syncFromSlice/setHasExtendedDsp
     // can't drift on the mode gate. Caller must hold a valid m_slice. (#2177)
     void updateExtendedDspVisibility();
+    bool usesTransmitFrequencyCheck() const;
+    void configureRepeaterReverseControl();
+    void configureFmToneControls();
+    void releaseTransmitFrequencyCheck();
     // The ONE owner of the radio-side DSP buttons' visibility: ANDs each
     // button's cached mode eligibility with m_hasRadioSideDsp. Both mode
     // recompute sites and setHasRadioSideDsp() route through here, so no
@@ -707,14 +750,21 @@ private:
     QStackedWidget*  m_digOffsetStack{nullptr};    // switches between label and edit
     // FM-family OPT controls. DSTR uses the duplex controls but not CTCSS.
     QWidget*       m_fmContainer{nullptr};
+    QVBoxLayout*   m_fmLayout{nullptr};
     QWidget*       m_fmToneContainer{nullptr};
+    QWidget*       m_fmToneRxContainer{nullptr};
     QComboBox*     m_fmToneModeCmb{nullptr};
     QComboBox*     m_fmToneValueCmb{nullptr};
+    QComboBox*     m_fmToneRxValueCmb{nullptr};
+    QComboBox*     m_fmDtcsCodeCmb{nullptr};
+    QComboBox*     m_fmDtcsPolarityCmb{nullptr};
+    QWidget*       m_fmDtcsContainer{nullptr};
     QDoubleSpinBox* m_fmOffsetSpin{nullptr};
     QPushButton*   m_fmOffsetDown{nullptr};
     QPushButton*   m_fmSimplexBtn{nullptr};
     QPushButton*   m_fmOffsetUp{nullptr};
     QPushButton*   m_fmRevBtn{nullptr};
+    bool           m_xfcHeldByThisControl{false};
     ScrollableLabel* m_markLabel{nullptr};
     ScrollableLabel* m_shiftLabel{nullptr};
     // Mode tab
@@ -727,6 +777,7 @@ private:
     QVector<int> m_filterWidths;
     // Radio-declared ladder; empty when the radio does not declare one.
     QVector<int> m_radioFilterWidths;
+    RxFilterControl m_radioFilterControl;
     // Parallel to m_filterWidths.  When a slot has user-defined custom
     // edges (right-click → "Set Custom Edges..."), the lo/hi are stored
     // here and applied directly instead of going through applyFilterPreset's
@@ -763,17 +814,10 @@ private:
     // which already defaults true), so a permissive default would show NB in
     // the pre-report window on radios that will never claim either.
     bool         m_hasHostNoiseBlanker{false};
-    // Mode eligibility for each radio-side DSP button, cached by the two places
-    // that recompute it (the slice modeChanged handler and syncFromSlice) so
-    // applyRadioSideDspVisibility() can AND it with the capability WITHOUT
-    // re-deriving mode.
-    //
-    // Re-deriving would force a choice between those two sites' rules, and they
-    // differ: the modeChanged handler hides ANF/ANFL/ANFT for FreeDV modes
-    // (its isVoice carries a !isFdv term), syncFromSlice does not. That is a
-    // pre-existing difference — the same class of drift #2177 found on DFM — and
-    // resolving it is not this change's job. Caching keeps each site's answer
-    // exactly as it was.
+    // Mode eligibility per radio-side DSP button, cached by the two sites that
+    // compute it (modeChanged handler, syncFromSlice) so
+    // applyRadioSideDspVisibility() can AND it with the capability. Their rules
+    // differ (only modeChanged hides ANF/ANFL/ANFT for FreeDV), so don't re-derive.
     bool         m_nrModeOk{true};
     bool         m_nbModeOk{true};
     bool         m_anfModeOk{true};

@@ -64,6 +64,20 @@ void ClientEqFftAnalyzer::buildWindow()
     }
 }
 
+float ClientEqFftAnalyzer::coherentGainCorrectionDb() const noexcept
+{
+    // Mean of the window = its coherent gain. Summed in double because 2048
+    // float adds of ~0.5 each would lose the last digits of a figure whose
+    // whole job is to be exact.
+    double sum = 0.0;
+    for (const float w : m_window)
+        sum += static_cast<double>(w);
+    const double mean = sum / static_cast<double>(kFftSize);
+    if (!(mean > 1e-12))
+        return 0.0f;   // a degenerate window has no meaningful correction
+    return static_cast<float>(-20.0 * std::log10(mean));
+}
+
 void ClientEqFftAnalyzer::reset() noexcept
 {
     std::fill(m_smoothedDb.begin(), m_smoothedDb.end(), kFloorDb);
@@ -85,9 +99,11 @@ void ClientEqFftAnalyzer::update(const float* samples, int count) noexcept
     }
     fftInPlace(buf, kFftSize);
 
-    // Magnitude → dBFS (0 dB = full-scale sine). Normalise by N/2 to
-    // land full-scale inputs at ~0 dB; Hann window reduces coherent
-    // gain by 6 dB which we absorb into the normalisation.
+    // 2/N is the single-sided normalisation for an UNWINDOWED transform; it does
+    // not absorb the Hann window's 0.5 coherent gain, so a full-scale sine reads
+    // -6.02 dB, not 0. Kept so the EQ editor's established display does not move;
+    // absolute-level callers add coherentGainCorrectionDb().
+    // bandscope_analyzer_test pins both scales.
     const float norm = 2.0f / static_cast<float>(kFftSize);
     for (int i = 0; i < kBinCount; ++i) {
         const float mag = std::abs(buf[i]) * norm;

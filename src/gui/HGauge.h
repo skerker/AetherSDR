@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DragValuePopup.h"
+#include "MeterExtremes.h"
 #include "MeterSmoother.h"
 
 #include <QAccessible>
@@ -11,6 +12,7 @@
 #include <QFocusEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QGradient>
 #include <QPainter>
 #include <QPoint>
 #include <QStringList>
@@ -50,12 +52,47 @@ public:
         setFixedHeight(24);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
+        applyExtremesScale();
         m_smooth.setTarget(fractionFor(m_value));
         m_smooth.snapToTarget();
         m_animTimer.setTimerType(Qt::PreciseTimer);
         m_animTimer.setInterval(kMeterSmootherIntervalMs);
         connect(&m_animTimer, &QTimer::timeout, this, [this]() {
-            if (!m_smooth.tick(m_animElapsed.restart()))
+            const qint64 dt = m_animElapsed.restart();
+            const bool barMoving = m_smooth.tick(dt);
+            // The extremes engine keeps ticking after the bar settles: a
+            // window sample can expire and slide the marker with the needle
+            // already at rest.
+            bool markerMoving = false;
+            if (m_peakSource != PeakSource::Disabled) {
+                m_nowMs += dt;
+                // The PAINTED needle, not the raw target: the engine clamps
+                // the marker to sit at or above the needle, so handing it the
+                // unsmoothed value would drag the marker straight to the new
+                // reading and there would be no glide to see.
+                const double needleUnits =
+                    double(m_min) + double(m_smooth.value())
+                                        * (double(m_max) - double(m_min));
+                markerMoving = m_extremes.tick(
+                    m_nowMs, dt, needleUnits,
+                    [this](double raw) {
+                        return double(qBound(m_min, float(raw), m_max));
+                    });
+                // Publish the marker every tick, including after the window
+                // has emptied: that is exactly when it is gliding back down to
+                // the floor, and freezing the published value there would
+                // strand the marker at the last peak forever.
+                m_peakValue = static_cast<float>(m_extremes.maxPosUnits());
+                m_peakEnabled =
+                    m_extremes.hasData()
+                    || m_peakValue > float(needleUnits) + kMarkerCollapseEps;
+            }
+            // m_nowMs only advances in here, so the sliding window can only
+            // expire while the timer runs. tick() reports true whenever a
+            // marker is mid-slew or still standing off the needle — which is
+            // exactly the state in which pruning still has work to do — so its
+            // return value alone is a sufficient keep-alive.
+            if (!barMoving && !markerMoving)
                 m_animTimer.stop();
             // Republish so gaugeFraction tracks the bar through the sweep, not
             // just at the setValue/setRange call that started it — otherwise
@@ -84,6 +121,13 @@ public:
             activeHoverGauge() = nullptr;
     }
 
+    void setUnit(const QString& unit) {
+        if (m_unit == unit) return;
+        m_unit = unit;
+        publishAutomationState();
+        update();
+    }
+
     void setLabel(const QString& label) {
         if (m_label == label) return;
         m_label = label;
@@ -91,24 +135,55 @@ public:
         update();
     }
 
-    // The normalised [0,1] fill fraction, after ballistics. Distinct from
-    // value()/min()/max(): those are the INPUTS, this is the derived state that
-    // gets drawn, and the two can disagree (see setRange). Exposed so that
-    // divergence is assertable without pixel-reading.
-    //
-    // This is what paintEvent multiplies by the bar width for a normal gauge
-    // and for setFillFromRight(). On a setReversed() gauge (PhoneCwApplet's
-    // compression bar) the mapping is inverted at paint time — min means FULL —
-    // so the painted width there is 1.0f - filledFraction(). Assert
-    // accordingly; the fraction itself is always value-normalised.
+    // Opt into a sliding-window marker driven by the values passed to
+    // setValue(). Ordinary gauges remain marker-free; only readings for which
+    // an extremum is meaningful (forward power today) enable this mode.
+    void setWindowPeakEnabled(bool enabled) {
+        selectPeakSource(enabled ? PeakSource::Window : PeakSource::Disabled,
+                         enabled);
+        publishAutomationState();
+        update();
+    }
+
+    // Feed a separate raw sample into the sliding window without changing the
+    // bar. TxApplet uses this because its bar receives a smoothed reading while
+    // txPeakChanged carries the raw FWDPWR sample from which PEP is derived.
+    void recordWindowPeakSample(float v) {
+        selectPeakSource(PeakSource::Window, false);
+        m_extremes.record(double(qBound(m_min, v, m_max)), m_nowMs);
+        m_peakEnabled = true;
+        armPeakTimer();
+    }
+
+    // Drive the peak marker from a separately measured peak (TGXL `peak`)
+    // instead of this gauge's own sliding window. The marker then tracks that
+    // value at SmartMTR's fast peak slew. Switching source resets the old
+    // window so record() and external-peak mode can never coexist.
+    void setExternalPeak(float v) {
+        selectPeakSource(PeakSource::External, false);
+        m_extremes.setExternalPeak(double(qBound(m_min, v, m_max)));
+        m_peakEnabled = true;
+        armPeakTimer();
+    }
+
     float value() const { return m_value; }
+    // Drawn [0,1] fill after ballistics; can differ from value() (see
+    // setRange). A setReversed() gauge paints 1.0f - filledFraction().
     float filledFraction() const { return m_smooth.value(); }
+    // The peak-hold marker. peakHeld() is separate from the value because
+    // "no peak" and "peak at 0" are different states and the tick is absent
+    // in only one of them.
+    float peakValue() const { return m_peakValue; }
+    bool  peakHeld()  const { return m_peakEnabled; }
 
     void setValue(float v) {
         if (qFuzzyCompare(m_value, v)) return;
         m_value = v;
+        if (m_peakSource == PeakSource::Window && m_recordGaugeValuesForPeak) {
+            m_extremes.record(double(v), m_nowMs);
+        }
         m_smooth.setTarget(fractionFor(v));
-        if (!m_smooth.needsAnimation()) {
+        if (!m_smooth.needsAnimation() && !m_peakEnabled) {
             if (m_animTimer.isActive()) m_animTimer.stop();
             update();
         } else if (!m_animTimer.isActive()) {
@@ -130,15 +205,25 @@ public:
     }
 
     void setPeakValue(float v) {
+        // Legacy/manual callers own the marker value directly. In particular,
+        // PhoneCwApplet supplies the radio's MICPEAK immediately after
+        // setValue(); a window tick must not overwrite that measurement.
+        selectPeakSource(PeakSource::Disabled, false);
         if (qFuzzyCompare(m_peakValue, v)) return;
         m_peakValue = v;
         m_peakEnabled = true;
+        publishAutomationState();
         update();
     }
 
     void clearPeak() {
+        // Park: drop the window too, or the engine keeps sliding a marker
+        // for a gauge the caller has just said has nothing to show.
+        m_extremes.reset();
+        m_peakValue = static_cast<float>(m_extremes.floorPos());
         if (!m_peakEnabled) return;
         m_peakEnabled = false;
+        publishAutomationState();
         update();
     }
 
@@ -153,6 +238,10 @@ public:
         MeterSmoother::Ballistics ballistics = m_smooth.ballistics();
         std::swap(ballistics.attackSeconds, ballistics.releaseSeconds);
         m_smooth.setBallistics(ballistics);
+        m_extremes.setReversed(rev);
+        m_extremes.reset();
+        m_peakValue = static_cast<float>(m_extremes.floorPos());
+        m_peakEnabled = false;
         update();
     }
     // Anchor the fill bar to the right edge instead of the left.  Unlike
@@ -163,6 +252,32 @@ public:
     // in the natural direction.
     void setFillFromRight(bool on) { m_fillFromRight = on; update(); }
 
+    // Paint the empty track as a left-to-right gradient instead of a flat
+    // ground, so the bar carries its own scale colouring even at rest — how
+    // the Tuner Genius XL's front panel draws its SWR scale, which
+    // TunerApplet reproduces in its expanded presentation.
+    //
+    // Stops are passed in rather than resolved here: this header is included
+    // by ~20 applets, and a themed default would couple every one of them to
+    // ThemeManager for a mode only one of them turns on. Empty restores the
+    // flat track.
+    void setTrackGradient(const QGradientStops& stops) {
+        m_trackStops = stops;
+        update();
+    }
+
+    // Scale the gauge's internal metrics — the tick strip above the bar and
+    // both font sizes — so a gauge given more height grows its lettering
+    // instead of just a taller bar. Opt-in, defaulting to 1.0, which
+    // reproduces the original fixed metrics exactly: every other applet's
+    // gauges are unaffected.
+    void setMetricScale(qreal scale) {
+        const qreal clamped = qBound(0.5, scale, 4.0);
+        if (qFuzzyCompare(m_metricScale, clamped)) return;
+        m_metricScale = clamped;
+        update();
+    }
+
     void setBallistics(const MeterSmoother::Ballistics& b) {
         m_smooth.setBallistics(b);
     }
@@ -170,24 +285,14 @@ public:
     void setRange(float min, float max, float redStart,
                   const QVector<Tick>& ticks, float yellowStart = std::numeric_limits<float>::quiet_NaN()) {
         m_min = min; m_max = max; m_redStart = redStart;
+        applyExtremesScale();
         m_yellowStart = std::isnan(yellowStart) ? redStart : yellowStart;
         m_ticks = ticks;
-        // Re-map the CURRENT value onto the new axis. Without this the fill
-        // keeps the fraction computed under the old bounds, and setValue()'s
-        // unchanged-value early-return means a steady reading never corrects
-        // it — an amplifier holding a constant carrier across a range change
-        // (ACOM auto-range, SPE LOW/MID/HIGH) shows the old fraction against
-        // the new scale indefinitely, misreporting RF output by hundreds of
-        // watts. Snapped, not animated: the axis moved, the signal did not,
-        // so sweeping the needle would show a change that never happened.
-        //
-        // Precondition: m_value is already in the NEW axis's units. A caller
-        // that changes units as well as bounds (MeterApplet's °C/°F toggle)
-        // must still follow with setValueImmediate to convert it — this
-        // re-map fixes the axis, it cannot know the value moved too. That
-        // pairing is now belt-and-braces rather than load-bearing: both
-        // update() calls coalesce into one repaint, so the intermediate
-        // fraction never reaches the screen.
+        // Snap the fill to the CURRENT value on the new axis: setValue() skips
+        // unchanged values, so a steady carrier across an amp auto-range (ACOM,
+        // SPE LOW/MID/HIGH) would keep the old fraction. Not animated, since
+        // the signal did not change. Assumes m_value is already in the new
+        // units; a unit change (°C/°F) must also call setValueImmediate.
         m_smooth.setTarget(fractionFor(m_value));
         m_smooth.snapToTarget();
         // Belt-and-braces: the smoother is at target, so the animation
@@ -198,21 +303,10 @@ public:
         update();
     }
 
-    // ── Hover value readout ───────────────────────────────────────────────
-    // Opt-in floating popup that shows the gauge's current numeric value
-    // while the pointer hovers over the bar, reusing the same DragValuePopup
-    // badge the sliders flash on keyboard/drag adjustment.  Handy on the TX
-    // meters (SWR / forward power / ALC) where the bar scale alone doesn't
-    // give an exact reading.  The badge lingers briefly after the pointer
-    // leaves so a quick glance-and-move still registers. (#3936)
-    //
-    // Only ONE badge is ever on screen app-wide: showHoverPopup() closes the
-    // previously-showing gauge's badge before raising its own. Each gauge owns
-    // its own DragValuePopup (a lifetime choice — a shared static QWidget would
-    // outlive QApplication), so without that hand-off nothing would ever hide
-    // gauge A's badge on entering gauge B, and the linger below would leave two
-    // stacked on screen at once. The stacked meters in TxApplet/PhoneCwApplet
-    // sit two pixels apart, so the two badges land nearly on top of each other.
+    // Opt-in hover popup showing the numeric value, reusing the DragValuePopup
+    // badge; lingers briefly after leave (#3936). Only one badge app-wide:
+    // showHoverPopup() closes the previous gauge's badge, since each gauge owns
+    // its own popup (a shared static QWidget would outlive QApplication).
     using HoverValueFormatter = std::function<QString(float)>;
 
     // How long a badge can outlive a dropped physical leaveEvent before the
@@ -286,13 +380,19 @@ protected:
 
         const int w = width();
         const int h = height();
-        const int barY = 12;
+        const int barY = qRound(12 * m_metricScale);
         const int barH = h - barY - 2;
         const int barX = 0;
         const int barW = w;
 
         // Background
-        p.fillRect(barX, barY, barW, barH, QColor(0x0a, 0x0a, 0x18));
+        if (m_trackStops.isEmpty()) {
+            p.fillRect(barX, barY, barW, barH, QColor(0x0a, 0x0a, 0x18));
+        } else {
+            QLinearGradient track(barX, 0, barX + barW, 0);
+            track.setStops(m_trackStops);
+            p.fillRect(barX, barY, barW, barH, track);
+        }
         p.setPen(QColor(0x20, 0x30, 0x40));
         p.drawRect(barX, barY, barW - 1, barH - 1);
 
@@ -343,23 +443,19 @@ protected:
         if (m_peakEnabled) {
             float peakFrac = qBound(0.0f, (m_peakValue - m_min) / (m_max - m_min), 1.0f);
             int peakX = barX + static_cast<int>(peakFrac * barW);
-            if (m_reversed) {
-                // In reversed mode, peak is the lowest value (most compression)
-                if (peakX > barX && peakX < barX + barW - 1) {
-                    p.setPen(QColor(0xff, 0xff, 0xff));
-                    p.drawLine(peakX, barY + 1, peakX, barY + barH - 2);
-                }
-            } else {
-                if (peakX > barX && peakX < barX + barW - 1) {
-                    p.setPen(QColor(0xff, 0xff, 0xff));
-                    p.drawLine(peakX, barY + 1, peakX, barY + barH - 2);
-                }
+            // Two pixels, not one: a single hairline is easy to lose against
+            // the bar's own gradient, especially while it is decaying.
+            // Reversed mode reads the peak as the lowest value (most
+            // compression) but draws the same marker.
+            if (peakX > barX && peakX < barX + barW - 1) {
+                p.setPen(QPen(QColor(0xff, 0xff, 0xff), kPeakMarkerW));
+                p.drawLine(peakX, barY + 1, peakX, barY + barH - 2);
             }
         }
 
         // Tick labels along the top
         QFont tickFont = font();
-        tickFont.setPixelSize(9);
+        tickFont.setPixelSize(qMax(6, qRound(9 * m_metricScale)));
         p.setFont(tickFont);
 
         for (const auto& tick : m_ticks) {
@@ -374,12 +470,12 @@ protected:
             // Center label on tick position, clamp to widget bounds
             // Leave a small right margin so the last tick isn't flush to the edge
             int lx = qBound(2, tx - tw / 2, w - tw - 4);
-            p.drawText(lx, 10, tick.label);
+            p.drawText(lx, qRound(10 * m_metricScale), tick.label);
         }
 
         // Label in center of bar
         QFont lblFont = font();
-        lblFont.setPixelSize(10);
+        lblFont.setPixelSize(qMax(6, qRound(10 * m_metricScale)));
         lblFont.setBold(true);
         p.setFont(lblFont);
         p.setPen(QColor(0xff, 0xff, 0xff));
@@ -389,6 +485,52 @@ protected:
     }
 
 private:
+
+    enum class PeakSource {
+        Disabled,
+        Window,
+        External,
+    };
+
+    void selectPeakSource(PeakSource source, bool recordGaugeValues) {
+        const bool recordValues = source == PeakSource::Window && recordGaugeValues;
+        if (m_peakSource == source
+            && m_recordGaugeValuesForPeak == recordValues) {
+            return;
+        }
+        m_extremes.reset();
+        m_peakSource = source;
+        m_recordGaugeValuesForPeak = recordValues;
+        m_peakValue = static_cast<float>(m_extremes.floorPos());
+        m_peakEnabled = false;
+    }
+
+    void armPeakTimer() {
+        if (!m_animTimer.isActive()) {
+            m_animElapsed.restart();
+            m_animTimer.start();
+        }
+    }
+
+    // SmartMTR slews its markers at a constant 60 UNITS/s over a 220-UNIT bar
+    // -- a marker crosses the full scale in ~3.7 s, deliberately lazy against
+    // the bar's attack. Expressed as a fraction of span so every gauge range
+    // takes the same ~3.7 s, which is what makes them feel alike.
+    void applyExtremesScale() {
+        MeterExtremes::Tuning t;
+        t.windowSeconds   = SmartMtrExtremes::kWindowMediumSec;
+        t.scaleMin        = m_min;
+        t.scaleMax        = m_max;
+        const double span = double(m_max) - double(m_min);
+        t.slewUnitsPerSec = span > 0.0 ? span / kMarkerCrossSeconds : 1.0;
+        m_extremes.setTuning(t);
+    }
+    // Below this (in gauge units) the marker has effectively collapsed onto
+    // the needle and stops being drawn as a separate peak.
+    static constexpr float kMarkerCollapseEps = 0.001f;
+    static constexpr double kMarkerCrossSeconds =
+        (SmartMtrUnits::kScaleMax - SmartMtrUnits::kScaleMin)
+        / SmartMtrExtremes::kSlewUnitsPerSec;
     // Map a physical value onto the normalised [0,1] axis fraction the
     // smoother and paintEvent work in. Every site that moves the fill must
     // agree on this — the constructor, setValue, setValueImmediate and
@@ -410,6 +552,7 @@ private:
         static const bool kAutomation = qEnvironmentVariableIsSet("AETHER_AUTOMATION");
         if (!kAutomation) return;
         setProperty("gaugeLabel", m_label);
+        setProperty("gaugeUnit", m_unit);
         setProperty("gaugeValue", m_value);
         // The DERIVED state — see filledFraction(). Every property above and
         // below reads correct while the bar paints something else, so without
@@ -425,6 +568,14 @@ private:
         for (const auto& t : m_ticks)
             tickLabels << t.label;
         setProperty("gaugeTicks", tickLabels.join(QLatin1Char(',')));
+        // The peak-hold marker. Published because it is the one part of a
+        // power meter a driver cannot infer: gaugeValue is the instant, and
+        // on a speech envelope the instant is mostly silence -- the tick is
+        // what the operator actually reads a PEP off. Enabled is separate
+        // from the value because "no peak held" and "peak held at 0" are
+        // different states and the tick is absent in only one of them.
+        setProperty("gaugePeak", m_peakValue);
+        setProperty("gaugePeakEnabled", m_peakEnabled);
     }
 
     QString hoverValueText() const {
@@ -480,30 +631,12 @@ private:
         return isVisible() && rect().contains(mapFromGlobal(QCursor::pos()));
     }
 
-    // Arm the recovery watchdog only while the pointer is REALLY over the bar.
-    //
-    // Qt does not guarantee a leaveEvent (the hideEvent override above exists
-    // for the same reason), and a stuck m_hovered is self-sustaining: every
-    // showValue() cancels the pending hide timer. So a dropped leave used to
-    // pin the badge on screen indefinitely, frozen at the anchor the pointer
-    // left it at.
-    //
-    // The recovery is on a timer rather than on setValue(), because setValue()
-    // early-returns on an unchanged reading — a meter that settles (or stops
-    // reporting entirely, as the TX gauges do on unkey) would never reach it,
-    // and a quiescent meter is the more likely way to end up here than a busy
-    // one.
-    //
-    // Gating on the physical cursor is what keeps the automation bridge's
-    // synthetic hover working. `hover <target>` injects a QEnterEvent and a
-    // no-button QMouseMove at the widget centre WITHOUT moving the real cursor
-    // (AutomationServer::doHover), so an injected hover never arms the
-    // watchdog and holds the badge until the driver sends an explicit
-    // `hover <target> leave`. A validation run on every frame instead would
-    // have torn the badge down under the driver on the first changing value.
-    // The cost is that recovery covers physical hovers only — which is the
-    // only case that can drop a leave, since the injected ones are delivered
-    // by hand.
+    // Arm the recovery watchdog only while the physical cursor is over the bar.
+    // Qt may drop leaveEvent, and a stuck m_hovered keeps cancelling the hide
+    // timer; a timer (not setValue(), which skips unchanged readings) recovers.
+    // Gating on the real cursor keeps bridge `hover <target>` working: it
+    // injects events without moving the cursor, so the badge holds until
+    // `hover <target> leave`.
     void syncHoverWatchdog() {
         // Already armed and still hovered: the next tick re-validates within
         // kHoverWatchdogMs, so asking again in between learns nothing. Worth
@@ -559,10 +692,21 @@ private:
 
     float m_min, m_max, m_redStart, m_yellowStart;
     float m_value{0.0f};
+    static constexpr int kPeakMarkerW = 2;   // pixels
+    // Peak marker, SmartMTR's engine (project canon): a sliding window over
+    // recent samples with a constant-velocity glide, rather than a latched
+    // peak on a hold-then-decay timer. The window expiring is what retires
+    // the marker, so there is no hold phase to tune.
+    MeterExtremes m_extremes;
+    PeakSource m_peakSource{PeakSource::Disabled};
+    bool   m_recordGaugeValuesForPeak{false};
+    qint64 m_nowMs{0};          // monotonic tick clock for the window
     float m_peakValue{0.0f};
     bool  m_peakEnabled{false};
     bool  m_reversed{false};
     bool  m_fillFromRight{false};
+    QGradientStops m_trackStops;   // empty = flat track (the default)
+    qreal m_metricScale{1.0};      // 1.0 = the original fixed metrics
     QString m_label, m_unit;
     QVector<Tick> m_ticks;
 

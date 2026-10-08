@@ -4,10 +4,11 @@
 // every QMenu/QAction in the menu bar, their enable/disable wiring, and the
 // inline lambdas they trigger (~70 connects).
 //
-// The community-credits subsystem lives in Contribute.cpp; this TU retains
-// only the About-dialog button and its connection.
+// Contributors are recognised in the Contributor Logbook, which the About
+// window links to.
 
 #include "MainWindow.h"
+#include "AetherBuildIdentity.h"   // generated at build time (#5804)
 
 #include "workspace/WorkspaceController.h"
 
@@ -15,6 +16,7 @@
 #include "CopyAssistController.h"
 #include "CopyAssistPanel.h"
 #endif
+#include "AetherialAudioStrip.h"
 #include "AppletPanel.h"
 #include "DaxApplet.h"
 #include "PanadapterApplet.h"
@@ -22,7 +24,7 @@
 #include "RadioSetupDialog.h"
 #include "TciApplet.h"
 #include "ClientChainApplet.h"
-#include "Contribute.h"
+#include "CwxPanel.h"
 #include "DxClusterDialog.h"
 #include "HelpDialog.h"
 #include "MainWindowHelpers.h"
@@ -40,54 +42,270 @@
 #include "ProfileManagerDialog.h"
 #include "SettingsBrowserDialog.h"
 #include "ThemeEditorDialog.h"
+#include "BandscopeDialog.h"
 #include "TxBandDialog.h"
+#include "TxApplet.h"
 #include "UlanziDialMapperDialog.h"
+#include "VfoWidget.h"
 #include "WaveformsDialog.h"
 #include "WhatsNewDialog.h"
+#include "WindowShowState.h"
 #include "core/UpdateChecker.h"
 #include "core/AppSettings.h"
 #include "core/SpotModeResolver.h"
 #include "core/ThemeManager.h"
+#include "BrandMark.h"
+#include "CanonWindow.h"
+#include "core/TxKeyingMarker.h"
 #include "models/BandPlanManager.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 
 #include <QActionGroup>
+#include <QApplication>
 #include <QColor>
 #include <QCoreApplication>
 #include <QCheckBox>
 #include <QDesktopServices>
 #include <QFrame>
-#include <QJsonDocument>
+#include <QHBoxLayout>
 #include <QJsonObject>
+#include <QKeySequence>
 #include <QLabel>
 #include <QMenuBar>
-#include <QNetworkAccessManager>
-#include <QNetworkReply>
-#include <QNetworkRequest>
+#include <QPointer>
+#include <QGridLayout>
+#include <QFontMetricsF>
+#include <QPainter>
 #include <QPushButton>
-#include <QScrollArea>
-#include <QScrollBar>
+#include <QSpinBox>
 #include <QShortcut>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QWidgetAction>
 
+#include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace AetherSDR {
 
 namespace {
-// Stall timeout for the About dialog's GitHub contributor fetch (#4688 §6).
-constexpr int kTransferTimeoutMs = 15000;
+
+// "AetherSDR" at display size, centred: BrandMark's wordmark, without the
+// mark, which the About window shows larger above it.
+class AboutWordmark : public QWidget {
+public:
+    explicit AboutWordmark(QWidget* parent = nullptr) : QWidget(parent)
+    {
+        setAccessibleName(QStringLiteral("AetherSDR"));
+        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    }
+    QSize sizeHint() const override
+    {
+        const QFontMetricsF fm(wordFont());
+        return QSize(int(BrandMark::wordmarkWidth(wordFont())) + 8, int(fm.height()) + 4);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        const QFont f = wordFont();
+        const QFontMetricsF fm(f);
+        BrandMark::paintWordmark(p, this, f, (width() - BrandMark::wordmarkWidth(f)) / 2.0,
+                                 (height() + fm.capHeight()) / 2.0, height());
+    }
+
+private:
+    QFont wordFont() const
+    {
+        QFont f = font();
+        f.setPixelSize(26);
+        f.setWeight(QFont::Bold);
+        f.setLetterSpacing(QFont::PercentageSpacing, 98);
+        return f;
+    }
+};
+
+QWidget* windowMenuTarget(QWidget* primaryWindow,
+                          const QList<WindowMenuEntry>& entries)
+{
+    QWidget* activeWindow = QApplication::activeWindow();
+    const bool activeIsListed = std::any_of(
+        entries.cbegin(), entries.cend(), [activeWindow](const WindowMenuEntry& entry) {
+            return entry.window == activeWindow;
+        });
+    return activeIsListed ? activeWindow : primaryWindow;
+}
+
+void toggleWindowMaximized(QWidget* window)
+{
+    if (!window) {
+        return;
+    }
+    Qt::WindowStates state = window->windowState() & ~Qt::WindowMinimized;
+    state.setFlag(Qt::WindowMaximized, !state.testFlag(Qt::WindowMaximized));
+    window->setWindowState(state);
+    window->show();
+    window->raise();
+    window->activateWindow();
+}
+
+void toggleWindowFullScreen(QWidget* window)
+{
+    if (!window) {
+        return;
+    }
+    Qt::WindowStates state = window->windowState() & ~Qt::WindowMinimized;
+    state.setFlag(Qt::WindowFullScreen,
+                  !state.testFlag(Qt::WindowFullScreen));
+    window->setWindowState(state);
+    window->show();
+    window->raise();
+    window->activateWindow();
+}
+
+QString menuActionText(const QString& label, const QString& shortcut)
+{
+    return shortcut.isEmpty()
+        ? label
+        : QStringLiteral("%1\t%2").arg(label, shortcut);
+}
+
+void populateWindowMenu(QMenu* menu, QWidget* primaryWindow,
+                        const QString& minimizeShortcut,
+                        const QString& fullScreenShortcut)
+{
+    menu->clear();
+
+    const QList<WindowMenuEntry> entries = windowInventory(primaryWindow);
+    QWidget* target = windowMenuTarget(primaryWindow, entries);
+    QPointer<QWidget> guardedTarget(target);
+
+    QAction* minimize = menu->addAction(menuActionText(
+        QObject::tr("Minimize"), minimizeShortcut));
+    minimize->setObjectName(QStringLiteral("windowMenuMinimize"));
+    minimize->setMenuRole(QAction::NoRole);
+    minimize->setEnabled(target != nullptr);
+    QObject::connect(minimize, &QAction::triggered, menu, [guardedTarget] {
+        if (guardedTarget) {
+            guardedTarget->showMinimized();
+        }
+    });
+
+#ifdef Q_OS_MAC
+    const QString maximizeLabel = QObject::tr("Zoom");
+#else
+    const QString maximizeLabel = target && target->isMaximized()
+        ? QObject::tr("Restore")
+        : QObject::tr("Maximize");
+#endif
+    QAction* maximize = menu->addAction(maximizeLabel);
+    maximize->setObjectName(QStringLiteral("windowMenuMaximize"));
+    maximize->setMenuRole(QAction::NoRole);
+    maximize->setEnabled(target != nullptr && !target->isFullScreen());
+    QObject::connect(maximize, &QAction::triggered, menu, [guardedTarget] {
+        toggleWindowMaximized(guardedTarget);
+    });
+
+    const bool fullScreen = target && target->isFullScreen();
+    const QString fullScreenLabel = fullScreen
+        ? QObject::tr("Exit Full Screen")
+        : QObject::tr("Enter Full Screen");
+    QAction* fullScreenAction = menu->addAction(menuActionText(
+        fullScreenLabel, fullScreenShortcut));
+    fullScreenAction->setObjectName(QStringLiteral("windowMenuFullScreen"));
+    fullScreenAction->setMenuRole(QAction::NoRole);
+    fullScreenAction->setEnabled(target != nullptr);
+    QObject::connect(fullScreenAction, &QAction::triggered, menu, [guardedTarget] {
+        toggleWindowFullScreen(guardedTarget);
+    });
+
+    menu->addSeparator();
+
+    QAction* bringAll = menu->addAction(QObject::tr("Bring All to Front"));
+    bringAll->setObjectName(QStringLiteral("windowMenuBringAllToFront"));
+    bringAll->setMenuRole(QAction::NoRole);
+    bringAll->setEnabled(!entries.isEmpty());
+
+    QList<QPointer<QWidget>> guardedWindows;
+    guardedWindows.reserve(entries.size());
+    for (const WindowMenuEntry& entry : entries) {
+        guardedWindows.append(QPointer<QWidget>(entry.window));
+    }
+    QObject::connect(bringAll, &QAction::triggered, menu,
+                     [guardedWindows, guardedTarget] {
+        // Raise every other window first, then restore the window that was
+        // active when the menu opened so Bring All preserves the operator's
+        // working window at the top of the application's stack.
+        for (const QPointer<QWidget>& window : guardedWindows) {
+            if (window && window != guardedTarget) {
+                showAndRaiseWindow(window);
+            }
+        }
+        if (guardedTarget) {
+            showAndRaiseWindow(guardedTarget);
+        }
+    });
+
+    menu->addSeparator();
+
+    for (const WindowMenuEntry& entry : entries) {
+        QAction* action = menu->addAction(entry.menuText);
+        action->setObjectName(QStringLiteral("windowMenuWindow"));
+        action->setMenuRole(QAction::NoRole);
+        action->setCheckable(true);
+        // Use the same resolved target as the standard window actions.  Some
+        // platforms temporarily report no active QWidget while the native
+        // menu bar owns focus; in that interval isActiveWindow() would leave
+        // every entry unchecked even though Minimize/Zoom still target one.
+        action->setChecked(entry.window == target);
+        action->setStatusTip(QObject::tr("Bring %1 to the foreground")
+                                 .arg(entry.title));
+        QPointer<QWidget> guardedWindow(entry.window);
+        QObject::connect(action, &QAction::triggered, menu, [guardedWindow] {
+            showAndRaiseWindow(guardedWindow);
+        });
+    }
+}
 } // namespace
+
+void MainWindow::minimizeActiveApplicationWindow()
+{
+    QWidget* target = windowMenuTarget(this, windowInventory(this));
+    if (target) {
+        target->showMinimized();
+    }
+}
+
+void MainWindow::toggleActiveApplicationWindowFullScreen()
+{
+    toggleWindowFullScreen(windowMenuTarget(this, windowInventory(this)));
+}
 
 void MainWindow::buildMenuBar()
 {
     auto* fileMenu = menuBar()->addMenu("&File");
 
-    auto* waveformsAct = fileMenu->addAction("Waveforms...");
+    auto* chooseRadio = fileMenu->addAction("Connect to Radio...");
+    chooseRadio->setMenuRole(QAction::NoRole);
+    connect(chooseRadio, &QAction::triggered, this, [this] {
+        toggleConnectionDialog();
+    });
+
+    auto* disconnectRadio = fileMenu->addAction("Disconnect");
+    disconnectRadio->setMenuRole(QAction::NoRole);
+    connect(disconnectRadio, &QAction::triggered,
+            this, &MainWindow::disconnectFromRadioByUser);
+
+    connect(fileMenu, &QMenu::aboutToShow, this,
+            [this, disconnectRadio] {
+        disconnectRadio->setEnabled(m_radioModel.isConnected());
+    });
+
+    auto* waveformsAct = new QAction("Waveforms...", this);
     m_waveformsAction = waveformsAct;   // hidden by applyCapabilitiesToUi()
                                        // on a radio with no installable waveforms
     waveformsAct->setMenuRole(QAction::NoRole);
@@ -108,34 +326,45 @@ void MainWindow::buildMenuBar()
 
     // ── Settings menu ──────────────────────────────────────────────────────
     auto* settingsMenu = menuBar()->addMenu("&Settings");
+    // QMenu shows per-action tooltips only when the menu opts in, and a
+    // submenu's menuAction() renders on the PARENT, so opt in here too. Needed
+    // for the "Not supported by this radio" reasons on greyed entries (#5546).
+    // Entries without an explicit tooltip stay silent, so this costs nothing.
+    settingsMenu->setToolTipsVisible(true);
 
     auto* radioSetup = settingsMenu->addAction("Radio Setup...");
     radioSetup->setMenuRole(QAction::PreferencesRole);  // macOS: appears in app menu as Preferences (#883, #1013)
     connect(radioSetup, &QAction::triggered, this, [this] {
-        // Snapshot compression setting before dialog opens — used by the
-        // finished handler to detect a change and recreate the RX audio stream.
-        const QString prevComp = m_radioModel.audioCompressionParam();
-        const bool wasFresh = !m_radioSetupDialog;
-        showOrRaisePersistent(m_radioSetupDialog,
-                              &m_radioModel, m_audio,
-                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
-                              m_kiwiSdrManager, &m_acomConn, &m_speConn, &m_vkampConn);
-        if (wasFresh && m_radioSetupDialog)
-            wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
-    });
-
-    auto* chooseRadio = settingsMenu->addAction("Connect to Radio...");
-    chooseRadio->setMenuRole(QAction::NoRole);      // prevent macOS auto-reparenting (#883)
-    connect(chooseRadio, &QAction::triggered, this, [this] {
-        toggleConnectionDialog();
+        openRadioSetupPage();
     });
 
     auto* flexControlAction = settingsMenu->addAction("AetherControl...");
+    m_aetherControlAction = flexControlAction;
+    flexControlAction->setVisible(true); // host controller, independent of radio capabilities
     flexControlAction->setMenuRole(QAction::NoRole);
     connect(flexControlAction, &QAction::triggered,
             this, &MainWindow::showFlexControlDialog);
 
-    auto* networkAction = settingsMenu->addAction("Network...");
+#ifdef HAVE_SERIALPORT
+    // Primary discoverability entry for #4940 — a Settings-menu shortcut
+    // straight to the FlexControl Tuning Knob group, for the user who
+    // browses Settings looking for it rather than opening AetherControl...
+    // first. Guarded the same as the Serial & Controllers page itself
+    // (RadioSetupDialog.cpp) and the AetherControl "Settings…" button
+    // (MainWindow_Controllers.cpp) that offers the same deep-link from
+    // inside the controller window.
+    auto* flexControlKnobAction = settingsMenu->addAction("FlexControl Knob & Buttons...");
+    m_flexControlKnobAction = flexControlKnobAction;
+    flexControlKnobAction->setVisible(true); // host serial device, never gated (#5778)
+    flexControlKnobAction->setMenuRole(QAction::NoRole);
+    connect(flexControlKnobAction, &QAction::triggered, this, [this] {
+        if (RadioSetupDialog* dlg = openRadioSetupPage())
+            dlg->revealFlexControlSettings();
+    });
+#endif
+
+    auto* networkAction = new QAction("Network Diagnostics...", this);
+    networkAction->setMenuRole(QAction::NoRole);
     connect(networkAction, &QAction::triggered, this, [this] {
         showNetworkDiagnosticsDialog();
     });
@@ -302,26 +531,13 @@ void MainWindow::buildMenuBar()
     connect(mqttAction, &QAction::triggered,
             this, &MainWindow::showMqttSettingsDialog);
 #endif
-    auto* memoryAction = settingsMenu->addAction("Memory...");
+    auto* memoryAction = new QAction("Memory...", this);
     connect(memoryAction, &QAction::triggered, this, [this] {
         showMemoryDialog();
     });
-    auto* netSchedulerAction = settingsMenu->addAction("Net Scheduler...");
+    auto* netSchedulerAction = new QAction("Net Scheduler...", this);
     connect(netSchedulerAction, &QAction::triggered, this, [this] {
         showNetSchedulerDialog();
-    });
-    auto* usbCablesAction = settingsMenu->addAction("USB Cables...");
-    connect(usbCablesAction, &QAction::triggered, this, [this] {
-        const QString prevComp = m_radioModel.audioCompressionParam();
-        const bool wasFresh = !m_radioSetupDialog;
-        showOrRaisePersistent(m_radioSetupDialog,
-                              &m_radioModel, m_audio,
-                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
-                              m_kiwiSdrManager, &m_acomConn, &m_speConn, &m_vkampConn);
-        if (wasFresh && m_radioSetupDialog)
-            wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
-        if (m_radioSetupDialog)
-            m_radioSetupDialog->selectTab(QStringLiteral("USB Cables"));
     });
 #ifdef HAVE_MIDI
     auto* midiAction = settingsMenu->addAction("MIDI Mapping...");
@@ -363,6 +579,34 @@ void MainWindow::buildMenuBar()
         showOrRaisePersistent(m_ulanziMapperDialog, m_dialBackend,
                               &m_shortcutManager, midi);
     });
+    settingsMenu->addSeparator();
+    auto* usbCablesAction = settingsMenu->addAction("USB Cables...");
+    connect(usbCablesAction, &QAction::triggered, this, [this] {
+        openRadioSetupPage(QStringLiteral("USB Cables"));
+    });
+    settingsMenu->addSeparator();
+
+    m_keyboardShortcutsEnabled = AppSettings::instance()
+        .value("KeyboardShortcutsEnabled", "False").toString() == "True";
+    auto* kbAct = settingsMenu->addAction("Keyboard Shortcuts");
+    kbAct->setCheckable(true);
+    kbAct->setChecked(m_keyboardShortcutsEnabled);
+    connect(kbAct, &QAction::toggled, this, [this](bool on) {
+        m_keyboardShortcutsEnabled = on;
+        s_keyboardShortcutsEnabled = on;
+        syncOperatingShortcutsEnabled();
+        AppSettings::instance().setValue("KeyboardShortcutsEnabled", on ? "True" : "False");
+        AppSettings::instance().save();
+    });
+    auto* configShortcutsAct = settingsMenu->addAction("Configure Shortcuts...");
+    configShortcutsAct->setMenuRole(QAction::NoRole);
+    connect(configShortcutsAct, &QAction::triggered, this, [this] {
+        ShortcutDialog dlg(&m_shortcutManager, this);
+        dlg.exec();
+        m_shortcutManager.rebuildShortcuts(this, shortcutGuard);
+    });
+    settingsMenu->addSeparator();
+
     auto* spotsAction = settingsMenu->addAction("SpotHub...");
     connect(spotsAction, &QAction::triggered, this, [this] {
         const bool wasFresh = !m_spotHubDialog;
@@ -543,7 +787,7 @@ void MainWindow::buildMenuBar()
     });
     auto* multiFlexAction = settingsMenu->addAction("multiFLEX...");
     m_multiFlexAction = multiFlexAction;   // hidden by applyCapabilitiesToUi()
-                                           // on a single-client backend
+                                           // on every non-Flex family
     connect(multiFlexAction, &QAction::triggered,
             this, &MainWindow::showMultiFlexDialog);
     // m_titleBar connect deferred — see after TitleBar creation (~line 2530)
@@ -561,6 +805,10 @@ void MainWindow::buildMenuBar()
     // Inhibit during TUNE submenu — user selects which TX outputs to suppress.
     // Uses QWidgetAction with QCheckBox so the menu stays open for multi-select.
     auto* tuneInhibitMenu = settingsMenu->addMenu("Inhibit during TUNE");
+    // Kept as a member so applyCapabilitiesToUi can dim it (with TX Band
+    // Settings) on backends with no Flex command plane — doctrine (#5263):
+    // dim, never hide.
+    m_tuneInhibitMenu = tuneInhibitMenu;
 
     auto& settings = AppSettings::instance();
     struct InhibitDef { const char* label; const char* key; };
@@ -653,10 +901,10 @@ void MainWindow::buildMenuBar()
         });
     }
 
-    auto* dspAction = settingsMenu->addAction("AetherDSP Settings...");
+    auto* dspAction = settingsMenu->addAction("AetherRX...");
     dspAction->setMenuRole(QAction::NoRole);        // prevent macOS auto-reparenting (#883)
     connect(dspAction, &QAction::triggered, this, [this] {
-        ensureAetherDspDialog();
+        ensureAetherRxDialog();
     });
 
     auto* settingsBrowserAction = settingsMenu->addAction("Settings Browser...");
@@ -753,30 +1001,6 @@ void MainWindow::buildMenuBar()
     // RADE was the only consumer that ever actually wanted that route.
     // See AudioEngine::setRadeMode().
 
-    // Connect placeholder items to show "not implemented" message
-    for (auto* action : settingsMenu->actions()) {
-        if (!action->isSeparator() && action != radioSetup && action != chooseRadio
-            && action != networkAction && action != memoryAction && action != spotsAction
-            && action != usbCablesAction
-#ifdef HAVE_SERIALPORT
-            && action != flexControlAction
-#endif
-#ifdef HAVE_MIDI
-            && action != midiAction
-#endif
-            && action != multiFlexAction
-            && action != autoCatAction
-            && action != autoTciAction
-#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
-            && action != autoDaxAction
-#endif
-            ) {
-            connect(action, &QAction::triggered, this, [this, action] {
-                statusBar()->showMessage(action->text().remove("...") + " — not yet implemented", 3000);
-            });
-        }
-    }
-
     // ── Profiles menu ──────────────────────────────────────────────────────
     m_profilesMenu = menuBar()->addMenu("&Profiles");
     auto* profileMgrAct = m_profilesMenu->addAction("Profile Manager...");
@@ -817,18 +1041,19 @@ void MainWindow::buildMenuBar()
         }
     });
 
-    auto* viewMenu = menuBar()->addMenu("&View");
+    // Tools contains the operator's frequently used actions, so keep it ahead
+    // of the less frequently changed display options in View.
+    auto* toolsMenu = menuBar()->addMenu("&Tools");
+    toolsMenu->setToolTipsVisible(true);
 
-    // Workspace canvas (RFC #4887 phase 3) — opt-in, reversible.  The check
-    // state persists inside the workspace document itself (Principle V), not
-    // in a settings key: wireWorkspaceCanvas() re-applies it at startup and
-    // enabledChanged keeps the action honest if enabling fails.
-    //
-    // Two postures since the edit-mode field request: Enabled turns the
-    // canvas shell on, Edit Layout arms placement (select/drag/resize/
-    // drops/nudges/dots).  Enabled-but-locked is the OPERATING posture —
-    // interacting with an applet just uses it.  Edit state is session-
-    // transient by design; wireWorkspaceCanvas() syncs both directions.
+    auto* viewMenu = menuBar()->addMenu("&View");
+    viewMenu->setToolTipsVisible(true);  // see settingsMenu above (#5546)
+
+    // Workspace canvas (RFC #4887). The Enabled state persists in the workspace
+    // document, not a settings key; wireWorkspaceCanvas() re-applies it at
+    // startup and enabledChanged corrects the action if enabling fails. Edit
+    // Layout arms placement and is session-transient; enabled-but-locked is the
+    // operating posture.
     QMenu* wsMenu = viewMenu->addMenu("Workspace &Canvas");
     m_workspaceCanvasAction = wsMenu->addAction("&Enabled");
     m_workspaceCanvasAction->setCheckable(true);
@@ -863,7 +1088,11 @@ void MainWindow::buildMenuBar()
         if (m_workspaceController && m_workspaceController->isEnabled()) {
             return;
         }
-        toggleAppletPanelFloating(m_appletPanelFloatWindow == nullptr);
+        // Same routing as the title-bar pop-out icon so the keystroke and the
+        // click cannot drift into different states.
+        bool floating = false, dockedLeft = false, visible = false;
+        appletPanelState(&floating, &dockedLeft, &visible);
+        applyAppletPanelState(!floating, dockedLeft, true);
     });
 
     // Restore floating state at startup if the user had it floating last
@@ -970,6 +1199,62 @@ void MainWindow::buildMenuBar()
         showOrRaisePersistent(m_themeEditorDialog);
     });
 
+    // Global defaults for new slices. Existing VFO flag controls remain
+    // per-slice overrides; choosing here also applies to every live slice.
+    auto* markerWidthMenu = viewMenu->addMenu("VFO Marker Size");
+    auto* markerWidthGroup = new QActionGroup(markerWidthMenu);
+    markerWidthGroup->setExclusive(true);
+    // Re-read on every open rather than only at build time: Settings ▸ Reset
+    // Settings… (same menu bar) clears the stored defaults underneath these,
+    // and an exclusive group showing a stale tick offers no way to resync —
+    // re-picking the already-checked entry is a no-op to the operator.
+    connect(markerWidthMenu, &QMenu::aboutToShow, this, [markerWidthGroup] {
+        const int width = VfoWidget::defaultMarkerWidth();
+        for (auto* action : markerWidthGroup->actions())
+            action->setChecked(action->data().toInt() == width);
+    });
+    for (const auto& option : {
+             std::pair<const char*, int>{"Off", 0},
+             {"1 px", 1},
+             {"3 px", 3}}) {
+        auto* action = markerWidthMenu->addAction(option.first);
+        action->setCheckable(true);
+        action->setData(option.second);
+        action->setChecked(option.second == VfoWidget::defaultMarkerWidth());
+        markerWidthGroup->addAction(action);
+        connect(action, &QAction::triggered, this, [this, width = option.second] {
+            VfoWidget::setDefaultMarkerWidth(width);
+            for (auto* vfo : findChildren<VfoWidget*>()) {
+                vfo->setMarkerWidth(width, /*persist=*/false);
+            }
+        });
+    }
+
+    auto* filterEdgesMenu = viewMenu->addMenu("VFO Filter Edge");
+    auto* filterEdgesGroup = new QActionGroup(filterEdgesMenu);
+    filterEdgesGroup->setExclusive(true);
+    const bool filterEdgesHidden = VfoWidget::defaultFilterEdgesHidden();
+    connect(filterEdgesMenu, &QMenu::aboutToShow, this, [filterEdgesGroup] {
+        const bool hidden = VfoWidget::defaultFilterEdgesHidden();
+        for (auto* action : filterEdgesGroup->actions())
+            action->setChecked(action->data().toBool() == hidden);
+    });
+    for (const auto& option : {
+             std::pair<const char*, bool>{"Show", false},
+             {"Hide", true}}) {
+        auto* action = filterEdgesMenu->addAction(option.first);
+        action->setCheckable(true);
+        action->setData(option.second);
+        action->setChecked(option.second == filterEdgesHidden);
+        filterEdgesGroup->addAction(action);
+        connect(action, &QAction::triggered, this, [this, hide = option.second] {
+            VfoWidget::setDefaultFilterEdgesHidden(hide);
+            for (auto* vfo : findChildren<VfoWidget*>()) {
+                vfo->setFilterEdgesHidden(hide, /*persist=*/false);
+            }
+        });
+    }
+
     auto* singleClickTuneAct = viewMenu->addAction("Single-Click to Tune");
     singleClickTuneAct->setCheckable(true);
     singleClickTuneAct->setChecked(
@@ -1041,14 +1326,12 @@ void MainWindow::buildMenuBar()
             this, [this] { showCallsignLookupDialog(); });
 
 #ifdef HAVE_WEBSOCKETS
-    {
-        auto* fdvReporterAct = viewMenu->addAction(tr("FreeDV Reporter..."));
-        connect(fdvReporterAct, &QAction::triggered, this, &MainWindow::showFreeDvReporter);
-    }
+    auto* fdvReporterAct = viewMenu->addAction(tr("FreeDV Reporter..."));
+    connect(fdvReporterAct, &QAction::triggered, this, &MainWindow::showFreeDvReporter);
 #endif
 
     viewMenu->addSeparator();
-    m_minimalModeAction = viewMenu->addAction("Minimal Mode\tCtrl+M");
+    m_minimalModeAction = viewMenu->addAction("Minimal Mode\tCtrl+Shift+M");
     m_minimalModeAction->setCheckable(true);
     m_minimalModeAction->setChecked(
         AppSettings::instance().value("MinimalModeEnabled", "False").toString() == "True");
@@ -1095,8 +1378,8 @@ void MainWindow::buildMenuBar()
     connect(packetDecoderAction, &QAction::triggered,
             this, &MainWindow::showAx25HfPacketDecodeDialog);
 
-    // Copy Assist has no View-menu entry: it's shown/hidden by the status-bar
-    // "ASR" toggle (and the keyboard shortcut) via showCopyAssist().
+    // Copy Assist's menu entry lives on Tools; the status-bar "ASR" toggle and
+    // the keyboard shortcut drive the same showCopyAssist() path.
 
     auto* smartSpotAct = viewMenu->addAction("Smart Spot Filtering");
     smartSpotAct->setCheckable(true);
@@ -1134,26 +1417,6 @@ void MainWindow::buildMenuBar()
         }
     });
 
-    m_keyboardShortcutsEnabled = AppSettings::instance()
-        .value("KeyboardShortcutsEnabled", "False").toString() == "True";
-    auto* kbAct = viewMenu->addAction("Keyboard Shortcuts");
-    kbAct->setCheckable(true);
-    kbAct->setChecked(m_keyboardShortcutsEnabled);
-    connect(kbAct, &QAction::toggled, this, [this](bool on) {
-        m_keyboardShortcutsEnabled = on;
-        s_keyboardShortcutsEnabled = on;
-        AppSettings::instance().setValue("KeyboardShortcutsEnabled", on ? "True" : "False");
-        AppSettings::instance().save();
-    });
-    auto* configShortcutsAct = viewMenu->addAction("Configure Shortcuts...");
-    configShortcutsAct->setMenuRole(QAction::NoRole); // prevent macOS auto-reparenting (#883)
-    connect(configShortcutsAct, &QAction::triggered, this, [this] {
-        ShortcutDialog dlg(&m_shortcutManager, this);
-        dlg.exec();
-        // Rebuild shortcuts in case bindings changed
-        m_shortcutManager.rebuildShortcuts(this, shortcutGuard);
-    });
-
     viewMenu->addSeparator();
     auto* heartbeatBlinkAct = viewMenu->addAction("Blink Status Indicator");
     heartbeatBlinkAct->setCheckable(true);
@@ -1167,6 +1430,198 @@ void MainWindow::buildMenuBar()
         connect(m_titleBar, &TitleBar::blinkEnabledChanged,
                 heartbeatBlinkAct, &QAction::setChecked);
     }
+
+    // Destructive client-store reset: a Settings action, not a Help one (#5570).
+    // NoRole is required — macOS would otherwise read "Settings" as a
+    // Preferences action and reparent it into the application menu (#883).
+    auto* resetSettingsAction = settingsMenu->addAction("Reset Settings...", this, [this] {
+        SupportDialog::resetSettings(this);
+    });
+    resetSettingsAction->setMenuRole(QAction::NoRole);
+
+    // ── Tools menu ─────────────────────────────────────────────────────────
+    // Operational windows and verbs live here. Reusing the existing QActions
+    // preserves their shortcuts and signal paths while changing only IA.
+    // Ellipsis: this opens PanLayoutDialog rather than creating immediately,
+    // because layout ids are not 1:1 with pan counts (two pans is "2v" or "2h")
+    // and the arrangement is the operator's to pick. Shares one handler with the
+    // status-bar +PAN affordance so PanadapterLayout is written and applied on
+    // both routes instead of only one.
+    auto* addPanAction = toolsMenu->addAction("Add Panadapter...");
+    m_addPanAction = addPanAction;
+    addPanAction->setEnabled(false);
+    connect(addPanAction, &QAction::triggered,
+            this, &MainWindow::showAddPanadapterDialog);
+
+    // The three checkable panel toggles re-read their own state after the
+    // handler runs: triggered() fires *after* Qt has flipped the check mark, and
+    // every one of these handlers can legitimately decline (no active pan, keyer
+    // indicator disabled), which would otherwise leave the menu asserting a
+    // panel is open when it is not.
+    auto* aetherialAction = toolsMenu->addAction("AetherTX...");
+    m_aetherialAction = aetherialAction;
+    aetherialAction->setCheckable(true);
+    connect(aetherialAction, &QAction::triggered, this, [this] {
+        toggleAetherialStrip();
+        updateToolsMenuState();
+    });
+
+    auto* cwKeyerAction = toolsMenu->addAction("CW Keyer");
+    m_cwKeyerAction = cwKeyerAction;
+    cwKeyerAction->setCheckable(true);
+    cwKeyerAction->setEnabled(false);
+    connect(cwKeyerAction, &QAction::triggered, this, [this] {
+        toggleCwKeyerPanel();
+        updateToolsMenuState();
+    });
+
+#ifdef AETHER_ASR_ENABLED
+    auto* copyAssistAction = toolsMenu->addAction("Copy Assist");
+    m_copyAssistAction = copyAssistAction;
+    copyAssistAction->setCheckable(true);
+    copyAssistAction->setEnabled(false);
+    connect(copyAssistAction, &QAction::triggered, this, [this] {
+        showCopyAssist();
+        updateToolsMenuState();
+    });
+#endif
+
+    viewMenu->removeAction(packetDecoderAction);
+    toolsMenu->addAction(packetDecoderAction);
+    auto* kiwiAction = toolsMenu->addAction("Configure KiwiSDR...");
+    kiwiAction->setMenuRole(QAction::NoRole);
+    connect(kiwiAction, &QAction::triggered, this, [this] {
+        openRadioSetupPage(QStringLiteral("Antennas"));
+    });
+
+    toolsMenu->addSeparator();
+    auto* swrScanAction = toolsMenu->addAction("Start SWR Scan...");
+    m_swrScanAction = swrScanAction;
+    swrScanAction->setEnabled(false);
+    swrScanAction->setProperty(kTxKeyingProperty, true);
+    connect(swrScanAction, &QAction::triggered, this, [this] {
+        startSwrSweep(-1, 1, 0.0, 0.0, /*forceLicenseConfirm=*/true);
+    });
+    auto* preTuneAction = toolsMenu->addAction("Pre-tune ATU Bands...");
+    m_preTuneAction = preTuneAction;
+    preTuneAction->setEnabled(false);
+    preTuneAction->setProperty(kTxKeyingProperty, true);
+    connect(preTuneAction, &QAction::triggered, this, [this] {
+        if (m_appletPanel && m_appletPanel->txApplet()) {
+            m_appletPanel->txApplet()->openPreTuneDialog();
+        }
+    });
+    auto* clearAtuAction = toolsMenu->addAction("Clear ATU Memories...");
+    m_clearAtuAction = clearAtuAction;
+    clearAtuAction->setEnabled(false);
+    connect(clearAtuAction, &QAction::triggered, this, [this] {
+        if (m_appletPanel && m_appletPanel->txApplet()) {
+            m_appletPanel->txApplet()->confirmAndClearAtuMemories();
+        }
+    });
+    // Discoverability mitigation for AGC-T calibration's right-click-only
+    // entry point (docs/agc-t-calibration-design.md §0 flags this exact
+    // tension and prescribes a mitigation — this is the Tools-menu half of
+    // it, additive to the slider's right-click menu, not a replacement).
+    // Requested by Larry, KE2ET. Targets the active slice, same as the
+    // right-click path (RxApplet.cpp) — "the currently selected panadapter."
+    // No kTxKeyingProperty: calibration listens to the noise floor, it does
+    // not key the transmitter like the two sweeps above it.
+    auto* agcTCalibrationAction = toolsMenu->addAction(
+        "Calibrate AGC-T...", this, [this] {
+        if (auto* s = activeSlice()) {
+            showAgcCalibrationDialog(s->sliceId());
+        }
+    });
+    m_agcTCalibrationMenuAction = agcTCalibrationAction;
+
+    toolsMenu->addSeparator();
+    viewMenu->removeAction(callsignLookupAct);
+    viewMenu->removeAction(pskMapAction);
+    toolsMenu->addAction(callsignLookupAct);
+    toolsMenu->addAction(pskMapAction);
+#ifdef HAVE_WEBSOCKETS
+    viewMenu->removeAction(fdvReporterAct);
+    toolsMenu->addAction(fdvReporterAct);
+#endif
+
+    toolsMenu->addSeparator();
+    toolsMenu->addAction(netSchedulerAction);
+    toolsMenu->addAction(memoryAction);
+    toolsMenu->addAction(waveformsAct);
+
+    // Wideband converter view (docs/HERMES.md §13 item 18), in Tools with the
+    // other instrument windows. Gated on RadioCapabilities::widebandConverterView,
+    // disabled (not hidden, and not permissive while disconnected: no radio, no
+    // converter). QAction has no accessibleDescription, so the reason goes in
+    // the status tip, cleared again when the entry is live.
+    auto* bandscopeAct = toolsMenu->addAction("Wideband Bandscope...");
+    bandscopeAct->setMenuRole(QAction::NoRole);
+    bandscopeAct->setToolTip(
+        "The radio's converter, before tuning and filtering");
+    bandscopeAct->setEnabled(false);
+    bandscopeAct->setStatusTip(
+        "Unavailable: no radio is connected that provides a wideband "
+        "converter view.");
+    connect(&m_radioModel, &RadioModel::capabilitiesChanged, bandscopeAct,
+            [bandscopeAct](bool connected, const RadioCapabilities& caps) {
+        const bool on = connected && caps.widebandConverterView.has_value();
+        bandscopeAct->setEnabled(on);
+        bandscopeAct->setStatusTip(on
+            ? QString()
+            : (connected
+                   ? QStringLiteral("Unavailable: this radio does not provide "
+                                    "a wideband converter view.")
+                   : QStringLiteral("Unavailable: no radio is connected.")));
+    });
+    connect(bandscopeAct, &QAction::triggered, this, [this] {
+        showOrRaisePersistent(m_bandscopeDialog, &m_radioModel);
+    });
+
+    toolsMenu->addSeparator();
+    toolsMenu->addAction("Radio Health...", this, [this] {
+        auto* dlg = new RadioHealthDialog(&m_radioModel, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
+    auto* gpsDashboardAction = toolsMenu->addAction("GPS Dashboard...", this, [this] {
+        showGpsLocationDialog();
+    });
+    toolsMenu->addAction(networkAction);
+    toolsMenu->addAction("Runtime Monitor...", this, [this] {
+        showSystemInfoDialog();
+    });
+
+    m_gpsDashboardAction = gpsDashboardAction;
+
+    // Both passes call the same function: aboutToShow for the human, and
+    // applyCapabilitiesToUi() for everything that never pops the menu — most of
+    // all the automation bridge, which resolves menu-bar actions in a CLOSED
+    // menu bar and honours only isEnabled().
+    connect(toolsMenu, &QMenu::aboutToShow, this,
+            [this] { updateToolsMenuState(); });
+    updateToolsMenuState();
+
+    auto* windowMenu = menuBar()->addMenu("&Window");
+    const auto refreshWindowMenu = [this, windowMenu] {
+        const auto shortcutText = [this](const QString& id) {
+            const ShortcutManager::Action* action = m_shortcutManager.action(id);
+            return action
+                ? action->currentKey.toString(QKeySequence::NativeText)
+                : QString();
+        };
+        populateWindowMenu(windowMenu, this,
+                           shortcutText(QStringLiteral("window_minimize")),
+                           shortcutText(QStringLiteral("window_fullscreen")));
+    };
+    connect(windowMenu, &QMenu::aboutToShow, this, refreshWindowMenu);
+    // Seed actions for bridge/menu discovery before first open. ShortcutManager
+    // becomes the sole keyboard owner later in MainWindow construction; the
+    // dynamic list and displayed bindings refresh on every aboutToShow edge.
+    refreshWindowMenu();
 
     auto* helpMenu = menuBar()->addMenu("&Help");
 
@@ -1271,17 +1726,6 @@ void MainWindow::buildMenuBar()
         dlg->show();
         dlg->raise();
     });
-    // Before Slice Troubleshooting: this one is about the RADIO's own health
-    // registers, which is the first thing to check when the slice-level
-    // symptoms in that dialog turn out to have a hardware cause.
-    helpMenu->addAction("Radio Health...", this, [this]() {
-        auto* dlg = new RadioHealthDialog(&m_radioModel, this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        trackPersistentDialog(dlg);
-        dlg->show();
-        dlg->raise();
-        dlg->activateWindow();
-    });
     helpMenu->addAction("Slice Troubleshooting...", this, [this]() {
         auto* dlg = new SliceTroubleshootingDialog(
             &m_radioModel, m_audio, this,
@@ -1301,187 +1745,193 @@ void MainWindow::buildMenuBar()
         dlg->raise();
         dlg->activateWindow();
     });
-    // "Reset Settings" was previously buried inside the Support dialog too.
-    // NoRole is required: macOS would otherwise treat the word "Settings" as a
-    // Preferences action and reparent it into the application menu.
-    auto* resetSettingsAction = helpMenu->addAction("Reset Settings...", this, [this]() {
-        SupportDialog::resetSettings(this);
-    });
-    resetSettingsAction->setMenuRole(QAction::NoRole);
     helpMenu->addAction("Check for Updates...", this, [this]() {
         m_updateChecker->checkNow();
     });
     helpMenu->addSeparator();
     helpMenu->addAction("About AetherSDR", this, [this]{
-        auto* dlg = new PersistentDialog(QStringLiteral("About AetherSDR"),
-                                         QStringLiteral("AboutDialogGeometry"), this);
+        // Styled to the AetherSDR style guide: an ambient ground, the gradient
+        // wordmark, nested build details, and colour only from color.canon.*
+        // and color.brand.* tokens.
+        // One About at a time: a second click brings the open one forward.
+        if (m_aboutWindow) {
+            m_aboutWindow->raise();
+            m_aboutWindow->activateWindow();
+            return;
+        }
+        auto& tm = AetherSDR::ThemeManager::instance();
+        // A CanonWindow: no title bar, rounded corners, the ambient ground,
+        // a corner close button; Escape and OK close it too.
+        auto* dlg = new CanonWindow(QStringLiteral("About AetherSDR"), this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setFixedWidth(380);
-        AetherSDR::ThemeManager::instance().applyStyleSheet(dlg, "QDialog { background: {{color.background.0}}; }");
+        m_aboutWindow = dlg;
+        dlg->setFixedWidth(400);
 
         auto* vbox = new QVBoxLayout(dlg->bodyWidget());
-        vbox->setSpacing(8);
-        vbox->setContentsMargins(16, 16, 16, 16);
-        dlg->setBodyLayoutMargins(QMargins(16, 16, 16, 16),
-                                  QMargins(16, 14, 16, 16));
-        trackPersistentDialog(dlg);
+        vbox->setSpacing(10);
+        vbox->setContentsMargins(24, 26, 24, 22);
 
-        // Icon
-        auto* iconLbl = new QLabel;
-        iconLbl->setPixmap(QPixmap(":/icon.png").scaled(96, 96, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-        iconLbl->setAlignment(Qt::AlignCenter);
-        vbox->addWidget(iconLbl);
+        // The mark is dark on a dark ground: a contrast ring and the guide's
+        // spark set it apart. SparkRing scales it for the screen's DPR.
+        auto* logo = new SparkRing(QPixmap(QStringLiteral(":/icon.png")), 88);
+        logo->setAccessibleName(QStringLiteral("AetherSDR logo"));
+        vbox->addWidget(logo, 0, Qt::AlignHCenter);
+        auto* wordmark = new AboutWordmark;
+        tm.applyStyleSheet(wordmark, "background: transparent;");
+        vbox->addWidget(wordmark);
 
-        // Header
-        // The git SHA captured at CMake configure time identifies the build —
-        // useful when bug-reporting against a dev/test build that doesn't
-        // correspond to a tagged release.  See CMakeLists.txt for the capture
-        // and the file-top #define for the non-CMake-build fallback.
+        // The git SHA identifies the build — useful when bug-reporting against
+        // a dev/test build that doesn't correspond to a tagged release. It is
+        // captured at build time; see cmake/AetherBuildIdentity.cmake.
+        auto* version = new QLabel(QStringLiteral("v%1  <span style='font-family:monospace; font-size:11px;'>%2</span>")
+                                       .arg(QCoreApplication::applicationVersion(),
+                                            QStringLiteral(AETHER_BUILD_SHA)));
+        version->setAlignment(Qt::AlignCenter);
+        version->setToolTip(QStringLiteral("Version and the commit this binary was built from."));
+        tm.applyStyleSheet(version, "QLabel { color: {{color.canon.muted}}; font-size: 13px; background: transparent; }");
+        vbox->addWidget(version);
+
+        auto* blurb = new QLabel(QStringLiteral("Cross-platform SmartSDR-compatible client\nfor FlexRadio transceivers."));
+        blurb->setAlignment(Qt::AlignCenter);
+        blurb->setWordWrap(true);
+        tm.applyStyleSheet(blurb, "QLabel { color: {{color.canon.inkSoft}}; font-size: 13px; padding: 2px 0 4px 0; background: transparent; }");
+        vbox->addWidget(blurb);
+
+        // Build details: a nested card of label / value rows.
         const QString rendererDescription = [this]() {
             if (SpectrumWidget* sw = spectrum()) {
                 return sw->rendererDescription();
             }
             return QStringLiteral("No active pan");
         }();
-        auto* header = new QLabel(QString(
-            "<div style='text-align:center;'>"
-            "<h2 style='margin-bottom:2px; color:#c8d8e8;'>AetherSDR</h2>"
-            "<p style='margin-top:0; color:#8aa8c0;'>v%1<br>"
-            "<span style='font-size:10px; color:#6a8090;'>(%4)</span></p>"
-            "<p style='margin-top:8px; color:#c8d8e8;'>Cross-platform SmartSDR-compatible client<br>"
-            "for FlexRadio transceivers.</p>"
-            "<p style='font-size:11px; color:#6a8090;'>"
-            "Built with Qt %2 &middot; C++20<br>"
-            "Compiled: %3<br>"
-            "Renderer: %5</p>"
-            "</div>")
-            .arg(QCoreApplication::applicationVersion(), qVersion(),
-                 QStringLiteral(__DATE__),
-                 QStringLiteral(AETHER_GIT_SHA),
-                 rendererDescription.toHtmlEscaped()));
-        header->setAlignment(Qt::AlignCenter);
-        header->setWordWrap(true);
-        // Tooltip explains the staleness possibility — the SHA is baked at
-        // CMake configure time, so a dev who runs `cmake --build` after a
-        // new commit without re-configuring sees the previous SHA here.
-        // Re-running `cmake --fresh` (or deleting CMakeCache.txt) captures
-        // the current HEAD. The renderer line comes from the active pan at
-        // dialog-open time, after Qt has picked a real QRhi backend when the
-        // GPU path is active.
-        header->setToolTip(
-            QStringLiteral("Build identity and active pan renderer. SHA is captured at CMake "
-                           "configure time — re-run `cmake -B build` after "
-                           "a new commit if you need the current value."));
-        vbox->addWidget(header);
+        auto* build = new QFrame;
+        build->setObjectName(QStringLiteral("aboutBuild"));
+        tm.applyStyleSheet(build,
+            "QFrame#aboutBuild { background: {{color.canon.nested}}; border: 1px solid {{color.canon.line}}; border-radius: 12px; }"
+            "QLabel { background: transparent; border: none; font-size: 12px; color: {{color.canon.inkSoft}}; }"
+            "QLabel[role=\"key\"] { color: {{color.canon.muted}}; font-size: 10px; font-weight: bold; }");
+        auto* grid = new QGridLayout(build);
+        grid->setContentsMargins(14, 10, 14, 10);
+        grid->setHorizontalSpacing(12);
+        grid->setVerticalSpacing(5);
+        const QList<QPair<QString, QString>> rows = {
+            {QStringLiteral("BUILT WITH"), QStringLiteral("Qt %1 · C++20").arg(QString::fromLatin1(qVersion()))},
+            {QStringLiteral("COMPILED"), QStringLiteral(__DATE__)},
+            {QStringLiteral("RENDERER"), rendererDescription},
+        };
+        // The body's content width: the window less its hairline inset and
+        // the body margins.
+        const QMargins vm = vbox->contentsMargins();
+        const int contentWidth = dlg->width() - 2 * CanonWindow::kInset - vm.left() - vm.right();
+        QList<QLabel*> values;
+        int keyWidth = 0;
+        for (int i = 0; i < rows.size(); ++i) {
+            auto* k = new QLabel(rows[i].first);
+            k->setProperty("role", QStringLiteral("key"));
+            auto* v = new QLabel(rows[i].second);
+            // Driver and device names are not markup.
+            v->setTextFormat(Qt::PlainText);
+            v->setWordWrap(true);
+            v->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+            v->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            grid->addWidget(k, i, 0, Qt::AlignTop | Qt::AlignRight);
+            grid->addWidget(v, i, 1, Qt::AlignTop);
+            // Measure in the card's stylesheet fonts, not the defaults.
+            k->ensurePolished();
+            keyWidth = std::max(keyWidth, k->sizeHint().width());
+            values.append(v);
+        }
+        grid->setColumnStretch(1, 1);
+        // Wrapped labels under-report their height in a fixed-width window;
+        // reserve it for the value column's width: the content width less the
+        // card's padding and border, the spacing and the measured key column.
+        const QMargins gm = grid->contentsMargins();
+        const int valueWidth = contentWidth - gm.left() - gm.right() - 2 * build->frameWidth()
+                               - grid->horizontalSpacing() - keyWidth;
+        for (QLabel* v : values) {
+            v->ensurePolished();
+            v->setMinimumHeight(v->heightForWidth(valueWidth));
+        }
+        // The renderer line comes from the active pan at dialog-open time,
+        // after Qt has picked a real QRhi backend when the GPU path is active.
+        build->setToolTip(QStringLiteral("Build identity and active pan renderer. The SHA is captured "
+                                         "when the binary is built."));
+        vbox->addWidget(build);
 
-        // Separator
-        auto* sep1 = new QFrame;
-        sep1->setFrameShape(QFrame::HLine);
-        AetherSDR::ThemeManager::instance().applyStyleSheet(sep1, "color: {{color.background.2}};");
-        vbox->addWidget(sep1);
-
-        // Contributors label
-        auto* contribTitle = new QLabel("<b style='color:#c8d8e8;'>Contributors</b>");
-        contribTitle->setAlignment(Qt::AlignCenter);
-        vbox->addWidget(contribTitle);
-
-        // Scrollable contributors list
-        auto* contribLabel = new QLabel("Jeremy (KK7GWY)<br>Claude &middot; Anthropic<br>rfoust<br>Ian (M7HNF)<br>VE3NEM<br>jensenpat<br>chibondking<br>Dependabot");
-        contribLabel->setAlignment(Qt::AlignCenter);
-        AetherSDR::ThemeManager::instance().applyStyleSheet(contribLabel, "QLabel { color: {{color.text.primary}}; font-size: 11px; }");
-        contribLabel->setWordWrap(true);
-
-        auto* scroll = new QScrollArea;
-        scroll->setWidget(contribLabel);
-        scroll->setWidgetResizable(true);
-        scroll->setFixedHeight(80);
-        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        AetherSDR::ThemeManager::instance().applyStyleSheet(scroll, "QScrollArea { background: {{color.background.0}}; border: 1px solid {{color.background.1}}; border-radius: 4px; }"
-            "QScrollBar:vertical { background: {{color.background.0}}; width: 6px; }"
-            "QScrollBar::handle:vertical { background: {{color.background.2}}; border-radius: 3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }");
-        vbox->addWidget(scroll);
-
-        // Separator
-        auto* sep2 = new QFrame;
-        sep2->setFrameShape(QFrame::HLine);
-        AetherSDR::ThemeManager::instance().applyStyleSheet(sep2, "color: {{color.background.2}};");
-        vbox->addWidget(sep2);
-
-        auto* communityCreditsButton = new QPushButton(QStringLiteral("Play Community Credits..."));
-        communityCreditsButton->setAccessibleName(QStringLiteral("Play AetherSDR community credits"));
-        communityCreditsButton->setAccessibleDescription(
-            QStringLiteral("Opens an animated thank-you to contributors and Open Collective supporters with music."));
-        AetherSDR::ThemeManager::instance().applyStyleSheet(
-            communityCreditsButton,
-            "QPushButton { background: {{color.background.1}}; color: {{color.accent.bright}}; "
-            "border: 1px solid {{color.accent}}; border-radius: 4px; padding: 7px 18px; "
-            "font-weight: bold; }"
-            "QPushButton:hover { background: {{color.background.2}}; }");
-        vbox->addWidget(communityCreditsButton, 0, Qt::AlignCenter);
-        connect(communityCreditsButton, &QPushButton::clicked, this, [this] {
-            showOrRaisePersistent(m_contributeDialog);
+        // Contributors live in the Contributor Logbook (points, weekly
+        // awards, bios); the window links there instead of listing names.
+        auto* logbookButton = new QPushButton(QStringLiteral("Contributor Logbook  ↗"));
+        logbookButton->setAccessibleName(QStringLiteral("Open the AetherSDR Contributor Logbook"));
+        logbookButton->setAccessibleDescription(
+            QStringLiteral("Opens the all-time standings at contributors.aethersdr.com in your browser."));
+        logbookButton->setToolTip(QStringLiteral("contributors.aethersdr.com"));
+        logbookButton->setCursor(Qt::PointingHandCursor);
+        tm.applyStyleSheet(
+            logbookButton,
+            "QPushButton { background: {{color.canon.control}}; color: {{color.canon.cyan}}; "
+            "border: 1px solid {{color.canon.lineHi}}; border-radius: 4px; padding: 7px 18px; "
+            "font-weight: bold; font-size: 12px; }"
+            "QPushButton:hover { background: {{color.canon.nested}}; color: {{color.canon.aqua}}; }"
+            "QPushButton:focus { border-color: {{color.canon.sparkGold}}; }");
+        // The logbook is where contributors are recognised: the gold spark
+        // circles the button, as it circles the award cards there.
+        vbox->addSpacing(2);
+        vbox->addWidget(new SparkBorder(logbookButton, 4), 0, Qt::AlignCenter);
+        connect(logbookButton, &QPushButton::clicked, dlg, [] {
+            QDesktopServices::openUrl(QUrl(QStringLiteral("https://contributors.aethersdr.com/#all-time")));
         });
 
-        // Footer
-        auto* footer = new QLabel(
-            "<div style='text-align:center;'>"
-            "<p style='font-size:11px; color:#8aa8c0;'>"
-            "&copy; 2026 AetherSDR Contributors<br>"
-            "Licensed under "
-            "<a href='https://www.gnu.org/licenses/gpl-3.0.html' style='color:#00b4d8;'>GPLv3</a></p>"
-            "<p style='font-size:11px;'>"
-            "<a href='https://github.com/aethersdr/AetherSDR' style='color:#00b4d8;'>"
-            "github.com/aethersdr/AetherSDR</a></p>"
-            "<p style='font-size:10px; color:#6a8090;'>"
-            "SmartSDR protocol &copy; FlexRadio Systems</p>"
-            "<p style='font-size:10px; color:#6a8090;'>"
-            "D-STAR is a registered trademark of Icom Inc.<br>"
-            "AetherSDR is not affiliated with or endorsed by Icom Inc.</p>"
-            "<p style='font-size:10px; color:#6a8090;'>"
-            "HF propagation forecasts provided by "
-            "<a href='https://www.hamqsl.com/' style='color:#8aa8c0;'>hamqsl.com</a></p>"
-            "</div>");
+        auto* sep = new QFrame;
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFixedHeight(1);
+        tm.applyStyleSheet(sep, "QFrame { background: {{color.canon.line}}; border: none; }");
+        vbox->addSpacing(4);
+        vbox->addWidget(sep);
+
+        // Rich-text link colours are baked into the HTML, so the footer is
+        // rewritten when the theme changes while the window is open.
+        auto* footer = new QLabel;
+        auto setFooterText = [footer] {
+            auto& tm = AetherSDR::ThemeManager::instance();
+            footer->setText(QStringLiteral(
+                "<div style='text-align:center;'>"
+                "<p style='margin:0 0 6px 0;'>&copy; 2026 AetherSDR Contributors &middot; Licensed under "
+                "<a href='https://www.gnu.org/licenses/gpl-3.0.html' style='color:%1; text-decoration:none;'>GPLv3</a></p>"
+                "<p style='margin:0 0 8px 0;'><a href='https://github.com/aethersdr/AetherSDR' style='color:%1; text-decoration:none;'>"
+                "github.com/aethersdr/AetherSDR</a></p>"
+                "<p style='font-size:10px; margin:0;'>SmartSDR protocol &copy; FlexRadio Systems<br>"
+                "D-STAR is a registered trademark of Icom Inc.<br>"
+                "AetherSDR is not affiliated with or endorsed by Icom Inc.<br>"
+                "HF propagation forecasts provided by "
+                "<a href='https://www.hamqsl.com/' style='color:%1; text-decoration:none;'>hamqsl.com</a></p>"
+                "</div>").arg(tm.color(footer, QStringLiteral("color.canon.cyan")).name()));
+        };
+        setFooterText();
+        connect(&tm, &AetherSDR::ThemeManager::themeChanged, footer, setFooterText);
         footer->setAlignment(Qt::AlignCenter);
         footer->setOpenExternalLinks(true);
         footer->setWordWrap(true);
+        tm.applyStyleSheet(footer, "QLabel { color: {{color.canon.muted}}; font-size: 11px; background: transparent; }");
+        // A wrapped rich-text label under-reports its height in a fixed-width
+        // dialog; size it for the content width so the last line isn't clipped.
+        footer->ensurePolished();
+        footer->setMinimumHeight(footer->heightForWidth(contentWidth));
         vbox->addWidget(footer);
 
-        // OK button
-        auto* okBtn = new QPushButton("OK");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(okBtn, "QPushButton { background: {{color.accent}}; color: {{color.background.0}}; font-weight: bold; "
-            "border-radius: 4px; padding: 6px 24px; }"
-            "QPushButton:hover { background: {{color.accent.bright}}; }");
+        // OK: the primary action, in the brand gradient.
+        auto* okBtn = new QPushButton(QStringLiteral("OK"));
+        okBtn->setDefault(true);
+        tm.applyStyleSheet(okBtn,
+            "QPushButton { background: {{color.brand.gradient}}; color: {{color.canon.onAccent}}; font-weight: bold; "
+            "font-size: 12px; border: 1px solid transparent; border-radius: 4px; padding: 6px 30px; }"
+            "QPushButton:hover { border-color: {{color.canon.aqua}}; }"
+            "QPushButton:focus { border: 2px solid {{color.canon.aqua}}; padding: 5px 29px; }");
         connect(okBtn, &QPushButton::clicked, dlg, &QDialog::close);
+        vbox->addSpacing(4);
         vbox->addWidget(okBtn, 0, Qt::AlignCenter);
 
         dlg->show();
-
-        // Fetch live contributor list from GitHub API
-        auto* nam = new QNetworkAccessManager(dlg);
-        // Bound the contributor fetch (#4688 §6) — without it a half-open
-        // connection leaves the About dialog's list pending with no error.
-        nam->setTransferTimeout(kTransferTimeoutMs);
-        auto* reply = nam->get(QNetworkRequest(
-            QUrl("https://api.github.com/repos/aethersdr/AetherSDR/contributors")));
-        connect(reply, &QNetworkReply::finished, dlg, [contribLabel, reply] {
-            reply->deleteLater();
-            if (reply->error() != QNetworkReply::NoError) return;
-            auto doc = QJsonDocument::fromJson(reply->readAll());
-            if (!doc.isArray()) return;
-            QStringList names;
-            names << "Jeremy (KK7GWY)" << "Claude &middot; Anthropic";
-            for (const auto& val : doc.array()) {
-                auto obj = val.toObject();
-                QString login = obj.value("login").toString();
-                if (login.isEmpty() || login == "ten9876") continue;
-                if (login.contains("[bot]"))
-                    login = login.replace("[bot]", "");
-                if (!names.contains(login))
-                    names << login;
-            }
-            contribLabel->setText(names.join("<br>"));
-        });
+        okBtn->setFocus(Qt::OtherFocusReason);   // Enter closes; the corner × stays quiet
     });
 }
 
@@ -1511,5 +1961,165 @@ void MainWindow::showCopyAssist()
     updateKeyerAvailability(); // keep the status-bar ASR indicator in sync
 }
 #endif
+
+// Right-click on the SPLIT/SWAP badge (#2242, #311): the offsets, Monitor TX,
+// and the remembered split audio arrangement.
+void MainWindow::showSplitBadgeMenu(int sliceId, const QPoint& globalPos)
+{
+    SliceModel* rx = nullptr;
+    SliceModel* tx = nullptr;
+    const bool paired = splitPairForSlice(sliceId, rx, tx);
+    // With a split, the offsets retune its TX slice; without one, they enter
+    // split on the slice whose badge was clicked (#311). The reason a split
+    // cannot be entered goes on the statusTip, which a screen reader announces
+    // for a disabled QAction where a tooltip is never read.
+    const QString blocker = paired ? QString() : splitEntryBlocker(sliceId);
+
+    const QJsonObject initialQsySettings = m_splitQsySettings.toJson();
+    QMenu menu(this);
+
+    // ── One-touch pileup offsets (#311) ──────────────────────────────────
+    const double offsets[] = {1.0, 5.0, 10.0};
+    for (double khz : offsets) {
+        QAction* a = menu.addAction(tr("Split Up %1 kHz").arg(khz, 0, 'g', 2));
+        a->setEnabled(blocker.isEmpty());
+        if (!blocker.isEmpty())
+            a->setStatusTip(blocker);
+        connect(a, &QAction::triggered, this,
+                [this, khz, sliceId]() { applySplitOffsetKHz(khz, sliceId); });
+    }
+
+    // Keep client-side split-on-QSY policy beside the other split actions.
+    menu.addSeparator();
+    QMenu* splitQsyMenu = menu.addMenu(tr("Split QSY Option"));
+
+    auto* closeSplitCheck = new QCheckBox(
+        tr("Close split on QSY"), splitQsyMenu);
+    closeSplitCheck->setObjectName(QStringLiteral("splitCloseOnQsy"));
+    closeSplitCheck->setAccessibleName(tr("Close split on QSY"));
+    closeSplitCheck->setChecked(m_splitQsySettings.closeSplitOnQsy);
+    auto* closeSplitAction = new QWidgetAction(splitQsyMenu);
+    closeSplitAction->setDefaultWidget(closeSplitCheck);
+    splitQsyMenu->addAction(closeSplitAction);
+
+    QWidget* thresholdRow = new QWidget(splitQsyMenu);
+    auto* thresholdLayout = new QHBoxLayout(thresholdRow);
+    thresholdLayout->setContentsMargins(12, 4, 12, 4);
+    auto* thresholdLabel = new QLabel(
+        tr("QSY change threshold to close split:"), thresholdRow);
+    auto* thresholdSpin = new QSpinBox(thresholdRow);
+    thresholdLabel->setBuddy(thresholdSpin);
+    thresholdLayout->addWidget(thresholdLabel);
+    thresholdSpin->setObjectName(QStringLiteral("splitQsyThresholdHz"));
+    thresholdSpin->setRange(AetherSDR::SplitQsySettings::kMinimumThresholdHz,
+                            AetherSDR::SplitQsySettings::kMaximumThresholdHz);
+    thresholdSpin->setValue(m_splitQsySettings.thresholdHz);
+    thresholdSpin->setSuffix(tr(" Hz"));
+    thresholdSpin->setAccessibleName(
+        tr("QSY change threshold to close split"));
+    thresholdSpin->setAccessibleDescription(
+        tr("Enter a frequency change from 1 to 200000 Hz."));
+    thresholdLayout->addWidget(thresholdSpin);
+    auto* thresholdAction = new QWidgetAction(splitQsyMenu);
+    thresholdAction->setDefaultWidget(thresholdRow);
+    splitQsyMenu->addAction(thresholdAction);
+    thresholdSpin->setEnabled(m_splitQsySettings.closeSplitOnQsy);
+
+    connect(closeSplitCheck, &QCheckBox::toggled, this, [this, thresholdSpin](bool enabled) {
+        m_splitQsySettings.closeSplitOnQsy = enabled;
+        thresholdSpin->setEnabled(enabled);
+    });
+    connect(thresholdSpin, qOverload<int>(&QSpinBox::valueChanged), this,
+            [this](int thresholdHz) {
+        m_splitQsySettings.thresholdHz = thresholdHz;
+    });
+
+    // ── Monitor TX ───────────────────────────────────────────────────────
+    menu.addSeparator();
+    QMenu* monitorMenu = menu.addMenu(tr("Monitor TX"));
+
+    // Surface the binding here rather than only in the shortcut editor: this is
+    // a hold control, so an operator who finds it in this menu still needs to
+    // be told there is nothing to hold until they bind one.
+    QString keyText;
+    if (auto* act = m_shortcutManager.action(QLatin1String(kSplitMonitorActionId)))
+        keyText = act->currentKey.toString(QKeySequence::NativeText);
+    QAction* keyRow = monitorMenu->addAction(
+        keyText.isEmpty() ? tr("Not bound — set a key in Keyboard Shortcuts")
+                          : tr("Hold %1").arg(keyText));
+    keyRow->setEnabled(false);
+    monitorMenu->addSeparator();
+
+    auto profile = loadSplitAudioProfile();
+    using Monitor = AetherSDR::SplitAudioProfile::Monitor;
+    auto* group = new QActionGroup(&menu);
+    struct { Monitor mode; const char* label; } modes[] = {
+        {Monitor::Solo, QT_TR_NOOP("Solo TX frequency")},
+        {Monitor::Both, QT_TR_NOOP("Hear both")},
+    };
+    for (const auto& m : modes) {
+        QAction* a = monitorMenu->addAction(tr(m.label));
+        a->setCheckable(true);
+        a->setChecked(profile.monitor == m.mode);
+        group->addAction(a);
+        const Monitor mode = m.mode;
+        connect(a, &QAction::triggered, this, [this, mode]() {
+            // Read-modify-write: the learned half of the profile is not this
+            // menu's business and must survive a monitor-mode change.
+            auto p = loadSplitAudioProfile();
+            p.monitor = mode;
+            saveSplitAudioProfile(p);
+        });
+    }
+
+    // ── The remembered arrangement ───────────────────────────────────────
+    menu.addSeparator();
+    // Name what is stored, in operating terms. A remembered arrangement the
+    // operator cannot see is the difference between a feature and a haunting.
+    auto panWord = [this](int pan) {
+        if (pan <= 33) return tr("left");
+        if (pan >= 67) return tr("right");
+        return tr("centre");
+    };
+    const bool pending = m_splitAudioRecorder.hasPendingLearning();
+    QString summaryText;
+    if (!profile.hasLearnedState()) {
+        summaryText = pending
+            ? tr("This split's changes will be remembered when it ends")
+            : tr("Nothing remembered yet");
+    } else {
+        QStringList parts;
+        if (profile.hasTxMute)
+            parts << (profile.txMuted ? tr("TX muted") : tr("TX unmuted"));
+        if (profile.hasTxPan)  parts << tr("TX %1").arg(panWord(profile.txPan));
+        if (profile.hasTxGain) parts << tr("TX %1%").arg(profile.txGain);
+        if (profile.hasRxPan)  parts << tr("RX %1").arg(panWord(profile.rxPan));
+        summaryText = tr("Remembered: %1").arg(parts.join(tr(", ")));
+    }
+    QAction* summary = menu.addAction(summaryText);
+    summary->setEnabled(false);
+
+    QAction* forget = menu.addAction(tr("Forget remembered audio"));
+    const bool forgettable = profile.hasLearnedState() || pending;
+    forget->setEnabled(forgettable);
+    if (!forgettable)
+        forget->setStatusTip(tr("Nothing is remembered yet."));
+    connect(forget, &QAction::triggered, this, [this]() {
+        auto p = loadSplitAudioProfile();
+        p.forgetLearnedState();   // keeps the chosen monitor mode
+        saveSplitAudioProfile(p);
+        // And this split's edits so far, or the split's end would write them
+        // straight back. The RX pan is still put back at exit.
+        m_splitAudioRecorder.forgetTouched();
+        // Let the notice fire again: after a forget the next restore is news.
+        m_splitAudioNoticeShown = false;
+    });
+
+    menu.exec(globalPos);
+    // Keep edits live while the menu is open, but commit the document once.
+    if (m_splitQsySettings.toJson() != initialQsySettings) {
+        m_splitQsySettings.save();
+    }
+}
 
 } // namespace AetherSDR

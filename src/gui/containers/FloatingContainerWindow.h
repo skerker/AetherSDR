@@ -10,16 +10,10 @@ namespace AetherSDR {
 
 class ContainerWidget;
 
-// Top-level window that hosts a ContainerWidget in floating mode.
-// One FloatingContainerWindow per floating container.  The window's
-// layout is a single-slot QVBoxLayout holding the container; the
-// container's own titlebar serves as the drag handle and close/dock
-// affordance so the window's native title bar can be bare.
-//
-// Geometry is saved to AppSettings under `geometryKey()` whenever the
-// window moves or resizes; ContainerManager assigns that key from the
-// container's ID once Phase 2 lands.  For Phase 1 tests the caller
-// passes the key directly.
+// Top-level window hosting one floating ContainerWidget in a single-slot
+// layout; the container's own titlebar is the drag handle and close/dock
+// affordance. Geometry is saved to AppSettings under geometryKey() on every
+// move/resize (ContainerManager assigns it from the container id).
 class FloatingContainerWindow : public QWidget {
     Q_OBJECT
 
@@ -37,6 +31,10 @@ public:
     // window typically destroys itself via deleteLater().
     ContainerWidget* releaseContainer();
     ContainerWidget* container() const { return m_container; }
+
+    // Retain the outer window's explicit show/hide request while the hosted
+    // container is temporarily unavailable. The content itself stays shown.
+    void setVisible(bool visible) override;
 
     // AppSettings key under which to store geometry (serialized as
     // base64 of QByteArray returned by saveGeometry()).  Empty = no
@@ -77,8 +75,13 @@ protected:
 
 private:
     void saveGeometryToKey() const;
+    void applyPresentation();
 
     ContainerWidget* m_container{nullptr};
+    QMetaObject::Connection m_presentationConnection;
+    QMetaObject::Connection m_containerVisibilityConnection;
+    QMetaObject::Connection m_containerDestroyedConnection;
+    bool             m_requestedVisible{false};
     QVBoxLayout*     m_layout{nullptr};
     QString          m_geometryKey;
     bool             m_restoring{false};

@@ -232,6 +232,40 @@ bool TxVoiceProcessor::processCapturedInt16(QByteArray& canonicalInputOutput)
         m_inputMono[static_cast<size_t>(frame)] = input[frame * 2] / 32768.0f;
     }
 
+    return processCapturedMono(inputFrames, canonicalInputOutput);
+}
+
+bool TxVoiceProcessor::processCapturedFloat32(QByteArray& canonicalInputOutput)
+{
+    if (!m_prepared || canonicalInputOutput.isEmpty()) {
+        return false;
+    }
+    const int inputFrames = canonicalInputOutput.size()
+        / (kChannels * static_cast<int>(sizeof(float)));
+    if (inputFrames <= 0) {
+        return false;
+    }
+
+    // Float input is used as-is (no scaling or rounding); the Int16 route gets
+    // here via /32768.0f. Scrub non-finite samples here: unlike Int16 input this
+    // can carry NaN/Inf, and processCapturedMono() runs the stateful ingress
+    // resampler before processWorkBuffer()'s egress scrub, so one NaN would poison
+    // it permanently. Public method, so don't rely on the engine's finiteOrZero().
+    const auto* input = reinterpret_cast<const float*>(
+        canonicalInputOutput.constData());
+    m_inputMono.resize(static_cast<size_t>(inputFrames));
+    for (int frame = 0; frame < inputFrames; ++frame) {
+        const float sample = input[frame * 2];
+        m_inputMono[static_cast<size_t>(frame)] =
+            std::isfinite(sample) ? sample : 0.0f;
+    }
+
+    return processCapturedMono(inputFrames, canonicalInputOutput);
+}
+
+bool TxVoiceProcessor::processCapturedMono(int inputFrames,
+                                           QByteArray& transportInt16Output)
+{
     const float* mono48Samples = m_inputMono.data();
     int frames48 = inputFrames;
     if (m_inputResampler) {
@@ -250,7 +284,7 @@ bool TxVoiceProcessor::processCapturedInt16(QByteArray& canonicalInputOutput)
         work[frame * 2] = mono48Samples[frame];
         work[frame * 2 + 1] = mono48Samples[frame];
     }
-    return processWorkBuffer(frames48, canonicalInputOutput);
+    return processWorkBuffer(frames48, transportInt16Output);
 }
 
 bool TxVoiceProcessor::processFloat48(const float* interleavedStereo,

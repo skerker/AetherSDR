@@ -1,4 +1,5 @@
 #pragma once
+#include "core/TxCoordinator.h"
 
 #include "core/tnc/Ax25.h"
 #include "core/tnc/Ax25LinkTiming.h"
@@ -16,20 +17,17 @@ namespace AetherSDR {
 
 class Ax25Connection;
 
-// The Personal Mailbox System (PMS / PBBS) service: a compact, Kantronics-style
-// AX.25 mailbox that a single remote caller can connect to at 1200 baud and
-// read / list / send messages, see who has been heard, and disconnect. Messages,
-// callers, and the heard list persist to JSON under the AetherSDR settings dir.
-//
-// This object owns an Ax25Connection (the connected-mode data link) and turns
-// reassembled line input into mailbox command responses. It is RF-agnostic: feed
-// it every decoded frame via onAirFrame() and key whatever it emits on
-// transmitFrame(). The heard list and UI-beacon logic are deliberately split out
-// so the future APRS/AX.25 digipeater can reuse the same plumbing.
+// Personal Mailbox System (PMS/PBBS): a Kantronics-style AX.25 mailbox for one
+// remote caller at 1200 baud (read/list/send, heard list, disconnect).
+// Messages, callers and heard list persist as JSON in the settings dir. Owns an
+// Ax25Connection; RF-agnostic: feed decoded frames to onAirFrame() and key
+// whatever transmitFrame() emits. Heard list and UI beacon are separate for
+// reuse by a digipeater.
 class PmsMailbox : public QObject {
     Q_OBJECT
 
 public:
+    void setTransmitProgram(const TxCoordinator::Request& input) { m_txProgram = input; }
     struct Message {
         int id{0};
         QChar type{QLatin1Char('P')}; // 'P' private, 'B' bulletin
@@ -141,13 +139,15 @@ public slots:
 
 signals:
     // A raw AX.25 frame (address..info, no FCS) to key on the air.
-    void transmitFrame(const QByteArray& rawNoFcs);
+    void transmitFrame(const QByteArray& rawNoFcs,
+                       const AetherSDR::TxCoordinator::Request& input);
     // Human-readable activity for the AetherModem log.
     void activity(const QString& message);
     // Connection/state/stats changed — the GUI should refresh its Mailbox panel.
     void stateChanged();
 
 private:
+    TxCoordinator::Request m_txProgram;
     void onLinkConnected(const ax25::Address& peer);
     void onLinkDisconnected(const ax25::Address& peer, bool byPeer);
     void onLinkData(const QByteArray& data);
@@ -181,11 +181,12 @@ private:
     QString messagesPath() const;
     QString callersPath() const;
     QString heardPath() const;
-    void ensureStorageDir() const;
+    bool ensureStorageDir() const;
     void loadAll();
-    void saveMessages() const;
-    void saveCallers() const;
-    void saveHeard() const;
+    bool saveMessages(const QVector<Message>& messages, int nextId);
+    bool saveCallers(const QVector<Caller>& callers);
+    bool saveHeard(const QVector<Heard>& heard);
+    void reportPersistenceFailure(const QString& store, const QString& detail);
 
     // Cap on unterminated inbound text. paclen tops out at 256 bytes and a
     // mailbox command is a few dozen characters, so anything approaching this

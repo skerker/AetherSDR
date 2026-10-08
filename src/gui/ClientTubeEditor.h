@@ -13,19 +13,9 @@ class ClientCompKnob;         // reused — generic rotary knob
 class ClientLevelMeter;
 class ClientTubeCurveWidget;
 
-// Floating editor for the client-side dynamic tube saturator.
-// Layout mirrors Ableton's Dynamic Tube device:
-//
-//   ┌─ bypass ──────────────────── × ┐
-//   │ ┌──────┐ ┌─────────┐ ┌──────┐ │
-//   │ │DryWet│ │  curve  │ │ ENV  │ │
-//   │ │      │ │         │ │      │ │
-//   │ │ Out  │ │         │ │ ATK  │ │
-//   │ │      │ │ [A B C] │ │      │ │
-//   │ │Drive │ │  Tone   │ │ REL  │ │
-//   │ │      │ │  Bias   │ │      │ │
-//   │ └──────┘ └─────────┘ └──────┘ │
-//   └────────────────────────────────┘
+// Floating editor for the client-side dynamic tube saturator, laid out like
+// Ableton's Dynamic Tube: Dry/Wet, Out, Drive on the left; curve with A/B/C
+// model, Tone and Bias in the middle; envelope, Attack, Release on the right.
 class ClientTubeEditor : public QWidget {
     Q_OBJECT
 
@@ -37,6 +27,7 @@ public:
 
     void showForTx();
     void showForRx();
+    bool isShowingTx() const { return isVisible() && m_side == Side::Tx; }
 
 signals:
     void bypassToggled(Side side, bool bypassed);
@@ -60,7 +51,6 @@ private:
     void applyOutput(float db);
     void applyDryWet(float v);
     void applyEnvelope(float v);
-    void applyAttack(float ms);
     void applyRelease(float ms);
 
     AudioEngine*           m_audio{nullptr};
@@ -75,7 +65,6 @@ private:
     ClientCompKnob*        m_tone{nullptr};
     ClientCompKnob*        m_bias{nullptr};
     ClientCompKnob*        m_envelope{nullptr};
-    ClientCompKnob*        m_attack{nullptr};
     ClientCompKnob*        m_release{nullptr};
     ClientLevelMeter*      m_outMeter{nullptr};
     QPushButton*           m_modelA{nullptr};

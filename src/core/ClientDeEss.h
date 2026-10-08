@@ -5,21 +5,11 @@
 
 namespace AetherSDR {
 
-// Client-side de-esser — TX DSP chain Phase 3 (#1661).  Sibilant
-// suppression via sidechain-filtered dynamics: the input is split
-// through a bandpass filter (2–10 kHz) whose output drives an
-// envelope detector; when the detector crosses threshold we apply
-// broadband attenuation (capped at `amount` dB) to the full signal.
-//
-// Single-band design.  Classic approach, tracks modern plugins like
-// Ableton's DeEsser and FabFilter's Pro-DS in structure.  Future
-// phases could add split-band (only attenuate HF), stereo-linked
-// vs. dual-mono detection, or listen-to-sidechain monitoring.
-//
-// Thread model mirrors ClientComp / ClientGate: UI thread writes
-// atomics + bumps a version counter; the audio thread reads the
-// version once per block and recaches coefficients.  No locks,
-// no allocations in process(), no exceptions.
+// Client-side TX de-esser (#1661). A bandpass sidechain at frequencyHz drives an
+// envelope detector; above threshold the bandpass portion of the signal is
+// attenuated (split-band, capped at `amount` dB), leaving lows and mids alone.
+// UI thread writes atomics + bumps a version; the audio thread recaches once per
+// block. No locks, allocations or exceptions in process().
 class ClientDeEss {
 public:
     ClientDeEss();
@@ -28,6 +18,8 @@ public:
     ClientDeEss(const ClientDeEss&)            = delete;
     ClientDeEss& operator=(const ClientDeEss&) = delete;
 
+    // Audio owner only; never concurrently with process(). GUI rate reads
+    // and parameter setters remain safe while a new producer is prepared.
     void prepare(double sampleRate);
 
     void setEnabled(bool on) noexcept;
@@ -75,7 +67,12 @@ public:
     float sidechainPeakDb() const noexcept;         // HF-band sidechain peak
     float gainReductionDb() const noexcept;         // ≤ 0 dB
 
-    double sampleRate() const noexcept { return m_sampleRate; }
+    // Audio owner: mirror a presented auxiliary source into UI-facing meters.
+    // Copies atomic snapshots only; parameters and processing histories stay local.
+    void copyMeteringFrom(const ClientDeEss& source) noexcept;
+
+    double sampleRate() const noexcept
+    { return m_sampleRate.load(std::memory_order_relaxed); }
 
     // Public because the cpp-local biquad helper takes references to
     // these.  Not part of the user-facing API.
@@ -118,7 +115,8 @@ private:
     void recacheIfDirty() noexcept;
     float staticCurveGainDb(float envDb) const noexcept;
 
-    double m_sampleRate{24000.0};
+    // Audio owner writes in prepare(); UI reads the displayed processing rate.
+    std::atomic<double> m_sampleRate{24000.0};
     Atomics m_atomics;
     Cached  m_cached;
     Meters  m_meters;

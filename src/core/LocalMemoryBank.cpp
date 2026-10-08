@@ -93,19 +93,11 @@ void LocalMemoryBank::load()
     m_entries = parsed.memories;
     m_dirty = false;
 
-    // TWO facts, deliberately separate, because one flag could not carry both:
-    //
-    //   m_loaded   — the read has been ATTEMPTED. Latches true no matter how the
-    //                read went, so nothing re-reads.
-    //   m_writable — the file was UNDERSTOOD, so replacing it is safe.
-    //
-    // Using m_loaded for both was wrong in both directions. Leaving it true on a
-    // failed read made the bank writable, so the next flush() replaced a damaged
-    // file with the empty bank it had just parsed out of it. And clearing it to
-    // withhold write permission also cleared "already read", so handleCommand()'s
-    // load() re-ran on EVERY command and wiped m_entries between `memory create`
-    // and `memory set` — every Add failing with "There is no memory in slot N",
-    // and the reset m_dirty suppressing the warning that would have explained it.
+    // Two separate facts:
+    //   m_loaded   - the read was ATTEMPTED (latches, so nothing re-reads; a
+    //                re-read would wipe m_entries between commands).
+    //   m_writable - the file was UNDERSTOOD, so replacing it is safe (a damaged
+    //                file must not be overwritten by the empty bank).
     m_loaded = true;
     m_writable = parsed.overwritable();
     // Baseline for the concurrent-writer check in flush().
@@ -119,6 +111,10 @@ void LocalMemoryBank::load()
                            : "(bank is READ-ONLY; edits will be refused)");
         return;
     }
+
+    // Loading never guesses recallability or upgrades an existing document.
+    // Experimental Icom imports did not preserve split/RPS metadata, so only
+    // an explicit Sync with the corrected codec can safely repair those rows.
 
     if (importedFromLegacy) {
         // Claim the legacy channels into the document now, so the migration
@@ -146,6 +142,19 @@ int LocalMemoryBank::allocateSlot() const
     while (m_entries.contains(index))
         ++index;
     return index;
+}
+
+int LocalMemoryBank::importedSlot(const QString& source, const QString& key) const
+{
+    if (source.isEmpty() || key.isEmpty()) {
+        return -1;
+    }
+    for (auto it = m_entries.constBegin(); it != m_entries.constEnd(); ++it) {
+        if (it->importSource == source && it->importKey == key) {
+            return it.key();
+        }
+    }
+    return -1;
 }
 
 LocalMemoryBank::CommandResult LocalMemoryBank::handleCommand(const QString& command)
@@ -297,11 +306,12 @@ void LocalMemoryBank::scheduleSave()
     m_saveTimer.start();
 }
 
-void LocalMemoryBank::flush()
+bool LocalMemoryBank::flush()
 {
     m_saveTimer.stop();
-    if (!m_dirty)
-        return;
+    if (!m_dirty) {
+        return true;
+    }
 
     // Not writable means load() could not understand the file — a version this
     // build cannot read, a foreign format id, or JSON it could not parse.
@@ -309,7 +319,7 @@ void LocalMemoryBank::flush()
     if (!m_writable) {
         qCWarning(lcProtocol).noquote()
             << "LocalMemoryBank: refusing to overwrite an unreadable bank";
-        return;
+        return false;
     }
 
     // Somebody else wrote the document since we read it.
@@ -328,7 +338,7 @@ void LocalMemoryBank::flush()
             "the memory panel to pick up the other changes.");
         qCWarning(lcProtocol).noquote() << "LocalMemoryBank:" << m_lastError;
         emit saveFailed(m_lastError);
-        return;   // stays dirty
+        return false;   // stays dirty
     }
 
     // savedAt uses millisecond precision: it doubles as the foreign-write
@@ -341,14 +351,14 @@ void LocalMemoryBank::flush()
     if (!AppSettings::instance().setRadioFeature(
             LocalMemoryStore::documentFamily(), QString(),
             LocalMemoryStore::documentFeature(),
-            LocalMemoryStore::kFormatVersion, envelope)) {
+            LocalMemoryStore::formatVersionFor(m_entries), envelope)) {
         m_lastError = QStringLiteral("the settings store refused the write");
         qCWarning(lcProtocol).noquote()
             << "LocalMemoryBank: save failed —" << m_lastError;
         emit saveFailed(m_lastError);
         // Stay dirty: the next edit (or flush) retries. A transient failure
         // must not cost the operator every channel they saved since.
-        return;
+        return false;
     }
 
     m_dirty = false;
@@ -358,6 +368,7 @@ void LocalMemoryBank::flush()
     m_seenSavedAt = savedAt;
     qCDebug(lcProtocol).noquote()
         << "LocalMemoryBank: saved" << m_entries.size() << "memories";
+    return true;
 }
 
 void LocalMemoryBank::rememberDocumentState()

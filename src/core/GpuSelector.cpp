@@ -238,19 +238,34 @@ void GpuSelector::applyAtStartup()
     }
 
 #if defined(Q_OS_LINUX)
-    // Honour an explicit user override of any GPU-selection env.
-    if (qEnvironmentVariableIsSet("__NV_PRIME_RENDER_OFFLOAD")
-            || qEnvironmentVariableIsSet("__GLX_VENDOR_LIBRARY_NAME")
-            || qEnvironmentVariableIsSet("DRI_PRIME")) {
-        s_appliedSummary = QStringLiteral("'%1' requested, but __NV_PRIME/__GLX/DRI_PRIME env already set — left as-is")
-                               .arg(chosen->name);
-        return;
-    }
     // The right lever differs by windowing system: __GLX_VENDOR_LIBRARY_NAME only
     // applies under X11/XWayland (GLX).  Under Wayland the app uses EGL, where it
     // is useless and =nvidia can raise GLX BadValue, so set only the
     // windowing-agnostic offload hints.
     const bool wayland = willUseWayland();
+
+    // Honour an explicit GPU-selection env override, but only one that applies to
+    // the windowing system in use. __GLX_VENDOR_LIBRARY_NAME is widely exported and
+    // is inert under Wayland (EGL; glvnd never reads it), so it vetoes the menu
+    // choice only under X11.
+    const char* vetoedBy = nullptr;
+    if (qEnvironmentVariableIsSet("__NV_PRIME_RENDER_OFFLOAD")) {
+        vetoedBy = "__NV_PRIME_RENDER_OFFLOAD";
+    } else if (qEnvironmentVariableIsSet("DRI_PRIME")) {
+        vetoedBy = "DRI_PRIME";
+    } else if (!wayland && qEnvironmentVariableIsSet("__GLX_VENDOR_LIBRARY_NAME")) {
+        // `wayland` is predicted from the environment before QApplication parses argv;
+        // `-platform xcb` or a failed Wayland plugin can still land on GLX. Being wrong
+        // only mislabels the summary line: the Wayland branch never sets
+        // __GLX_VENDOR_LIBRARY_NAME, so it can't re-arm the GLX BadValue.
+        vetoedBy = "__GLX_VENDOR_LIBRARY_NAME";
+    }
+    if (vetoedBy) {
+        s_appliedSummary =
+            QStringLiteral("'%1' requested, but %2 is already set in the environment — left as-is")
+                .arg(chosen->name, QString::fromLatin1(vetoedBy));
+        return;
+    }
     if (chosen->name.contains(QLatin1String("NVIDIA"))) {
         qputenv("__NV_PRIME_RENDER_OFFLOAD", "1");        // GLX + EGL offload hint
         qputenv("__VK_LAYER_NV_optimus", "NVIDIA_only");  // Vulkan offload hint

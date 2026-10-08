@@ -1,30 +1,14 @@
 #pragma once
 
-// ─── Audio format / sample-rate negotiation policy ───────────────────────────
-//
-// One ladder, one set of per-OS rules — the single home for "what rate and
-// sample format does this device want, and how do I bridge between that rate
-// and the caller's canonical device-boundary rate" (issue #3306).
-//
-// Historically each audio sink/source re-implemented this with its own
-// divergent fallback ladder and per-OS `#ifdef` branches, which is the root of
-// a cluster of platform-specific audio bugs (44.1k-only devices silently
-// failing on some sinks, WASAPI Float32-only devices rejecting Int16, macOS
-// Bluetooth-HFP mics delivering silence, etc.).
-//
-// DESIGN CONSTRAINT (testability): this layer is a PURE function over an
-// *injected* capability snapshot (`DeviceCaps`) with the target OS passed in as
-// a PARAMETER, never an `#ifdef`. That lets a single headless test binary,
-// built once on any CI runner, exercise every OS's ladder against every device
-// shape — the reason the historical bugs escaped CI. The thin live wrapper
-// (see AudioDeviceNegotiator, Qt-Multimedia) is the only platform-specific part.
-//
-// This header deliberately depends on nothing beyond Qt Core (QString/QList) so
-// the policy can be unit-tested by an executable that links only Qt6::Core.
-// QAudioFormat (Qt Multimedia) is intentionally NOT used here; the live wrapper
-// converts SampleFmt <-> QAudioFormat::SampleFormat.
+// Audio format / sample-rate negotiation policy (#3306): the single home for
+// which rate and format a device wants and how to bridge to the caller's
+// canonical rate. A PURE function over an injected DeviceCaps snapshot with the
+// target OS as a parameter (never #ifdef), so one headless test exercises every
+// OS's ladder against every device shape. Depends only on Qt Core; the live
+// wrapper (AudioDeviceNegotiator) converts SampleFmt <-> QAudioFormat.
 
 #include <QList>
+#include <functional>
 #include <QString>
 
 namespace AetherSDR {
@@ -48,17 +32,14 @@ enum class Direction { Output, Input };
 // these to/from the Qt enum). Only the formats AetherSDR opens are modelled.
 enum class SampleFmt { Int16, Float32 };
 
-// Which resampler strategy converts between the device rate and kInternalRate.
-//   None         — sink regenerates/consumes natively at the device rate
-//                  (CW sidetone, Quindar tone), or rate already == kInternalRate.
-//   PreservePan  — dual independent L/R r8brain instances; keeps VITA-49 per-
-//                  channel pan intact. REQUIRED for RX speaker and QSO playback
-//                  (collapsing to mono here regressed pan: #2403 / PR #2459).
-//   MonoCollapse — Resampler::processStereoToStereo (downmix→resample→duplicate).
-//                  Correct ONLY where the payload is inherently mono: TCI DAX TX,
-//                  RADE modem. MUST NOT be used for RX/QSO.
-// These two stereo strategies are deliberately distinct and must never be
-// unified (the conflation that caused #2403).
+// Which resampler converts between the device rate and kInternalRate.
+//   None         - sink runs natively at the device rate (CW sidetone, Quindar),
+//                  or rate already == kInternalRate.
+//   PreservePan  - independent L/R r8brain instances; keeps VITA-49 per-channel
+//                  pan. REQUIRED for RX speaker and QSO playback (#2403).
+//   MonoCollapse - Resampler::processStereoToStereo (downmix, resample,
+//                  duplicate). Only for inherently mono payloads (TCI DAX TX,
+//                  RADE modem); never RX/QSO. Never unify the two stereo kinds.
 enum class ResamplerKind { None, PreservePan, MonoCollapse };
 
 // How a particular sink/source treats sample rate — drives ResamplerKind.
@@ -157,6 +138,72 @@ NegotiatedFormat negotiate(TargetOs os,
 ResamplerKind resamplerKindFor(int deviceRate,
                                ResamplerPolicy policy,
                                int internalRate = kInternalRate);
+
+// WASAPI silent-open recovery (#2929): WASAPI can return a non-null QIODevice
+// that delivers zero bytes for an open the endpoint can't honour; a watchdog
+// reopens after ~1.5 s. Both channel count (mono-only mics) and sample format
+// (Int16 endpoints accepting a Float open) can cause it; mono is tried first as
+// the common case.
+struct TxOpenAttempt {
+    int       rate = 48000;
+    SampleFmt fmt = SampleFmt::Float32;
+    int       channels = 2;   // 1 == forced mono
+
+    bool operator==(const TxOpenAttempt& other) const
+    {
+        return rate == other.rate && fmt == other.fmt && channels == other.channels;
+    }
+};
+
+// The full ordered TX capture attempt sequence for an initial open of
+// `initialChannels`: index 0 is the initial open, the rest is recovery for either
+// failure shape (one ladder, so a tuple observed silent is never retried).
+// Order: rate (48000, 44100, 24000, 16000), then format (Float32, Int16), then
+// channels (clamped count, then mono). Duplicate rungs are collapsed.
+QList<TxOpenAttempt> txOpenLadder(int initialChannels);
+
+// What a single open attempt did.
+//
+// Null and SilentNonNull are DELIBERATELY not distinguished by the cursor.
+// Both mean "this tuple does not work", and treating them differently is
+// precisely what let the two old ladders disagree about where they were.
+enum class TxOpenOutcome { Null, SilentNonNull, Delivers };
+
+// The cursor AudioEngine drives, and the one a test drives with simulated
+// outcomes — so a test cannot pass against a state machine that is not the
+// shipped one.
+//
+// It moves forward only. That is what makes "never re-accept a tuple already
+// observed silent" structural rather than bookkeeping: every such tuple is
+// behind the cursor.
+class TxOpenCursor {
+public:
+    explicit TxOpenCursor(int initialChannels, int stage = 0);
+
+    int  stage() const { return m_stage; }
+    int  size() const { return static_cast<int>(m_ladder.size()); }
+    const TxOpenAttempt& attempt() const { return m_ladder.at(m_stage); }
+    const QList<TxOpenAttempt>& ladder() const { return m_ladder; }
+
+    // Is there anywhere left to go? The watchdog arms iff this is true, and
+    // it is the same question advance() answers — one rule, not two.
+    bool hasNext() const { return m_stage + 1 < size(); }
+
+    // Step to the next attempt. False means the ladder is exhausted, which is
+    // a hard failure for a null open and a permanently silent mic for a
+    // no-data one.
+    bool advance();
+
+private:
+    QList<TxOpenAttempt> m_ladder;
+    int                  m_stage = 0;
+};
+
+// Drive a cursor to completion against a simulated device, returning the stage
+// that ends up carrying audio, or -1 if the mic never delivers. Uses the
+// cursor's own transitions, so it walks the shipped state machine.
+int walkTxOpen(TxOpenCursor& cursor,
+               const std::function<TxOpenOutcome(const TxOpenAttempt&)>& probe);
 
 // The host OS as a TargetOs (the ONE place the real #ifdef lives). The live
 // wrapper passes this; tests pass an explicit value.

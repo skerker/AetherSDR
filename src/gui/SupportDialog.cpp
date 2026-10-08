@@ -7,7 +7,7 @@
 #include "core/LogManager.h"
 #include "core/SupportBundle.h"
 #include "models/RadioModel.h"
-#include "core/RadioConnection.h"
+#include "core/backends/flex/RadioConnection.h"
 
 #include <QCheckBox>
 #include <QCursor>
@@ -135,7 +135,7 @@ void SupportDialog::buildUI()
     layout->addLayout(actionRow);
 
     // ── Instructions ──────────────────────────────────────────────────────
-    // "File an Issue" and "Reset Settings" now live directly on the Help menu;
+    // "File an Issue" lives on Help and "Reset Settings" on Settings;
     // point the user there rather than duplicating the buttons here.
     auto* instructions = new QLabel(
         "<p style='color:#c8d8e8; font-size: 13px;'>"
@@ -352,7 +352,7 @@ void SupportDialog::fileIssue(QWidget* parent, RadioModel* radioModel)
         "- OS: %3\n"
         "- Radio: %4\n\n"
         "Before writing the bug report, please read the AetherSDR project context at\n"
-        "https://raw.githubusercontent.com/aethersdr/AetherSDR/main/CLAUDE.md\n"
+        "https://raw.githubusercontent.com/aethersdr/AetherSDR/main/AGENTS.md\n"
         "for architecture overview, data flow, protocol details, and known issues.\n\n"
         "Based on my description below, write a complete GitHub bug report.\n"
         "Do NOT ask me follow-up questions — just write the best report you can\n"

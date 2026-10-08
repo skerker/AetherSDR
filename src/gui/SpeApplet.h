@@ -7,35 +7,21 @@
 #include <QTimer>
 
 class QLabel;
+class QSpacerItem;
+class QVBoxLayout;
 
 namespace AetherSDR {
 
 class HGauge;
+class SpeLcdWidget;
 
-// Dedicated applet for an SPE Expert linear amplifier (1.3K-FA/1.5K-FA/
-// 2K-FA) — a sibling of AcomApplet and AmpApplet (PGXL), not a variant of
-// either, per the dedicated-applet-per-peripheral lesson recorded in
-// docs/architecture/acom-600s-amplifier-design.md §2. See
-// docs/architecture/spe-expert-amplifier-design.md for this applet's own
-// design note.
-//
-// The SPE's Status string reports output power, antenna-side SWR, AND
-// ATU-input-side SWR as independently real fields, so all three get a
-// permanent gauge row (same all-real-fields-get-gauges reasoning as
-// AcomApplet's Power/Reflected/SWR). Supply voltage/current and the
-// heatsink temperatures are text readouts — the protocol defines no
-// nominal/max scale to size an axis against.
-//
-// Buttons mirror the amplifier's own front panel keys (every remote command
-// IS a keystroke in this protocol): OPER/STBY toggle, power-level cycle
-// (the button label shows the CURRENT level, LOW/MID/HIGH), TUNE, OFF,
-// INPUT, ANT, and the ▲/▼ arrow keys — which on the Expert adjust the
-// drive power the amplifier requests from the radio over CAT. Band keys
-// are not exposed: the amp follows the radio's band via CAT/RF sensing.
-// SET/DISPLAY menu navigation and manual L/C tuning are deliberately not
-// exposed — SPE reserves complex operations for their own KTerm
-// application, and blind menu navigation without the amp's display is a
-// foot-gun.
+// Dedicated applet for SPE Expert amplifiers (1.3K/1.5K/2K-FA), a sibling of
+// AcomApplet and AmpApplet; see docs/architecture/spe-expert-amplifier-design.md.
+// Power, antenna SWR and ATU-input SWR are independent Status fields, so each
+// gets a gauge; supply and temperatures are text (protocol defines no scale).
+// Buttons are the amp's front-panel keys (each remote command is a keystroke);
+// ▲/▼ adjust the drive the amp requests over CAT. Band keys, SET/DISPLAY menus
+// and manual L/C tuning are not exposed: blind menu navigation is unsafe.
 class SpeApplet : public QWidget {
     Q_OBJECT
 
@@ -76,6 +62,20 @@ public:
     // can't tell this apart.
     void setResponding(bool responding);
 
+    // Docked (panel rail) vs floating (own window) presentation. Docked is
+    // the compact layout; floating relaxes margins and type sizes and
+    // reveals the FRONT PANEL key group (BAND±, L±/C±, SET) that the rail
+    // has no room for — mirroring the reference application's expanded
+    // window. Driven by the container's dockModeChanged (see AppletPanel).
+    void setFloating(bool floating);
+
+    // A decoded refresh of the amplifier's own front-panel LCD — rendered
+    // in the floating presentation's display mirror (see SpeLcdWidget).
+    void setLcdFrame(const AetherSDR::Spe::Lcd::Frame& frame);
+    // Separately tracks whether that mirror is recent enough to make the
+    // floating-only menu/manual-tuning keys safe to use.
+    void setLcdFresh(bool fresh);
+
 signals:
     void powerOnClicked();     // hardware power-ON pulse (works while the amp is silent)
     void operateClicked();     // OPERATE key — toggles STANDBY <-> OPERATE
@@ -86,11 +86,26 @@ signals:
     void antennaClicked();     // ANTENNA key
     void driveUpClicked();     // ▲ (RIGHT-arrow key) — raise requested drive power
     void driveDownClicked();   // ▼ (LEFT-arrow key) — lower requested drive power
+    // FRONT PANEL group (floating layout only — see setFloating):
+    void bandDownClicked();    // BAND− key — manual band override
+    void bandUpClicked();      // BAND+ key
+    void setKeyClicked();      // SET key — confirm/enter on the amp's own menu
+    void lMinusClicked();      // L− key — manual ATU inductance step
+    void lPlusClicked();       // L+ key
+    void cMinusClicked();      // C− key — manual ATU capacitance step
+    void cPlusClicked();       // C+ key
+    // The floating presentation wants the amplifier's LCD mirrored (and the
+    // docked one wants that polling stopped) — MainWindow routes this to
+    // SpeConnection::setLcdPolling.
+    void lcdPollingWanted(bool wanted);
 
 private:
     void updateValueLabels();  // 10 Hz throttled label text refresh
     void updateCommandsEnabled();
     void applyModePill();
+    // Re-applies every mode-dependent style/metric (margins, type sizes,
+    // gauge heights, FRONT PANEL visibility) for the current m_floating.
+    void applyDensity();
     // Blanks every reading back to its not-yet-known state. Shared by the
     // disconnect path and the stopped-answering path — both mean "what is on
     // screen is no longer telemetry", and a frozen-but-plausible panel is the
@@ -129,9 +144,26 @@ private:
     QPushButton* m_driveDownBtn{nullptr};
     QPushButton* m_driveUpBtn{nullptr};
 
+    // Floating layout only: the amp's LCD mirror and the FRONT PANEL group.
+    SpeLcdWidget* m_lcd{nullptr};
+    QWidget*     m_frontPanel{nullptr};
+    QSpacerItem* m_bottomStretch{nullptr};
+    QPushButton* m_bandDownBtn{nullptr};
+    QPushButton* m_bandUpBtn{nullptr};
+    QPushButton* m_setBtn{nullptr};
+    QPushButton* m_lMinusBtn{nullptr};
+    QPushButton* m_lPlusBtn{nullptr};
+    QPushButton* m_cMinusBtn{nullptr};
+    QPushButton* m_cPlusBtn{nullptr};
+
+    QVBoxLayout* m_vbox{nullptr};
+    bool m_floating{false};
+    bool m_lcdFresh{false};
+    // applyModePill's no-op key: mode text + density, so a dock<->float
+    // switch restyles the pill even when the mode itself is unchanged.
+    QString m_lastPillKey;
+
     QTimer m_labelTimer;
-    QTimer* m_peakTimer{nullptr};
-    float m_peakFwd{0.0f};
 
     // Last applied power-gauge scale — setPowerRange() no-ops on repeats so
     // the wiring can re-derive the level-dependent scale on every status

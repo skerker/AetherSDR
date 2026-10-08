@@ -79,6 +79,11 @@ struct AsrGpuDevice {
     int index = 0;
     QString name;
     bool usable = true;
+    // Physical memory as reported by ggml_backend_dev_memory (#4986); both 0
+    // when unknown — query unavailable, or the device was latched out before
+    // it could be asked.
+    quint64 vramFreeBytes = 0;
+    quint64 vramTotalBytes = 0;
 };
 
 // Factory for wiring AsrEngine to the production whisper backend. Kept here so
@@ -106,18 +111,11 @@ int asrResolveDefaultGpuIndex(const std::vector<AsrGpuDevice>& devices);
 void asrMarkGpuDeviceFailed(int index);
 bool asrGpuDeviceFailed(int index);
 
-// After compute-device resolution, which model tier should be running. The
-// GPU-default tier is heavy enough that it only makes sense on a usable GPU:
-//  - raise to it only while the GPU default is wanted (no explicit operator
-//    model choice yet) AND resolution landed on a usable GPU;
-//  - walk it back to the base default when it is selected only because an
-//    earlier resolution auto-raised it (`gpuDefaultActive`) and resolution has
-//    since fallen off the GPU — the heaviest model cannot keep up on CPU,
-//    which is the "backlog climbing, no text" shape of #4502;
-//  - never touch a tier the operator picked explicitly.
-// Returns the tier to run plus the updated auto-raise state. Header-inline and
-// whisper-free for the same reason as asrLanguageOrDefault below: unit
-// testable without linking the vendored library.
+// After device resolution, which tier should run. Raise to the GPU-default tier
+// only when no explicit operator choice exists and a usable GPU was resolved;
+// walk an auto-raised tier (`gpuDefaultActive`) back to the base default when
+// resolution falls off the GPU (it can't keep up on CPU, #4502); never touch an
+// operator-picked tier. Whisper-free for unit tests.
 struct AsrTierResolution {
     QString tierId;
     bool gpuDefaultActive = false;
@@ -142,6 +140,102 @@ inline AsrTierResolution asrReconcileDefaultTier(const QString& currentTier,
     // Off the GPU the auto-raise state is meaningless — drop it so a stale
     // flag can never walk back a tier the operator has since chosen.
     return {currentTier, false};
+}
+
+// Routes the whisper/ggml log callback (stderr by default) into the log file:
+// WARN/ERROR forwarded, INFO/DEBUG dropped, printf-sized chunks joined into whole
+// lines, GGML_LOG_LEVEL_CONT joined to the previous message (for a system
+// libwhisper; vendored code never emits it). Level constants mirror
+// ggml_log_level, static_asserted in the .cpp. Not thread-safe: caller serialises
+// feed().
+class AsrLibLogAssembler {
+public:
+    static constexpr int kLevelWarn = 3;  // GGML_LOG_LEVEL_WARN
+    static constexpr int kLevelError = 4; // GGML_LOG_LEVEL_ERROR
+    static constexpr int kLevelCont = 5;  // GGML_LOG_LEVEL_CONT
+
+    struct Line {
+        bool error = false; // false = warning
+        QString text;
+    };
+
+    // Feed one callback invocation; returns the complete lines it finished that
+    // are to be forwarded (usually none or one).
+    std::vector<Line> feed(int level, const char* text)
+    {
+        std::vector<Line> out;
+        if (text == nullptr) {
+            return out;
+        }
+        if (level != kLevelCont) {
+            // A new message. whisper and ggml end every message with '\n', but
+            // do not depend on it: finish whatever the last one left open.
+            finishPending(out);
+            m_forward = (level == kLevelWarn || level == kLevelError);
+            m_error = (level == kLevelError);
+        }
+        if (!m_forward) {
+            return out;
+        }
+        m_pending += QString::fromUtf8(text);
+        qsizetype newline = -1;
+        while ((newline = m_pending.indexOf(QLatin1Char('\n'))) >= 0) {
+            emitLine(m_pending.left(newline), out);
+            m_pending.remove(0, newline + 1);
+        }
+        if (m_pending.size() > kMaxPendingChars) {
+            finishPending(out); // never grow without bound on a newline-free stream
+        }
+        return out;
+    }
+
+private:
+    static constexpr int kMaxPendingChars = 4096;
+
+    void emitLine(const QString& raw, std::vector<Line>& out) const
+    {
+        const QString line = raw.trimmed();
+        if (!line.isEmpty()) {
+            out.push_back({m_error, line});
+        }
+    }
+
+    void finishPending(std::vector<Line>& out)
+    {
+        if (m_forward) {
+            emitLine(m_pending, out);
+        }
+        m_pending.clear();
+    }
+
+    bool m_forward = false;
+    bool m_error = false;
+    QString m_pending;
+};
+
+// Route whisper/ggml WARN + ERROR into aether.asr.whisper, leaving stderr output
+// unchanged. Called by the application only, so tests (asr_gpu_probe_test) keep
+// ggml's log. Lines are flushed synchronously only while an AsrStageTrace is
+// open. ggml-vulkan's direct std::cerr output is not captured.
+void asrInstallLogRouting();
+
+// Whether a tier of `tierSizeBytes` should load on a device with this much memory.
+// Gates only the AUTOMATIC raise to the GPU-default tier (#4972); an explicit
+// operator choice is never refused. Headroom = whisper's KV caches + compute
+// buffers: measured large-v3-turbo +268 MiB, base +152 MiB (RTX 5060, ggml-vulkan),
+// so 300 MiB. ggml-vulkan reports free == total without VK_EXT_memory_budget, so
+// total must also clear the need plus a chosen 512 MiB desktop reserve (observed
+// total-free: 367 and 791 MiB). Both figures 0 = unknown, allowed.
+inline constexpr quint64 kAsrTierVramHeadroomBytes = 300ull * 1024ull * 1024ull;
+inline constexpr quint64 kAsrTierVramDesktopReserveBytes = 512ull * 1024ull * 1024ull;
+
+inline bool asrTierFitsVram(quint64 vramFreeBytes, quint64 vramTotalBytes, qint64 tierSizeBytes)
+{
+    if (vramTotalBytes == 0 || tierSizeBytes <= 0) {
+        return true;
+    }
+    const quint64 need = static_cast<quint64>(tierSizeBytes) + kAsrTierVramHeadroomBytes;
+    return vramFreeBytes >= need && vramTotalBytes >= need + kAsrTierVramDesktopReserveBytes;
 }
 
 // A selectable transcription language: `code` is the ISO code passed to the

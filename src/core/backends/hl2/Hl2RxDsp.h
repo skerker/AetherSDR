@@ -1,17 +1,26 @@
 #pragma once
 
+#include "core/dsp/WdspSMeter.h"
+
 #include <QElapsedTimer>
 #include <QObject>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <numbers>
+#include <optional>
 #include <vector>
 
+#include "core/backends/hl2/Hl2AdcPairing.h"
 #include "core/backends/hl2/Hl2Spectrum.h"
 #include "core/dsp/WdspChannel.h"
+#include "core/dsp/WdspProcessTally.h"
 
 namespace AetherSDR::hl2 {
 
@@ -30,7 +39,7 @@ public:
     ~Hl2RxDsp() override;
 
     // WDSP's internal DSP rate. Constant at 48 kHz and independent of both the
-    // HL2 IQ rate and the audio rate — see the note in configure().
+    // HL2 IQ rate and the audio rate — see the note in buildChannel().
     static constexpr int kWdspDspSampleRateHz = 48000;
 
     // RX filter length. This is also the manual-notch resolution: WDSP's
@@ -40,6 +49,8 @@ public:
     // 200 Hz, wide enough to swallow a CW signal next to the carrier being
     // notched. Keep kMinNotchWidthHz in step if this changes — the UI offers
     // widths from it.
+    // This is the LONG length (rxFilterTapsFor): whenever a notch exists it is
+    // in force, so the advertised notch floor derives from it.
     static constexpr int kRxFilterTaps = 8192;
     static constexpr double kMinNotchWidthHz =
         1600.0 / (static_cast<double>(kRxFilterTaps) / 256.0)
@@ -47,6 +58,39 @@ public:
     static_assert(kMinNotchWidthHz <= 50.0,
                   "RX filter taps no longer allow a 50 Hz notch; the width "
                   "presets in the TNF menu assume one.");
+
+    // RX filter phase per mode (#5498): minimum phase preserves the notch
+    // floor and cuts post-unmute return from 128 to 44 ms (AGC off). CW stays
+    // linear by the ruling linked in the WDSP patch ledger. Minimum
+    // phase costs ~14 ms per filter edit on hl2-io; patch 14 frees its design
+    // scratch. See third_party/wdsp/AETHERSDR-PATCHES.md for the measurements.
+    // CW's latency is cut by length instead: rxFilterTapsFor().
+    [[nodiscard]] static constexpr bool rxMinimumPhaseFor(WdspChannel::Mode mode) noexcept
+    {
+        return mode != WdspChannel::Mode::Cwl && mode != WdspChannel::Mode::Cwu;
+    }
+
+    // RX filter length (#5578). Outside CW minimum phase already removed the
+    // delay, so length buys nothing there. In CW the length is the latency, so
+    // it runs kRxShortFilterTaps unless a notch needs the long filter's floor or
+    // the passband is under kRxShortTapsMinWidthHz; 2048 would leave a -33 dB
+    // skirt 50 Hz out (hl2_rxdsp_adaptive_taps_test measures each length).
+    // Shortening needs kRxTapsHysteresisHz of margin; currentTaps <= 0 = none.
+    static constexpr int kRxShortFilterTaps = 4096;
+    static constexpr double kRxShortTapsMinWidthHz = 100.0;
+    static constexpr double kRxTapsHysteresisHz = 20.0;
+    [[nodiscard]] static constexpr int rxFilterTapsFor(WdspChannel::Mode mode, double lowHz,
+                                                       double highHz, int notchCount,
+                                                       int currentTaps = 0) noexcept
+    {
+        if (rxMinimumPhaseFor(mode) || notchCount > 0)
+            return kRxFilterTaps;
+        const double width = highHz >= lowHz ? highHz - lowHz : lowHz - highHz;
+        const bool shortening = currentTaps <= 0 || currentTaps > kRxShortFilterTaps;
+        const double needed = kRxShortTapsMinWidthHz
+                              + (shortening && currentTaps > 0 ? kRxTapsHysteresisHz : 0.0);
+        return width >= needed ? kRxShortFilterTaps : kRxFilterTaps;
+    }
 
     struct Config {
         int inputSampleRateHz = 48000;   // HL2 IQ sample rate
@@ -72,13 +116,80 @@ public:
         double maximumAgcGainDb = 39.0;   // = slice default 65 * 0.6
         // false (live): processIq is non-blocking — real-time input paces WDSP's
         // async worker and audio flows with ~1 block latency. true: processIq
-        // waits for each output block (deterministic for a burst/offline feed).
+        // waits for each output block. That does not make a burst feed
+        // reproducible: flush_iobuffs() drains with a 1 ms timed wait, so the
+        // r1/r2 phase is fixed per channel open, not per run (#5629).
         bool blockForOutput = false;
     };
 
-    // (Re)build the WdspChannel + Hl2Spectrum for this config. Returns false (and
-    // sets error, if given) when the WDSP channel cannot be created.
+    // (Re)build the WdspChannel + Hl2Spectrum for this config, SYNCHRONOUSLY on
+    // this object's own thread. Returns false (and sets error, if given) when the
+    // WDSP channel cannot be created.
+    //
+    // Connect uses this before streaming starts. Live rate changes and added
+    // receivers use beginRebuild/buildChannel/installRebuiltChannel so WDSP
+    // setup does not hold the I/O pacer (docs/HERMES.md §22.4).
     Q_INVOKABLE bool configure(const Config& config, std::string* error = nullptr);
+
+    // Asynchronous rebuild: build off-thread, swap on-thread. MetisClient's EP2
+    // pacing, EP6 drain and every Hl2RxDsp share one I/O thread, so a build on
+    // it would stall every receiver and stop EP2, which the gateware watchdog
+    // answers by halting the stream (docs/HERMES.md §20.8). Same trio as
+    // AnanRxDsp: build first, disturb the session second.
+
+    // What buildChannel() produced. Move-only (owns two unique_ptrs) and free
+    // of any reference to the Hl2RxDsp it will be installed into, which is what
+    // makes it safe to carry between threads.
+    struct RebuildResult {
+        std::unique_ptr<WdspChannel> channel;
+        std::unique_ptr<Hl2Spectrum> spectrum;
+        std::size_t outputBlockSize = 0;
+        // The Config this was actually built for. installRebuiltChannel() takes
+        // the GEOMETRY from here (rate, block size, FFT size) because that is
+        // what the new channel physically is, and leaves the operator-facing
+        // fields to m_config, which may have moved while the build ran.
+        Config built;
+        // The noise-blanker request the channel was OPENED with, so
+        // installRebuiltChannel() can tell whether the operator moved it
+        // mid-build and needs a live push after the swap.
+        WdspChannel::NoiseBlanker builtNbKind = WdspChannel::NoiseBlanker::Off;
+        int builtNbLevel = 50;
+        WdspChannel::NoiseBlankerFill builtNbFill =
+            WdspChannel::NoiseBlankerFill::Zero;
+        std::string error;   // set iff channel == nullptr
+    };
+
+    // The slow half of configure() (OpenChannel, FFTW planning) with nothing of
+    // `this` in it, so it may run on another thread while the installed channel
+    // keeps producing audio. The blanker triple is passed in because the channel
+    // is opened with it; the caller snapshots it on this object's thread inside
+    // beginRebuild()'s turn.
+    [[nodiscard]] static RebuildResult buildChannel(
+        const Config& config, WdspChannel::NoiseBlanker noiseBlanker,
+        int noiseBlankerLevel, WdspChannel::NoiseBlankerFill noiseBlankerFill);
+
+    // Marks a rebuild in flight and seeds the operator-facing half of m_config
+    // from the build's snapshot. Call on this object's thread BEFORE the build.
+    // While a rebuild is in flight, control verbs update mirrors only: pushing
+    // to WDSP would block this I/O thread on WdspChannel.cpp's process-wide
+    // g_setupMutex, which the build holds. installRebuiltChannel() re-applies
+    // them. Geometry fields (rates, block and FFT size) are left alone because
+    // they describe the still-running channel until the swap. Counted, not a
+    // flag: two rebuilds can be outstanding at once.
+    Q_INVOKABLE void beginRebuild(const Config& config);
+
+    // Give up on a rebuild that will never be installed — it failed, or a newer
+    // one superseded it. Balances beginRebuild(); touches nothing else, so the
+    // running channel and every mirror are exactly as they were.
+    Q_INVOKABLE void abandonRebuild();
+
+    // Swap a built RebuildResult in as the active channel, on this object's
+    // thread. Not Q_INVOKABLE: RebuildResult is move-only and moc's dispatch
+    // copy-constructs by-value arguments. Returns false, leaving the current
+    // channel untouched, if result.channel is null. Always balances
+    // beginRebuild().
+    bool installRebuiltChannel(RebuildResult result);
+
     Q_INVOKABLE void setMode(WdspChannel::Mode mode);
     Q_INVOKABLE void setFilter(double lowHz, double highHz);
     // Runtime AGC change. agcMode is the WDSP RXA AGC mode; maximumGainDb is
@@ -90,89 +201,205 @@ public:
     // slice inside the passband without moving the DDC. Kept in m_config so a
     // later reconfigure() rebuilds the channel with the operator's offset.
     Q_INVOKABLE void setShift(double shiftHz);
-    // Cap how often a panadapter frame is produced, in frames per second.
-    //
-    // The FFT is SKIPPED entirely when a frame is not due, which is the whole
-    // point: this backend's natural frame rate is the IQ sample rate over the
-    // FFT size — 48000/1024 = 47 fps at the narrowest span but 384000/1024 =
-    // 375 fps at the widest — so the display rate used to track the operator's
-    // ZOOM rather than their Display->FFT FPS slider, and widening the span
-    // multiplied the render load eightfold.
-    //
-    // Limiting HERE rather than downstream is what makes it cheap. At 384 kHz
-    // and a 25 fps target this skips ~93% of the FFTs and the 1024-bin
-    // magnitude/log pass behind each one; coalescing the frames after the fact
-    // would compute every one of them and then spend MORE cpu combining them.
-    //
-    // fps <= 0 removes the cap. The rate is applied on a wall clock, so it
-    // holds across a sample-rate change without needing to be recomputed.
+    // Cap panadapter frames per second; fps <= 0 removes the cap. The FFT is
+    // skipped when a frame is not due: the natural rate is IQ rate / FFT size
+    // (47 fps at 48 kHz, 375 fps at 384 kHz), so limiting here rather than
+    // downstream saves the FFT work. Wall-clock based, so it holds across a
+    // sample-rate change.
     Q_INVOKABLE void setSpectrumRateFps(int fps);
 
-    // Impulse noise blanker, on the raw IQ ahead of the demodulator.
-    //
-    // THE ONLY NOISE BLANKER THIS RADIO HAS. The HL2 ships raw IQ and runs no
-    // firmware DSP, so — exactly like the manual notch — this either happens on
-    // this host or it does not happen at all. That is why the NB button is
-    // visible on a radio that reports hasRadioSideDsp = false.
-    //
-    // Runs inside WdspChannel::processIq(), on the wire samples, immediately
-    // ahead of fexchange2. Placement is not a style choice: an impulse is
-    // narrow in time and wide in frequency, and once the bandpass has spread it
-    // over milliseconds there is no spike left to remove.
-    //
-    // ON THE AUDIO PATH ONLY. processIqBlock() feeds the panadapter from its
-    // own conjugated copy BEFORE it reaches the channel, so the spectrum and
-    // waterfall show UNBLANKED IQ. That is deliberate — the display is a
-    // measurement of what is on the air and blanking it would hide the very
-    // impulses the operator is deciding whether to blank — but it is a visible
-    // difference from a Flex, which blanks in its own DDC upstream of both.
-    // If that ever needs to change, the stage moves up here rather than gaining
-    // a second copy inside the channel.
-    //
-    // `level` is 0..100, larger being more aggressive; WdspChannel owns the map
-    // onto WDSP's inverted threshold.
-    //
-    // Held OUTSIDE Config, like the shift and the notch set and for the same
-    // reason: configure() REPLACES m_config, so a rate change carrying a
-    // caller's default would switch the blanker off while the operator's NB
-    // button stayed lit. Anything that must outlive a rebuild lives in its own
-    // member and is re-applied at the end of configure().
-    Q_INVOKABLE void setNoiseBlanker(bool on, int level);
+    // Panadapter averaging: the operator's FFT AVG as a time constant in ms
+    // (0 = none) and the weighted toggle as the averaging domain (true =
+    // log-recursive, false = power); see Hl2Spectrum. Held here, not in Config,
+    // and re-applied in installChannel(): every zoom builds a fresh Hl2Spectrum.
+    Q_INVOKABLE void setSpectrumAverageMs(int ms);
+    Q_INVOKABLE void setSpectrumLogAverage(bool on);
+    // The NCO moved: forget the running average and the held partial window, so
+    // old-axis IQ does not ghost across the new axis. Not a transport gap, which
+    // keeps the average (see Hl2Spectrum::reset()).
+    Q_INVOKABLE void dropSpectrumAverage();
+    // What the installed spectrum is actually running, for tests. DSP thread.
+    [[nodiscard]] double spectrumAverageMsApplied() const noexcept
+    {
+        return m_spectrum ? m_spectrum->averageTimeMs() : -1.0;
+    }
+    [[nodiscard]] bool spectrumLogAverageApplied() const noexcept
+    {
+        return m_spectrum && m_spectrum->logAverage();
+    }
+
+    // Impulse noise blankers, the HL2's only ones (no firmware DSP), so NB is
+    // shown even with hasRadioSideDsp = false; at most one of the two runs. Runs
+    // in WdspChannel::processIq() on the wire samples ahead of fexchange2, before
+    // the bandpass smears the impulse. Audio path only: the panadapter shows
+    // unblanked IQ (a Flex blanks both). `level` 0..100, larger is more
+    // aggressive. Held outside Config because configure() replaces m_config; it
+    // is re-applied after every rebuild.
+    Q_INVOKABLE void setNoiseBlanker(WdspChannel::NoiseBlanker kind, int level,
+                                     WdspChannel::NoiseBlankerFill fill);
+    // Receive squelch; `level` is the slice model's 0..100. WdspChannel owns the
+    // per-mode routing and re-applies it on setMode(). Held outside Config, like
+    // the blanker, and re-applied by installChannel(). A change the channel
+    // refuses (a control operation in flight) is marked pending and retried at
+    // the top of each processIqBlock() until it is taken; see squelchPending().
+    // `levelOffsetDb` refers the level map to the LNA:
+    // Hl2DbReference::levelSquelchOffsetDb().
+    Q_INVOKABLE void setSquelch(bool on, int level, double levelOffsetDb);
+    [[nodiscard]] bool squelchPending() const noexcept { return m_squelchPending; }
+    [[nodiscard]] bool squelchEnabled() const noexcept { return m_squelchOn; }
+    [[nodiscard]] int squelchLevel() const noexcept { return m_squelchLevel; }
+    [[nodiscard]] double squelchLevelOffsetDb() const noexcept { return m_squelchOffsetDb; }
+    // What the channel last WROTE to WDSP (stage, run flags, threshold), or
+    // nullopt before configure(). Forwarded, not mirrored, for the reason
+    // channelConfig() gives below. The record itself is a by-value snapshot
+    // safe from any thread; m_channel is not, so call this on this object's
+    // thread.
+    [[nodiscard]] std::optional<WdspChannel::AppliedSquelch> appliedSquelch() const
+    {
+        if (!m_channel)
+            return std::nullopt;
+        return m_channel->appliedSquelch();
+    }
+
     // What the operator ASKED for. Survives configure() and is what a rebuild
     // re-applies.
-    [[nodiscard]] bool noiseBlankerEnabled() const { return m_nbOn; }
+    [[nodiscard]] bool noiseBlankerEnabled() const
+    {
+        return m_nbKind != WdspChannel::NoiseBlanker::Off;
+    }
+    [[nodiscard]] WdspChannel::NoiseBlanker noiseBlankerKind() const { return m_nbKind; }
     [[nodiscard]] int noiseBlankerLevel() const { return m_nbLevel; }
-    // What the WDSP stage ACTUALLY has, which is not the same question. The
-    // request crosses a queued connection to get here and WdspChannel can
-    // refuse it outright (a control operation already in flight), so a readback
-    // that reported the request back would be certifying its own input.
-    //
-    // ATOMIC because these two are the only members of this class read from
-    // OUTSIDE its thread: Hl2Backend answers the bridge's `hl2 nb.get` from the
-    // GUI thread while this object lives on the I/O thread. Relaxed is enough —
-    // they are independent scalars and nothing is ordered against them.
+    [[nodiscard]] WdspChannel::NoiseBlankerFill noiseBlankerFill() const
+    {
+        return m_nbFill;
+    }
+    // What the WDSP stage actually applied: the request crosses a queued
+    // connection and WdspChannel can refuse it. Atomic (relaxed) because
+    // Hl2Backend reads these from the GUI thread for `hl2 nb.get`.
     [[nodiscard]] bool appliedNoiseBlankerEnabled() const
     {
-        return m_nbAppliedOn.load(std::memory_order_relaxed);
+        return appliedNoiseBlankerKind() != WdspChannel::NoiseBlanker::Off;
+    }
+    [[nodiscard]] WdspChannel::NoiseBlanker appliedNoiseBlankerKind() const
+    {
+        return m_nbAppliedKind.load(std::memory_order_relaxed);
     }
     [[nodiscard]] int appliedNoiseBlankerLevel() const
     {
         return m_nbAppliedLevel.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] WdspChannel::NoiseBlankerFill appliedNoiseBlankerFill() const
+    {
+        return m_nbAppliedFill.load(std::memory_order_relaxed);
+    }
 
-    // ── Manual notch filters ──────────────────────────────────────────────
+    // AGC-off level and CW APF: held outside Config (configure() replaces it)
+    // and re-applied by installChannel(), pushed only when canPushToChannel().
     //
-    // `index` is WDSP's POSITIONAL handle, and Hl2Backend is what maps stable
-    // notch ids onto it — this class just does as it is told, in the order it
-    // is told, so the two stay in step across every receiver.
-    //
-    // Centres are ABSOLUTE RF Hz. setNotchTuneFrequency() must follow the NCO,
-    // or the notches stay where the NCO used to be.
-    //
-    // The set is MIRRORED here as well as in WDSP, because reconfigure()
-    // destroys the notch database along with the channel. Without the copy, an
-    // operator's notches vanish on a sample-rate change — the same reason the
-    // shift is kept.
+    // AGC-off level 0..100 -> WDSP fixed gain: 10 + 0.6 * (level - 10) dB, so
+    // the default level 10 is exactly WDSP's 10 dB channel default, and the
+    // slope matches the AGC-T threshold's 0.6 dB/unit. Not referred to the LNA
+    // gain: with AGC off the operator rides RF gain against overload.
+    static constexpr double kAgcFixedGainDbPerUnit = 0.6;
+    static constexpr int kDefaultAgcOffLevel = 10;           // SliceModel::m_agcOffLevel
+    static constexpr double kDefaultAgcFixedGainDb = 10.0;   // WdspChannel::Config
+    [[nodiscard]] static double agcFixedGainDbForOffLevel(int level) noexcept
+    {
+        return kDefaultAgcFixedGainDb
+               + static_cast<double>(std::clamp(level, 0, 100) - kDefaultAgcOffLevel)
+                     * kAgcFixedGainDbPerUnit;
+    }
+    // WDSP applies the fixed gain only in AGC mode 0 (wcpAGC.c xwcpagc), so
+    // this is safe in any mode and audible exactly when AGC is Off.
+    Q_INVOKABLE void setAgcOffLevel(int level);
+    [[nodiscard]] int agcOffLevel() const noexcept { return m_agcOffLevel; }
+
+    // APF level 0..100 -> the peak's bandwidth (the UI labels it "APF
+    // bandwidth", higher = narrower): 200 Hz at 0 halving every 50 units, so
+    // the default 50 is RXA.c's own 100 Hz. Gain stays at RXA.c's linear 2.0,
+    // so the slider changes selectivity, not loudness.
+    static constexpr double kApfWidestBandwidthHz = 200.0;
+    static constexpr double kApfGain = 2.0;          // RXA.c create_apfshadow
+    static constexpr int kDefaultApfLevel = 50;      // SliceModel::m_apfLevel
+    [[nodiscard]] static double apfBandwidthHzForLevel(int level) noexcept
+    {
+        const double units = static_cast<double>(std::clamp(level, 0, 100));
+        return kApfWidestBandwidthHz * std::pow(2.0, -units / 50.0);
+    }
+    [[nodiscard]] static constexpr bool isCwMode(WdspChannel::Mode mode) noexcept
+    {
+        return mode == WdspChannel::Mode::Cwl || mode == WdspChannel::Mode::Cwu;
+    }
+    // centerHz is the CW pitch in audio Hz (the backend owns it). The stage
+    // runs only in CWL/CWU; the request is held through other modes and
+    // setMode() re-evaluates it.
+    Q_INVOKABLE void setApf(bool on, int level, double centerHz);
+    [[nodiscard]] bool apfRequested() const noexcept { return m_apfOn; }
+    [[nodiscard]] int apfLevel() const noexcept { return m_apfLevel; }
+    [[nodiscard]] double apfCenterHz() const noexcept { return m_apfCenterHz; }
+    [[nodiscard]] bool apfInCircuit() const noexcept
+    {
+        return m_apfOn && isCwMode(m_config.mode);
+    }
+
+    // Post-DDC half of the ADC pairing (docs/HERMES.md §13 item 16;
+    // Hl2AdcPairing.h). WDSP's RXA_ADC_PK in dB re wire full scale, not
+    // calibrated to the antenna. adcmeter runs first in xrxa, after the shift
+    // and input resampler, so it measures this one slice at
+    // kWdspDspSampleRateHz before filtering, demod or AGC. Sampled on the DSP
+    // thread after each processed block; atomic (relaxed) for the GUI-thread
+    // healthSnapshot(). nullopt until a block has been processed.
+    [[nodiscard]] std::optional<double> adcPeakDbfs() const
+    {
+        const float v = m_adcPeakDbfs.load(std::memory_order_relaxed);
+        if (!std::isfinite(v)) {
+            return std::nullopt;
+        }
+        return static_cast<double>(v);
+    }
+    // Raw steady_clock stamp of the adcPeakDbfs() reading, for
+    // SliceSamplingGate, which must compare it against its resume request.
+    // Stored only on the unmuted path of processIqBlock(), so a stamp later than
+    // the request proves the unmute was applied. 0 = never processed.
+    [[nodiscard]] std::int64_t adcPeakObservedAtNs() const noexcept
+    {
+        return m_adcPeakAtNs.load(std::memory_order_relaxed);
+    }
+    // Age of the adcPeakDbfs() reading; it stops advancing when IQ stops or the
+    // chain is muted for TX. Feeds Hl2AdcPairing.h's freshness input
+    // (kSliceStaleMs) so a held slice peak isn't paired with a live flag.
+    [[nodiscard]] std::optional<std::int64_t> adcPeakObservedAgoMs() const
+    {
+        const std::int64_t at = m_adcPeakAtNs.load(std::memory_order_relaxed);
+        if (at == 0) {
+            return std::nullopt;
+        }
+        const std::int64_t ago = (steadyNowNs() - at) / 1'000'000;
+        return ago < 0 ? 0 : ago;
+    }
+
+    // Every processIq() outcome, counted since construction (WdspProcessTally.h).
+    // `Underrun` is separate from the faults: it is normal while the async output
+    // side fills. Monotonic across rebuilds, since a rebuild is when a fault is
+    // most likely. Safe to call from the GUI thread.
+    [[nodiscard]] WdspProcessTally::Counts processTally() const noexcept
+    {
+        return m_processTally.snapshot();
+    }
+
+    // Partial FFT windows discarded at a transport discontinuity (including
+    // accepted rewinds and duplicates; empty windows don't count). Monotonic for
+    // this object's lifetime, across configure(). Independent of droppedPackets.
+    // Written on the I/O thread, read relaxed on the GUI thread.
+    [[nodiscard]] quint64 spectrumGapDiscards() const noexcept
+    {
+        return m_spectrumGapDiscards.load(std::memory_order_relaxed);
+    }
+
+    // Manual notches. `index` is WDSP's positional handle; Hl2Backend maps stable
+    // ids onto it. Centres are absolute RF Hz, so setNotchTuneFrequency() must
+    // follow the NCO. The set is mirrored here because a rebuild destroys WDSP's
+    // notch database.
     Q_INVOKABLE void addNotch(int index, double centerHz, double widthHz, bool active);
     Q_INVOKABLE void editNotch(int index, double centerHz, double widthHz, bool active);
     Q_INVOKABLE void removeNotch(int index);
@@ -188,20 +415,49 @@ public:
     // index map depends on it — so both are exposed for the test that pins it.
     [[nodiscard]] int notchCount() const;
     [[nodiscard]] int wdspNotchCount() const;
+    // The RX filter length and notch-width floor the live channel is running
+    // (0 without one). Read back from the channel, not from the policy, so a
+    // test of the wiring cannot agree with itself.
+    [[nodiscard]] int rxFilterTapsInForce() const;
+    [[nodiscard]] double minimumNotchWidthInForceHz() const;
+    // TEST ONLY: treat every filter-length change as refused, as setFilterTaps()
+    // refuses one that loses beginControlOperation(). That race cannot be built
+    // on one thread, and refusing at WdspChannel would refuse the notch too.
+    void setRefuseFilterTapsChangesForTest(bool on) noexcept { m_refuseFilterTapsForTest = on; }
 
-    // Mute the DEMODULATOR while transmitting.
-    //
-    // Suppressing audio further downstream is not enough: this pipeline keeps
-    // demodulating our own transmission, WDSP's filters and buffers fill with
-    // it, and the moment the mute lifts that backlog drains to the speakers —
-    // heard as the tail end of a transmission playing back after unkey.
-    //
-    // Muted, the SPECTRUM still runs on real IQ so the panadapter keeps
-    // updating, but the audio channel is clocked with SILENCE. The pipeline
-    // therefore stays running at constant latency and contains nothing but
-    // silence when transmit ends.
+    // Mute the demodulator while transmitting. The spectrum keeps running on
+    // real IQ, but the audio channel is clocked with silence so WDSP's buffers
+    // never fill with our own transmission and drain it to the speakers at
+    // unkey.
     Q_INVOKABLE void setAudioMuted(bool muted);
+    // The applied mute state, not the request: Hl2Backend posts setAudioMuted()
+    // across threads, so its own m_rxAudioMuted is only a request (#5497). Read
+    // on the DSP thread, where setAudioMuted() runs.
+    [[nodiscard]] bool isAudioMuted() const noexcept { return m_audioMuted; }
     [[nodiscard]] bool isConfigured() const noexcept { return m_channel != nullptr; }
+
+    // What the WDSP channel was actually OPENED WITH, for the read-back verb.
+    //
+    // Forwarded from WdspChannel rather than mirrored here, for the same reason
+    // appliedNoiseBlankerEnabled() reads the applied value: a read-back that
+    // returned this class's own copy of the request would be certifying its own
+    // input. Null when no channel exists, which the caller must report as
+    // "not configured" rather than as zeros.
+    [[nodiscard]] const WdspChannel::Config* channelConfig() const noexcept
+    {
+        return m_channel ? &m_channel->config() : nullptr;
+    }
+    // Test only: forwards WdspChannel::refuseControlOperationsForTest() to the
+    // current channel, so the squelch retry path can be driven offline.
+    void refuseChannelControlForTest(unsigned count) noexcept
+    {
+        if (m_channel)
+            m_channel->refuseControlOperationsForTest(count);
+    }
+    [[nodiscard]] std::size_t channelOutputBlockSize() const noexcept
+    {
+        return m_channel ? m_channel->outputBlockSize() : 0;
+    }
 
     // The WDSP channel id this chain was actually given, or -1 before configure().
     //
@@ -211,53 +467,16 @@ public:
     // index-space map (Hl2Receivers.h) precisely so nothing has to derive it.
     [[nodiscard]] int wdspChannelId() const noexcept
     {
-        return m_channel ? m_channel->channelIdForTest() : -1;
+        return m_channel ? m_channel->channelId() : -1;
     }
 
-    // Demodulated-audio DC blocker, one pole per channel.
-    //
-    // WDSP's AM/SAM detector is an ENVELOPE detector — amd.c emits
-    // sqrt(I^2 + Q^2), which is strictly non-negative — so the carrier arrives
-    // as a DC pedestal. Nothing upstream removes it:
-    //
-    //   * `levelfade` (ON by default, RXA.c) computes
-    //     `audio += dc_insert - dc` from an 8 Hz-corner and a 0.11 Hz-corner
-    //     average. That cancels FADING and deliberately holds the pedestal at
-    //     the long-term carrier level; it is not a DC blocker.
-    //   * The AM/SAM passband is symmetric about the carrier ({-4000, +4000}
-    //     in Hl2Backend::defaultPassbandForMode) because both detectors need
-    //     it that way, which puts 0 Hz mid-band.
-    //
-    // Left in, the pedestal eats output headroom and skews every
-    // zero-referenced consumer downstream — the WAVE applet draws `peak` and
-    // `rms`, both magnitudes, mirrored about a hard centreline, so a DC-shifted
-    // trace renders as a second inverted phantom copy of itself in the lower
-    // half.
-    //
-    // SCOPE: this runs on WdspChannel's OUTPUT, downstream of the whole RXA
-    // chain, so it fixes the audio we deliver but NOT what WDSP itself saw.
-    // wcpAGC sits after amd INSIDE RXA and still rides the pedestal; correcting
-    // that would need DC removal between the two, which WDSP exposes no hook
-    // for. Turning `levelfade` off does not help either — it only stops the
-    // fade correction, leaving sqrt(I^2+Q^2) just as non-negative.
-    //
-    // WHY HERE AND NOT IN WdspChannel: the root cause is amd's envelope
-    // detector, which belongs to WDSP, so a blocker on WdspChannel's own RX
-    // output would fix it once for every future consumer instead of per caller.
-    // Hl2RxDsp is the only WDSP RECEIVE consumer in the tree today — Hl2TxDsp is
-    // the one other user and is transmit-only — so per-caller costs nothing yet.
-    // It does mean the next WDSP RX path added will NOT inherit this: whoever
-    // adds one should push the blocker down into WdspChannel rather than repeat
-    // it here.
-    //
-    // Applied to EVERY mode rather than switched on for AM/SAM: SSB, CW and
-    // the digital modes are already zero-mean so it is a no-op there, FM wants
-    // it for the same reason AM does, and an unconditional filter has no
-    // mode-change state that can be got wrong.
-    //
-    // Public, with the pole helper below, so hl2_am_dcblock_test can pin the
-    // unconfigured bypass and the rate-dependent corner directly. Neither is
-    // reachable through configure(), which only ever hands it a valid rate.
+    // Demodulated-audio DC blocker, one pole per channel. WDSP's AM/SAM
+    // detector (amd.c) emits sqrt(I^2 + Q^2), so the carrier arrives as a DC
+    // pedestal; `levelfade` holds it rather than removing it, and the symmetric
+    // AM passband puts 0 Hz mid-band. It runs on WdspChannel's output, so wcpAGC
+    // inside RXA still rides the pedestal. Applied to every mode (a no-op on
+    // zero-mean audio). A future WDSP RX consumer should move this into
+    // WdspChannel. Public for hl2_am_dcblock_test.
     struct DcBlocker {
         float r = 0.0f;    // pole radius, set by configure(); <= 0 bypasses
         float x1 = 0.0f;
@@ -304,27 +523,102 @@ public slots:
     // frame and audioReady/meterUpdate per completed WdspChannel block.
     void processIqBlock(const std::vector<std::complex<float>>& iq);
 
+    // An EP6 sequence gap precedes the next block. Called by DirectConnection on
+    // this object's I/O thread. Discards the partial panadapter frame so no FFT
+    // spans the discontinuity (see Hl2Spectrum::reset()). The audio path is left
+    // alone: dropping buffered samples would lengthen the hole, and resetting
+    // WDSP would restart filter and AGC state on one lost datagram.
+    void onSequenceGap();
+
 signals:
     void audioReady(const std::vector<float>& stereoPcm);   // interleaved L,R
     void spectrumReady(const std::vector<float>& binsDbfs); // DC-centred dBFS
     void meterUpdate(float dbfs);                           // audio-RMS S-meter
 
 private:
+    // Pushes rxMinimumPhaseFor(m_config.mode) to the live channel. Only
+    // called where the control verbs may reach it (setMode, installChannel).
+    void applyMinimumPhaseForMode();
+    // Pushes rxFilterTapsFor(mode, passband, notchCount) to the live channel;
+    // notchCount is passed so addNotch() can raise for the notch it is about to
+    // add. hysteresisFromTaps (> 0) is the length the hysteresis is measured
+    // from, for a fresh channel replacing one; 0 means the length in force.
+    // Returns whether the wanted length is in force afterwards.
+    bool applyFilterTaps(int notchCount, int hysteresisFromTaps = 0);
+    // One attempt to put the squelch request on the channel; marks it pending
+    // on refusal. Caller has checked canPushToChannel().
+    void pushSquelchToChannel();
+    // Push the held APF request / AGC-off level at the live channel. Callers
+    // check canPushToChannel() first. Refusals are logged and the request is
+    // kept, so the next install re-applies it.
+    void applyApf();
+    void applyAgcOffLevel();
     // True when the next panadapter frame may be computed. Stays true until one
     // actually completes, since a frame spans several EP6 blocks.
     bool spectrumFrameDue();
 
+    // The shared install step: resize the scratch buffers, recompute the DC
+    // blocker, re-apply everything Config does not carry (shift, the notch set,
+    // the noise blanker, the blanker hold, the squelch, the AGC-off level, the
+    // APF) and take ownership of the new channel/spectrum. configure() and
+    // installRebuiltChannel() both end here so a second copy of that list
+    // cannot drift and lose one of them.
+    void installChannel(RebuildResult result);
+    // Arm m_meterTap from the current geometry. One site for the arithmetic,
+    // called on the mute's release edge and on a channel install so the two
+    // cannot drift apart. DSP thread only.
+    void armMeterSettle();
+
+    // May a control verb push at m_channel now? False while a rebuild is
+    // outstanding (see beginRebuild()). True inside installChannel() even then,
+    // because the install's re-application goes through these same verbs.
+    [[nodiscard]] bool canPushToChannel() const noexcept
+    {
+        return m_channel && (m_installing || m_rebuildsInFlight == 0);
+    }
+    int m_rebuildsInFlight = 0;
+    bool m_installing = false;
+
     std::unique_ptr<WdspChannel> m_channel;
     std::unique_ptr<Hl2Spectrum> m_spectrum;
     double m_shiftHz = 0.0;   // current slice offset from the NCO, Hz
+    // The operator's panadapter averaging; see setSpectrumAverageMs().
+    int m_spectrumAverageMs = 0;
+    bool m_spectrumLogAverage = false;
     // Noise-blanker state, kept out of m_config so configure() cannot clear it.
-    // m_nbOn/m_nbLevel are the REQUEST; m_nbApplied* are what the WDSP stage
-    // took. They diverge exactly when something went wrong, which is the whole
-    // reason the bridge readback reports the applied pair.
-    bool m_nbOn = false;
+    // m_nbKind/m_nbLevel/m_nbFill are the REQUEST; m_nbApplied* are what the
+    // WDSP stage took. They diverge exactly when something went wrong, which is
+    // the whole reason the bridge readback reports the applied set.
+    WdspChannel::NoiseBlanker m_nbKind = WdspChannel::NoiseBlanker::Off;
     int  m_nbLevel = 50;      // 0..100, the slice model's units
-    std::atomic<bool> m_nbAppliedOn {false};
+    // Squelch request — see setSquelch(). Defaults mirror SliceModel's.
+    bool m_squelchOn = false;
+    int  m_squelchLevel = 20;
+    double m_squelchOffsetDb = 0.0;
+    // True while the channel has refused the current request; see setSquelch().
+    bool m_squelchPending = false;
+    WdspChannel::NoiseBlankerFill m_nbFill = WdspChannel::NoiseBlankerFill::Zero;
+    std::atomic<WdspChannel::NoiseBlanker> m_nbAppliedKind
+        {WdspChannel::NoiseBlanker::Off};
     std::atomic<int>  m_nbAppliedLevel {50};
+    std::atomic<WdspChannel::NoiseBlankerFill> m_nbAppliedFill
+        {WdspChannel::NoiseBlankerFill::Zero};
+    // AGC-off level and APF, kept out of m_config for the same reason; see
+    // setAgcOffLevel()/setApf(). Requests, in the slice model's units.
+    int m_agcOffLevel = kDefaultAgcOffLevel;
+    bool m_apfOn = false;
+    int m_apfLevel = kDefaultApfLevel;
+    double m_apfCenterHz = 600.0;
+    // Latest RXA_ADC_PK and when it was taken; see adcPeakDbfs() above. NaN and
+    // 0 are the "never observed" sentinels, which is why neither is a value the
+    // accessors can return. A steady_clock stamp rather than a QElapsedTimer
+    // because a QElapsedTimer's members are not atomic and this is read from
+    // another thread.
+    std::atomic<float> m_adcPeakDbfs {std::numeric_limits<float>::quiet_NaN()};
+    std::atomic<std::int64_t> m_adcPeakAtNs {0};
+    // See spectrumGapDiscards(). Written on the I/O thread by onSequenceGap(),
+    // read from the GUI thread by Hl2Backend::healthSnapshot().
+    std::atomic<quint64> m_spectrumGapDiscards {0};
     Config m_config;
 
     // Notch set, mirrored so reconfigure() can replay it — see the note on
@@ -337,10 +631,22 @@ private:
         bool active = true;
     };
     std::vector<Notch> m_notches;
+    bool m_refuseFilterTapsForTest = false;
     bool m_notchesEnabled = true;
     double m_notchTuneHz = 0.0;
 
+    // Per-outcome counters for m_channel->processIq(); see processTally().
+    // Written on the DSP thread in processIqBlock(), read from the GUI thread.
+    WdspProcessTally m_processTally;
+
     bool m_audioMuted = false;
+    // The S-meter tap's gate — the settle window after the channel starts
+    // being fed real IQ again, and the read cadence — see the settle note in
+    // processIqBlock() and WdspSMeter.h. Armed on the mute's release edge and
+    // on a channel swap, ticked once per block that WDSP actually completes,
+    // and only on the unmuted path, so it measures the same clock the meter
+    // itself integrates on. DSP thread only, like m_audioMuted.
+    WdspSMeterTap m_meterTap;
     // Panadapter frame-rate cap. 0 = uncapped. m_spectrumClock is started on
     // the first block and only read/written on the DSP thread.
     int m_spectrumIntervalMs = 0;

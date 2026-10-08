@@ -6,18 +6,10 @@
 
 namespace AetherSDR {
 
-// Downward expander / noise gate — TX DSP chain Phase 2 (#1661).  The
-// same DSP core covers both behaviours: a low ratio with a shallow range
-// gives gentle expansion that preserves natural decay, while a high ratio
-// with a deep range gives a hard gate that slams shut below threshold.
-// The Mode setter snaps ratio + range to preset pairs so the UI can
-// offer a one-click Expander ↔ Gate toggle without hiding the underlying
-// knobs from power users.
-//
-// Thread model mirrors ClientComp: UI thread writes via set*() which
-// update atomics + bump a version counter; the audio thread reads the
-// version once per block and recaches values.  No locks, no allocations
-// in process(), no exceptions.
+// Downward expander / noise gate (#1661): low ratio + shallow range = gentle
+// expansion, high ratio + deep range = hard gate. The Mode setter snaps ratio +
+// range to preset pairs. UI thread writes atomics + bumps a version; the audio
+// thread recaches once per block. No locks, allocations or exceptions.
 class ClientGate {
 public:
     enum class Mode : uint8_t {
@@ -31,7 +23,8 @@ public:
     ClientGate(const ClientGate&)            = delete;
     ClientGate& operator=(const ClientGate&) = delete;
 
-    // Main thread — call before first process() and on sample-rate change.
+    // Audio owner — call before first process() and on sample-rate change.
+    // Never call concurrently with process(); parameter setters remain atomic.
     void prepare(double sampleRate);
 
     // Main thread — global enable / bypass. Lock-free.
@@ -48,6 +41,10 @@ public:
     float thresholdDb() const noexcept;
     void  setRatio(float ratio) noexcept;          // 1.0 (off) .. 10.0 (hard gate)
     float ratio() const noexcept;
+    // Fixed at kAttackMs; no surface exposes it. Past a few ms attack chews word
+    // onsets, and Peek (lookahead) is the control that protects them. The setter
+    // remains for the per-slice mirror in RxClientEffects.
+    static constexpr float kAttackMs = 1.0f;
     void  setAttackMs(float ms) noexcept;          // 0.1 .. 100 ms
     float attackMs() const noexcept;
     void  setReleaseMs(float ms) noexcept;         // 5 .. 2000 ms
@@ -75,7 +72,12 @@ public:
     float gainReductionDb() const noexcept;   // ≤ 0 dB (attenuation)
     bool  gateOpen() const noexcept;          // true when signal is above threshold
 
-    double sampleRate() const noexcept { return m_sampleRate; }
+    // Audio owner: mirror a presented auxiliary source into UI-facing meters.
+    // Copies atomic snapshots only; parameters and processing histories stay local.
+    void copyMeteringFrom(const ClientGate& source) noexcept;
+
+    double sampleRate() const noexcept
+    { return m_sampleRate.load(std::memory_order_relaxed); }
 
 private:
     struct Atomics {
@@ -83,7 +85,7 @@ private:
         std::atomic<uint8_t>  mode{static_cast<uint8_t>(Mode::Expander)};
         std::atomic<float>    thresholdDb{-40.0f};
         std::atomic<float>    ratio{2.0f};
-        std::atomic<float>    attackMs{0.5f};
+        std::atomic<float>    attackMs{kAttackMs};
         std::atomic<float>    releaseMs{100.0f};
         std::atomic<float>    holdMs{20.0f};
         std::atomic<float>    floorDb{-15.0f};
@@ -114,7 +116,8 @@ private:
     void recacheIfDirty() noexcept;
     float staticCurveGainDb(float envDb) const noexcept;
 
-    double   m_sampleRate{24000.0};
+    // Audio owner writes in prepare(); UI reads the displayed processing rate.
+    std::atomic<double> m_sampleRate{24000.0};
     Atomics  m_atomics;
     Cached   m_cached;
     Meters   m_meters;

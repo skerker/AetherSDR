@@ -1,10 +1,14 @@
 #include "asr/WhisperAsrBackend.h"
 
+#include "asr/AsrStageTrace.h"
+
 #include <QFileInfo>
 #include <QLoggingCategory>
 #include <QThread>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <exception>
 #include <mutex>
 #include <set>
@@ -21,6 +25,10 @@ namespace AetherSDR {
 Q_LOGGING_CATEGORY(lcAsrWhisper, "aether.asr.whisper")
 
 namespace {
+// Set when the first model load begins; read by the whisper/ggml log callback.
+// See asrLibLogCallback for why stderr treats DEBUG differently after it.
+std::atomic<bool> g_asrModelLoadBegun{false};
+
 // Whisper is chunk-based; on HF audio a single over is well under 30 s, so we
 // cap inference threads modestly to leave the box responsive (esp. on a Pi).
 int chooseThreadCount()
@@ -32,25 +40,12 @@ int chooseThreadCount()
     return std::clamp(hw, 1, 4);
 }
 
-// Whether this host may enumerate Metal at all.
-//
-// The hazard being avoided is #4535: Apple's *runtime* shader compiler
-// (newLibraryWithSource) can live-lock on Intel-GPU Macs — measured at no
-// completion in 75 minutes on a Radeon Pro 560X — and ggml reaches it from
-// plain device enumeration. So on a build that embeds the shader SOURCE, Intel
-// Macs must not enumerate Metal: the first ggml touch would hang the caller.
-//
-// A build that embeds a precompiled .metallib (AETHER_ASR_METAL_PRECOMPILED,
-// the default and what every release ships) cannot reach that compiler at all,
-// so the gate is not needed and is not applied — an Intel Mac gets whatever
-// Metal device ggml enumerates, and ggml's own per-op capability checks decide
-// what actually runs on it. Keeping the gate on that build would withdraw the
-// GPU from Metal3-class AMD hardware (Vega II, W5700X, 5700XT) purely on
-// vendor, which is a policy nobody measured.
-//
-// Checked via hardware sysctl rather than build arch so an x86_64 build under
-// Rosetta still sees the real GPU. AETHER_ASR_FORCE_METAL=1 overrides, for
-// diagnostics.
+// Whether this host may enumerate Metal at all. With embedded shader SOURCE,
+// ggml enumeration reaches Apple's runtime shader compiler, which can live-lock
+// on Intel-GPU Macs (#4535), so they are refused. A precompiled .metallib build
+// (AETHER_ASR_METAL_PRECOMPILED, all releases) never compiles shaders, so no gate.
+// Uses hardware sysctl so Rosetta sees the real GPU. AETHER_ASR_FORCE_METAL=1
+// overrides.
 bool asrMetalUsableHost()
 {
 #if defined(Q_OS_MACOS) && !defined(AETHER_ASR_METAL_PRECOMPILED)
@@ -155,25 +150,36 @@ bool WhisperAsrBackend::load(const QString& modelPath, QString* error)
     cparams.use_gpu = useGpu;
     cparams.gpu_device = useGpu ? m_gpuDevice : 0;
 
+    // Opened after the asrGpuAvailable() pass above, which writes its own
+    // discovery record, so the two never nest and the last begin record in a
+    // crashed session's log names the stage that was actually running. The file
+    // name only: a custom model's directory is the operator's business.
+    g_asrModelLoadBegun.store(true);
+    const QFileInfo modelFile(modelPath);
+    AsrStageTrace stage("asr.model_load",
+                        QStringLiteral("model=%1 size_mb=%2 device=%3 threads=%4")
+                            .arg(modelFile.fileName())
+                            .arg(modelFile.size() / (1024 * 1024))
+                            .arg(useGpu ? QStringLiteral("gpu%1").arg(m_gpuDevice)
+                                        : QStringLiteral("cpu"))
+                            .arg(m_threads));
+
+    // Aimed at a GPU but not entering it (the device is latched, or no GPU
+    // backend answered): this load runs on CPU, and the attempt marker the
+    // controller armed may still name the GPU (#5190).
+    if (m_gpuDevice >= 0 && !useGpu) {
+        asrNotifyCpuFallback();
+    }
+
     const QByteArray pathUtf8 = modelPath.toUtf8();
     QString failure;
     m_ctx = initWhisperContext(pathUtf8, cparams, &failure);
     if (m_ctx == nullptr && useGpu) {
-        // A GPU that enumerates can still be unusable at load time, and
-        // ggml-vulkan's instance state is sticky per process — a second GPU
-        // attempt re-enters the half-built state (the fail-then-crash pattern
-        // of #4502). Retry once on CPU, which never touches the GPU backend.
-        //
-        // Only blame the GPU when the model itself is sound: an empty or
-        // unreadable file yields the same null context, and latching the
-        // device for that reports broken hardware for a bad download — and
-        // costs the GPU until restart, since the latch is one-way. The latch
-        // itself stays wide (`failure` is empty in exactly the dangerous
-        // case: whisper's internal catch swallows the vk::SystemError and
-        // returns null, so there is no discriminator on the exception side),
-        // and it stays BEFORE the CPU retry so a retry that fails for its own
-        // reasons — say, out of memory — cannot leave a poisoned device
-        // unlatched.
+        // ggml-vulkan's instance state is sticky per process, so a failed GPU load is
+        // retried once on CPU only (#4502). Latch the device only when the model file is
+        // plausible (a bad download gives the same null context), and latch before the
+        // CPU retry so a retry failing for its own reasons can't leave it unlatched.
+        // `failure` is empty in the dangerous case: whisper swallows vk::SystemError.
         const QFileInfo modelInfo(modelPath);
         const bool modelPlausible = modelInfo.isReadable() && modelInfo.size() > 0;
         qCWarning(lcAsrWhisper) << "GPU model load failed"
@@ -181,6 +187,13 @@ bool WhisperAsrBackend::load(const QString& modelPath, QString* error)
                                 << "- retrying on CPU";
         if (modelPlausible) {
             asrMarkGpuDeviceFailed(m_gpuDevice);
+            // After the latch, before the retry: from here a death is a CPU
+            // death, and the persisted marker must say so, or the next launch
+            // retires the GPU and walks straight back into this same CPU load
+            // (#5190). Only when the device was latched: an unlatched GPU may
+            // be entered by a load already queued behind this one, and its
+            // marker must keep naming that GPU.
+            asrNotifyCpuFallback();
         } else {
             qCWarning(lcAsrWhisper)
                 << "model file is empty or unreadable - not latching device"
@@ -193,9 +206,14 @@ bool WhisperAsrBackend::load(const QString& modelPath, QString* error)
         // null would otherwise be reported with the GPU's Vulkan exception
         // text — blaming the driver for, say, a truncated model file.
         failure.clear();
+        // The log says so too, flushed, whatever the latch decided above: the
+        // begin record named the GPU, and a death from here on is on the CPU.
+        stage.note("cpu_retry", QStringLiteral("device=cpu"));
         m_ctx = initWhisperContext(pathUtf8, cparams, &failure);
     }
     if (m_ctx == nullptr) {
+        // `useGpu` here means a CPU retry ran above and failed as well.
+        stage.fail(useGpu ? "gpu_and_cpu_failed" : "load_failed");
         if (error != nullptr) {
             *error = failure.isEmpty()
                 ? QStringLiteral("whisper failed to load model: %1").arg(modelPath)
@@ -213,6 +231,9 @@ bool WhisperAsrBackend::load(const QString& modelPath, QString* error)
     // latching. That is the safe direction: an over-latch costs a session of
     // GPU speed, an under-latch costs the process (#4502).
     m_ctxOnGpu = cparams.use_gpu;
+    if (useGpu && !m_ctxOnGpu) {
+        stage.fail("gpu_failed_cpu_ok"); // loaded, but only after the CPU retry
+    }
 
     qCInfo(lcAsrWhisper) << "Loaded model" << modelPath << "(" << m_threads << "threads )";
     return true;
@@ -402,6 +423,54 @@ std::function<std::unique_ptr<IAsrBackend>()> whisperAsrBackendFactory(const QSt
 
 namespace {
 
+static_assert(AsrLibLogAssembler::kLevelWarn == GGML_LOG_LEVEL_WARN
+                  && AsrLibLogAssembler::kLevelError == GGML_LOG_LEVEL_ERROR
+                  && AsrLibLogAssembler::kLevelCont == GGML_LOG_LEVEL_CONT,
+              "AsrLibLogAssembler's level constants must mirror ggml_log_level");
+
+// Runs on whichever thread whisper/ggml logged from (the ASR worker, the
+// discovery pool thread). Log and return — nothing else belongs here.
+void asrLibLogCallback(ggml_log_level level, const char* text, void*)
+{
+    if (text == nullptr) {
+        return;
+    }
+    // stderr first, so a terminal session reads as it did before routing
+    // existed. That is two regimes, not one: until whisper's first backend init,
+    // ggml logs through its own default callback, which prints every level —
+    // that is where the Vulkan device inventory ("Found N Vulkan devices", a
+    // DEBUG line) comes from, during discovery. whisper_backend_init_gpu() then
+    // installs whisper's default into ggml, and that one drops DEBUG — which
+    // keeps Metal's per-kernel DEBUG lines off the compute path. One callback
+    // now stands in for both, so it switches where they did: DEBUG reaches
+    // stderr only until the first model load begins.
+    if (level != GGML_LOG_LEVEL_DEBUG || !g_asrModelLoadBegun.load()) {
+        fputs(text, stderr);
+        fflush(stderr);
+    }
+
+    // Never destroyed, same reason as LogManager::instance(): the callback stays
+    // installed for the life of the process, and ggml can log from teardown
+    // that runs after function-local statics have been destroyed.
+    static auto* const mutex = new std::mutex;
+    static auto* const assembler = new AsrLibLogAssembler;
+    std::vector<AsrLibLogAssembler::Line> lines;
+    {
+        const std::lock_guard<std::mutex> lock(*mutex);
+        lines = assembler->feed(static_cast<int>(level), text);
+    }
+    if (lines.empty()) {
+        return;
+    }
+    for (const AsrLibLogAssembler::Line& line : lines) {
+        qCWarning(lcAsrWhisper).noquote()
+            << (line.error ? "whisper/ggml error:" : "whisper/ggml warning:") << line.text;
+    }
+    if (asrStageOpen()) {
+        asrFlushLog();
+    }
+}
+
 // Devices whose model load failed this run. Whisper loads happen on the ASR
 // worker thread while enumeration runs on a QtConcurrent pool thread, so the
 // set is mutex-guarded. Never cleared: see asrMarkGpuDeviceFailed's contract.
@@ -417,24 +486,13 @@ std::set<int>& asrFailedGpuDevices()
     return failed;
 }
 
-// Whether `dev` can run the kernels whisper's heavy path schedules on the GPU.
-// Probed through the public ggml_backend_dev_supports_op with synthetic ops — a
-// contiguous F32 soft-max, an F16 mat-mul, and a flash-attention op (whisper
-// enables flash attention unconditionally) — rather than by reading
-// backend-internal device properties, so one probe serves every GPU backend.
-// The op shapes model the decode of the vendored whisper.cpp (1.9.1 at this
-// writing): head dim 64, F16 K/V, unconditional flash attention. They are a
-// prediction, not a contract — a whisper.cpp bump that changes any of that
-// quietly changes what this probe should be asking, so re-derive the shapes
-// whenever the vendored copy moves.
-// supports_op only consults device properties: nothing is compiled or allocated
-// (no_alloc context, freed before returning).
-//
-// On the Vulkan backends this is deliberately the FIRST touch of the device:
-// ggml_backend_vk_device_supports_op resolves ggml_vk_get_device, which creates
-// the logical device. A driver stack that cannot create one fails here — once,
-// early, and survivably — instead of at model-load time, where a repeat attempt
-// against ggml's already-initialised instance state is no longer recoverable.
+// Whether `dev` can run whisper's GPU kernels, probed via
+// ggml_backend_dev_supports_op with synthetic F32 soft-max, F16 mat-mul and
+// flash-attention ops (head dim 64, F16 K/V, as vendored whisper.cpp 1.9.1
+// decodes). Re-derive the shapes when the vendored copy moves. Nothing is
+// compiled or allocated. On Vulkan this is deliberately the first device touch:
+// it creates the logical device, so a broken driver fails here survivably rather
+// than at model load.
 bool asrDeviceUsableForDecode(ggml_backend_dev_t dev)
 {
     ggml_init_params params = {};
@@ -467,6 +525,12 @@ bool asrDeviceUsableForDecode(ggml_backend_dev_t dev)
 }
 
 } // namespace
+
+void asrInstallLogRouting()
+{
+    // whisper_log_set() installs the callback for ggml as well.
+    whisper_log_set(asrLibLogCallback, nullptr);
+}
 
 void asrMarkGpuDeviceFailed(int index)
 {
@@ -508,16 +572,12 @@ std::vector<AsrGpuDevice> asrGpuDevices()
         return {};
     }
 
-    // Enumerate GPU + integrated-GPU devices in the same order whisper's
-    // gpu_device indexes them (see whisper_backend_init_gpu).
-    //
-    // The first call in the process constructs ggml's backend registry, and
-    // the Vulkan per-device queries sit beyond ggml_backend_vk_reg()'s
-    // internal guard — on a hostile driver stack they throw (#4509 analysis),
-    // which from here would terminate the process. Degrade to "no devices"
-    // (CPU-only) instead; a partial enumeration is discarded rather than
-    // returned, so an index never points at a device other than the one
-    // whisper would pick.
+    // Enumerate GPU + iGPU devices in whisper's gpu_device order (see
+    // whisper_backend_init_gpu). Vulkan per-device queries can throw on a hostile
+    // driver (#4509), so degrade to no devices; a partial list is discarded so an
+    // index never names a device whisper wouldn't pick. Traced here because load()
+    // also reaches this via asrGpuAvailable() on the worker thread (#5190).
+    AsrStageTrace stage("asr.device_discovery");
     std::vector<AsrGpuDevice> devices;
     try {
         int index = 0;
@@ -541,6 +601,15 @@ std::vector<AsrGpuDevice> asrGpuDevices()
                     // usable. The device is kept in the list either way, so
                     // the indices whisper's gpu_device refers to never shift.
                     try {
+                        // Physical-memory query first (#4986): device
+                        // properties only, useful even for a device that then
+                        // fails the probe. A throw here lands in the same
+                        // latch handlers as a probe throw — a device that
+                        // cannot answer a property query is not one to retry.
+                        size_t vramFree = 0, vramTotal = 0;
+                        ggml_backend_dev_memory(dev, &vramFree, &vramTotal);
+                        d.vramFreeBytes = vramFree;
+                        d.vramTotalBytes = vramTotal;
                         d.usable = asrDeviceUsableForDecode(dev);
                         if (!d.usable) {
                             qCInfo(lcAsrWhisper)
@@ -561,25 +630,42 @@ std::vector<AsrGpuDevice> asrGpuDevices()
                         asrMarkGpuDeviceFailed(d.index);
                         qCWarning(lcAsrWhisper)
                             << "GPU device" << d.index << d.name
-                            << "failed the capability probe:" << e.what()
+                            << "threw during the memory query or capability probe:" << e.what()
                             << "- not offered, and not retried this session";
                     } catch (...) {
                         d.usable = false;
                         asrMarkGpuDeviceFailed(d.index);
                         qCWarning(lcAsrWhisper)
                             << "GPU device" << d.index << d.name
-                            << "failed the capability probe (unknown exception)"
+                            << "threw during the memory query or capability probe (unknown exception)"
                             << "- not offered, and not retried this session";
                     }
+                }
+                // One inventory line per device — name, VRAM, verdict — so a
+                // support log answers "which GPU, how much memory" without a
+                // follow-up ask (#4986).
+                if (d.vramTotalBytes > 0) {
+                    qCInfo(lcAsrWhisper)
+                        << "GPU device" << d.index << d.name
+                        << "- VRAM free" << (d.vramFreeBytes / (1024 * 1024))
+                        << "of" << (d.vramTotalBytes / (1024 * 1024)) << "MB -"
+                        << (d.usable ? "usable" : "not offered");
+                } else {
+                    qCInfo(lcAsrWhisper)
+                        << "GPU device" << d.index << d.name
+                        << "- VRAM unknown -"
+                        << (d.usable ? "usable" : "not offered");
                 }
                 devices.push_back(std::move(d));
             }
         }
     } catch (const std::exception& e) {
         qCWarning(lcAsrWhisper) << "GPU device enumeration failed:" << e.what();
+        stage.fail("enumeration_threw");
         devices.clear();
     } catch (...) {
         qCWarning(lcAsrWhisper) << "GPU device enumeration failed: unknown exception";
+        stage.fail("enumeration_threw");
         devices.clear();
     }
     return devices;

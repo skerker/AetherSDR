@@ -101,6 +101,7 @@ QString SmartCatProtocol::freqField(double mhz)
 SmartCatProtocol::SmartCatProtocol(RadioModel* model, int vfoA, int vfoB,
                                    bool flexExtensions)
     : m_model(model)
+    , m_txProducer(model ? model->registerTxProducer() : TxCoordinator::Producer{})
     , m_vfoA(vfoA)
     , m_vfoB(vfoB)
     , m_flexExtensions(flexExtensions)
@@ -108,6 +109,8 @@ SmartCatProtocol::SmartCatProtocol(RadioModel* model, int vfoA, int vfoB,
 
 SmartCatProtocol::~SmartCatProtocol()
 {
+    m_txProducer.invalidate();
+    releasePtt();
     // Client disconnect: undo a split ONLY if WE engaged it (moved TX to VFO B).
     // A split set up by the operator or another client must survive our disconnect.
     if (m_weEngagedSplit)
@@ -508,8 +511,10 @@ QString SmartCatProtocol::cmdFR(const QString& arg)
 QString SmartCatProtocol::cmdTX(const QString& arg)
 {
     if (arg == "0") return cmdRX();
-    m_pttAssertedByMe = true;
-    m_model->setTransmit(true, TransmitModel::PttSource::Dax);
+    if (!m_pttRequest.valid()) {
+        m_pttRequest = m_txProducer.request();
+    }
+    (void)m_model->setProducerTransmit(m_pttRequest, true, TransmitModel::PttSource::Dax);
     return {};
 }
 
@@ -517,8 +522,9 @@ QString SmartCatProtocol::cmdTX(const QString& arg)
 
 QString SmartCatProtocol::cmdRX()
 {
-    m_pttAssertedByMe = false;
-    m_model->setTransmit(false, TransmitModel::PttSource::Dax);
+    const TxCoordinator::Request request = m_pttRequest;
+    m_pttRequest = {};
+    (void)m_model->setProducerTransmit(request, false, TransmitModel::PttSource::Dax);
     return {};
 }
 
@@ -526,9 +532,16 @@ QString SmartCatProtocol::cmdRX()
 
 void SmartCatProtocol::releasePtt()
 {
-    if (!m_pttAssertedByMe) return;
-    m_pttAssertedByMe = false;
-    m_model->setTransmit(false, TransmitModel::PttSource::Dax);
+    // SmartCatSession calls this at disconnect, before QObject destruction.
+    // Invalidate now so a terminal queue cannot key during deleteLater's gap.
+    m_txProducer.invalidate();
+    const TxCoordinator::Request request = m_pttRequest;
+    m_pttRequest = {};
+    if (m_model) {
+        (void)m_model->setProducerTransmit(request, false, TransmitModel::PttSource::Dax);
+        m_model->abortProducerCwx(m_cwxRequest);
+    }
+    m_cwxRequest = {};
 }
 
 // ── ID — rig identification ───────────────────────────────────────────────────
@@ -983,7 +996,9 @@ QString SmartCatProtocol::cmdKS(const QString& arg)
         return "KS" + fmt3(tx.cwSpeed()) + ";";
     bool ok;
     int wpm = arg.toInt(&ok);
-    if (!ok || wpm < 5 || wpm > 100) return "?;";
+    if (!ok || wpm < m_model->cwTextMinWpm() || wpm > m_model->cwTextMaxWpm()) {
+        return "?;";
+    }
     tx.setCwSpeed(wpm);
     return {};
 }
@@ -1015,13 +1030,24 @@ QString SmartCatProtocol::cmdKY(const QString& arg)
     // while every set went nowhere. Direct read on the CAT thread, the same
     // posture as the cwxActive() read this replaces.
     if (!m_model->hasRadioSideCwKeyer()) return "?;";
-    if (arg.isEmpty())
+    if (arg.isEmpty()) {
+        if (!m_model->hasCwTextProgress()) {
+            return "?;";
+        }
         return QString("KY%1;").arg(m_model->cwxActive() ? 1 : 0);
+    }
     if (arg.size() < 2) return "?;";
     // arg[0] is the fixed P1 space; text starts at arg[1], max 24 chars
     const QString text = arg.mid(1).left(24);
-    if (!text.isEmpty())
-        m_model->cwxModel().send(text);
+    if (!m_model->cwTextValidationError(text).isEmpty()) {
+        return "?;";
+    }
+    if (!text.isEmpty()) {
+        if (!m_cwxRequest.valid()) {
+            m_cwxRequest = m_txProducer.request();
+        }
+        m_model->requestProducerCwx(m_cwxRequest, text);
+    }
     return {};
 }
 
@@ -1062,6 +1088,9 @@ QString SmartCatProtocol::cmdZZNR(const QString& arg)
     if (arg.isEmpty())
         return QString("ZZNR%1;").arg(a->nrOn() ? 1 : 0);
     if (arg != "0" && arg != "1") return "?;";
+    // No radio-side NR (HL2, ANAN): ON is refused like any unsupported set.
+    if (arg == "1" && m_model && !m_model->radioSideNoiseReductionAvailable())
+        return "?;";
     a->setNr(arg == "1");
     return {};
 }
@@ -1091,16 +1120,9 @@ QString SmartCatProtocol::cmdZZDE(const QString& arg)
     return {};
 }
 
-// ── SL / SH — DSP filter low / high cutoff (Kenwood SSB/FM codes) ────────────
-//
-// Kenwood encodes filter edges as an index into a fixed Hz table rather than
-// raw Hz values.  We map from the slice's filterLow/filterHigh (signed Hz
-// relative to carrier) to the nearest table entry, then round-trip back on set.
-//
-// SL table (low-edge): 00=10, 01=50, 02=100, 03=200, 04=300, 05=400,
-//                      06=500, 07=600, 08=700, 09=800, 10=900, 11=1000 Hz
-// SH table (high-edge): 00=1400,01=1600,02=1800,03=2000,04=2200,05=2400,
-//                       06=2600,07=2800,08=3000,09=3400,10=4000,11=5000 Hz
+// SL / SH — DSP filter low/high cutoff (Kenwood). Kenwood sends an index into
+// a fixed Hz table; map the slice's signed filterLow/filterHigh to the nearest
+// entry and back on set.
 
 static const int kSLHz[] = { 10, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
 static const int kSHHz[] = { 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000, 3400, 4000, 5000 };
@@ -1212,6 +1234,8 @@ QString SmartCatProtocol::cmdNR(const QString& arg)
     if (arg.isEmpty())
         return QString("NR%1;").arg(a->nrOn() ? 1 : 0);
     if (arg != "0" && arg != "1" && arg != "2") return "?;";
+    if (arg != "0" && m_model && !m_model->radioSideNoiseReductionAvailable())
+        return "?;";   // no radio-side NR, as ZZNR
     a->setNr(arg != "0");
     return {};
 }
@@ -1249,6 +1273,8 @@ QString SmartCatProtocol::cmdNT(const QString& arg)
     if (arg.isEmpty())
         return QString("NT%1;").arg(a->anfOn() ? 1 : 0);
     if (arg != "0" && arg != "1") return "?;";
+    if (arg == "1" && m_model && !m_model->radioSideAutoNotchAvailable())
+        return "?;";   // no auto notch on this radio
     a->setAnf(arg == "1");
     return {};
 }

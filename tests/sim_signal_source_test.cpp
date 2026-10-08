@@ -77,18 +77,19 @@ public:
     explicit Collector(AetherSDR::SimSignalSource* src)
     {
         connect(src, &AetherSDR::SimSignalSource::audioFrameReady, this,
-                [this](const QByteArray& b) {
+                [this](const AetherSDR::PcmFrame& frame) {
+                    const QByteArray b = frame.legacyStereo24();
                     ++audio;
                     samples += b.size() / qint64(2 * sizeof(float));
                     lastAudio = b;
                 });
         connect(src, &AetherSDR::SimSignalSource::sliceAudioFrameReady, this,
-                [this](int id, const QByteArray&) {
+                [this](int id, const AetherSDR::PcmFrame&) {
                     ++slice;
                     lastSliceId = id;
                 });
         connect(src, &AetherSDR::SimSignalSource::spectrumFrameReady, this,
-                [this](int pan, const QByteArray&) {
+                [this](int pan, quint64, const QByteArray&) {
                     ++spectrum;
                     panIdsSeen.insert(pan);
                 });
@@ -113,7 +114,7 @@ int main(int argc, char** argv)
     Collector rx(src);
 
     // ── Start, and measure the long-run pacing ───────────────────────────
-    QMetaObject::invokeMethod(src, &SimSignalSource::start, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(src, [src] { src->startSession(1); }, Qt::QueuedConnection);
     report("audio frames arrive across the thread boundary",
            waitFor([&] { return rx.audio > 4; }, 2000));
 

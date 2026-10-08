@@ -61,24 +61,15 @@ void writeProfileDocument(QXmlStreamWriter& xml, const QVector<MidiBinding>& bin
     xml.writeEndDocument();
 }
 
-// ── SmartSDR iOS/Mac ".map" import ──────────────────────────────────────────
-//
-// The ".map" is the mapping file consumed by the SmartSDR iOS/Mac family's
-// own Import-map tool and published per device by controller vendors
-// (e.g. Lynovation's CTR2 config packages). Plain ASCII, "#"-headed
-// sections, one assignment per line:
-//
+// SmartSDR iOS/Mac ".map" import (the format controller vendors publish, e.g.
+// Lynovation CTR2 packages). ASCII, "#"-headed sections, one assignment per line:
 //     # Controls
 //     C100=freq;active          C<CC#> = <function>[;flags]
 //     # Buttons
 //     B20=leftpaddle            B<note#> = <function>[;flags]
-//     # LEDs                    (device feedback — not bindings)
-//
-// The function vocabulary is SmartSDR's; this table carries the verified
-// CTR2-MIDI + CTR2-Quad vocabulary. Functions absent here are reported as
-// named skips, so growing coverage is a data change only. relativeCc marks
-// functions whose CC values are relative steps (the VFO knob) rather than
-// absolute levels.
+//     # LEDs                    (device feedback, not bindings)
+// This table holds the verified CTR2-MIDI + CTR2-Quad vocabulary; unknown
+// functions are reported as named skips. relativeCc marks relative-step CCs.
 struct MapFunctionEntry {
     const char* function;
     const char* paramId;
@@ -90,6 +81,17 @@ constexpr MapFunctionEntry kSmartSdrMapFunctions[] = {
     { "anf",           "rx.anfEnable",      false },
     { "atu",           "tx.atuStart",       false },
     { "balanceslice",  "rx.audioPan",       false },
+    { "band10",        "global.band10m",    false },
+    { "band12",        "global.band12m",    false },
+    { "band15",        "global.band15m",    false },
+    { "band160",       "global.band160m",   false },
+    { "band17",        "global.band17m",    false },
+    { "band20",        "global.band20m",    false },
+    { "band30",        "global.band30m",    false },
+    { "band40",        "global.band40m",    false },
+    { "band6",         "global.band6m",     false },
+    { "band60",        "global.band60m",    false },
+    { "band80",        "global.band80m",    false },
     { "banddown",      "global.bandDown",   false },
     { "bandup",        "global.bandUp",     false },
     { "cwspeed",       "cw.speed",          false },
@@ -97,8 +99,17 @@ constexpr MapFunctionEntry kSmartSdrMapFunctions[] = {
     { "leftpaddle",    "cwdit",             false },
     { "mainmute",      "global.masterMute", false },
     { "micgain",       "phone.micLevel",    false },
+    { "modeam",        "global.modeAM",     false },
+    { "modecw",        "global.modeCW",     false },
+    { "modedigl",      "global.modeDIGL",   false },
+    { "modedigu",      "global.modeDIGU",   false },
+    { "modefm",        "global.modeFM",     false },
+    { "modelsb",       "global.modeLSB",    false },
     { "modenext",      "global.modeUp",     false },
     { "modeprev",      "global.modeDown",   false },
+    { "modertty",      "global.modeRTTY",   false },
+    { "modesam",       "global.modeSAM",    false },
+    { "modeusb",       "global.modeUSB",    false },
     { "nb",            "rx.nbEnable",       false },
     { "nr",            "rx.nrEnable",       false },
     { "power",         "tx.rfPower",        false },
@@ -225,16 +236,9 @@ QVector<MidiBinding> parseSmartSdrMap(const QByteArray& bytes,
                 result.skippedUnknownParam << note;
         };
 
-        // A section we know carries device feedback is never a binding, and
-        // vendors key those in their own dialect ("L1=", "LED1="), so they are
-        // not ours to key-validate — reporting them beats failing the file.
-        //
-        // Counted per section rather than named per row: every row under a
-        // known feedback header is the same kind of thing and none of them can
-        // ever bind, so a device with sixty LEDs would otherwise put sixty
-        // lines in the details list saying nothing the first one didn't. Rows
-        // under a header we *couldn't read* get named individually below,
-        // because there the operator does need to see which row it was.
+        // Known device-feedback sections never bind and use vendor key dialects ("L1=",
+        // "LED1="), so they are counted per section rather than validated or listed per
+        // row; rows under an unreadable header are named individually below.
         if (section == Section::NonBinding) {
             ++nonBindingRows[sectionLabel];
             continue;
@@ -384,21 +388,26 @@ QVector<MidiBinding> parseProfileXml(const QByteArray& bytes,
                 << param + QStringLiteral(" (channel \"%1\")").arg(channelAttr.toString());
             continue;
         }
-        // Range-checked for every type, Pitch Bend included. Pitch Bend
-        // ignores `number` at dispatch (key() substitutes 0xFF and
-        // sourceDisplayName() omits it), so an out-of-range value there is
-        // inert rather than dangerous — but storing and re-exporting a number
-        // no MIDI message can carry leaves a file that says something untrue,
-        // and Principle VII asks the boundary to validate ranges, not just
-        // the ranges that currently matter.
+        // Range-checked per type. Pitch Bend's message carries no controller
+        // number: Learn and manual entry store -1 for it and the shared
+        // writer exports that verbatim, so a Pitch Bend row must accept -1
+        // to round-trip the app's own export (#5024). In-range numbers on a
+        // PB row stay accepted as before, but every accepted PB row now
+        // stores -1 — dispatch ignores the number anyway (key() substitutes
+        // 0xFF), and normalizing means the store can never re-export a
+        // number no PB message can carry. Out-of-range values remain named
+        // skips for every type (Principle VII).
         const auto numberAttr = attrs.value("number");
         bool numberOk = true;
-        const int number = numberAttr.isNull() ? 0 : numberAttr.toInt(&numberOk);
-        if (!numberOk || number < 0 || number > 127) {
+        int number = numberAttr.isNull() ? 0 : numberAttr.toInt(&numberOk);
+        const int numberFloor = (type == MidiBinding::PitchBend) ? -1 : 0;
+        if (!numberOk || number < numberFloor || number > 127) {
             result.skippedBadType
                 << param + QStringLiteral(" (number \"%1\")").arg(numberAttr.toString());
             continue;
         }
+        if (type == MidiBinding::PitchBend)
+            number = -1;
 
         if (paramValidator && !paramValidator(param)) {
             result.skippedUnknownParam << param;
@@ -460,7 +469,7 @@ QString MidiSettings::settingsFilePath() const
            + "/AetherSDR/midi.settings";
 }
 
-QString MidiSettings::profileDir() const
+QString MidiSettings::profileDir()
 {
     return QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
            + "/AetherSDR/midi";
@@ -574,41 +583,118 @@ QVector<MidiBinding> MidiSettings::parseBindingsFromXml(const QString& filePath)
     return result;
 }
 
-void MidiSettings::writeBindingsToXml(const QString& filePath,
-                                       const QVector<MidiBinding>& bindings)
+bool MidiSettings::writeBindingsToXml(const QString& filePath,
+                                      const QVector<MidiBinding>& bindings)
 {
     QDir().mkpath(QFileInfo(filePath).absolutePath());
-    QFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) return;
+    // QSaveFile writes beside the target and renames over it on commit(), so
+    // a failure (unwritable store, full disk) leaves the previous profile
+    // intact instead of a truncated file — the outcome the caller then
+    // reports is true of the disk (Principle XIV). commit() flushes and
+    // returns false on a write error; hasError() covers a failure the stream
+    // writer saw earlier in the document. (#5077)
+    QSaveFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) return false;
 
-    QXmlStreamWriter xml(&file);
-    writeProfileDocument(xml, bindings);
+    // Writer scoped so the document is complete before commit() — same shape
+    // as exportProfile(), so it doesn't rest on the writer's destructor order.
+    {
+        QXmlStreamWriter xml(&file);
+        writeProfileDocument(xml, bindings);
+        if (xml.hasError()) {
+            file.cancelWriting();
+            return false;
+        }
+    }
+    return file.commit();
 }
 
 // ── Profiles ────────────────────────────────────────────────────────────────
+
+bool MidiSettings::isValidProfileName(const QString& name)
+{
+    // Separators are tested directly rather than via an allowlist so
+    // non-ASCII station and contest names keep working. A leading dot is
+    // filesystem semantics too: on Unix it is the hidden-file convention, so
+    // the QDir::Files listing omits an accepted ".hidden.xml" — saved, but
+    // vanished from availableProfiles() — and refusing it also covers "."
+    // and "..", the two names that are pure path syntax. Rejecting (not
+    // stripping) is deliberate: stripping "../foo" to "foo" would silently
+    // overwrite an unrelated existing profile. (#4975)
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty()) {
+        return false;
+    }
+    if (trimmed.startsWith(QLatin1Char('.'))) {
+        return false;
+    }
+    if (trimmed.contains(QLatin1Char('/')) || trimmed.contains(QLatin1Char('\\'))) {
+        return false;
+    }
+    return true;
+}
 
 QStringList MidiSettings::availableProfiles() const
 {
     QDir dir(profileDir());
     QStringList result;
-    for (const auto& fi : dir.entryInfoList({"*.xml"}, QDir::Files))
-        result.append(fi.baseName());
+    for (const auto& fi : dir.entryInfoList({"*.xml"}, QDir::Files)) {
+        // completeBaseName(), not baseName(): the writers below append exactly
+        // one ".xml", so the reader must strip exactly one extension —
+        // baseName() cuts at the FIRST dot, so a dotted name ("CTR2 v1.0")
+        // listed truncated and could then never be loaded. (#4974)
+        const QString name = fi.completeBaseName();
+        // List only names the other three operations will serve: a legacy
+        // file whose name the store now refuses (e.g. a backslash, legal in
+        // Unix filenames and creatable by the pre-guard GUI) would otherwise
+        // list but never load or delete. The file itself stays on disk.
+        if (isValidProfileName(name)) {
+            result.append(name);
+        }
+    }
     return result;
 }
 
-void MidiSettings::saveProfile(const QString& name,
+bool MidiSettings::profileExists(const QString& name)
+{
+    if (!isValidProfileName(name)) {
+        return false;
+    }
+    return QFile::exists(profileDir() + "/" + name + ".xml");
+}
+
+bool MidiSettings::saveProfile(const QString& name,
                                 const QVector<MidiBinding>& bindings)
 {
-    writeBindingsToXml(profileDir() + "/" + name + ".xml", bindings);
+    if (!isValidProfileName(name)) {
+        return false;
+    }
+    // Refused for the same reason exportProfile() refuses it: an empty set
+    // serializes to a childless <MidiProfile/> that loadProfile() reports as
+    // empty-or-missing, so "saved" would be untrue of what comes back — and
+    // Clear All → Save would otherwise replace a profile with nothing.
+    // importProfile() already guards this before it gets here. (#5077)
+    if (bindings.isEmpty()) {
+        return false;
+    }
+    return writeBindingsToXml(profileDir() + "/" + name + ".xml", bindings);
 }
 
 QVector<MidiBinding> MidiSettings::loadProfile(const QString& name) const
 {
+    if (!isValidProfileName(name)) {
+        return {};
+    }
     return parseBindingsFromXml(profileDir() + "/" + name + ".xml");
 }
 
 void MidiSettings::deleteProfile(const QString& name)
 {
+    // The guard matters most here: a mis-resolved delete is the one
+    // unrecoverable operation of the three. (#4975)
+    if (!isValidProfileName(name)) {
+        return;
+    }
     QFile::remove(profileDir() + "/" + name + ".xml");
 }
 
@@ -620,18 +706,11 @@ MidiImportResult MidiSettings::importProfile(
 {
     MidiImportResult result;
 
-    // A profile is kilobytes — the vendor CTR2-Quad map is a few. Two guards,
-    // because they cover different failures and neither covers the other:
-    //
-    //  1. Regular files only. QFile::size() reports 0 for character devices,
-    //     FIFOs and most /proc entries, so a size check alone lets exactly the
-    //     files with no end through. Pointing the picker at /dev/zero used to
-    //     read until the kernel OOM-killed the app (74 GB VM, no dialog, no log
-    //     line); a FIFO hung in the read forever. Principle VII: a parser must
-    //     not crash, hang, or over-allocate on the input it is handed.
-    //  2. A bounded read of one byte past the cap. This is what enforces the
-    //     size limit — checking size() first would re-trust the same number
-    //     guard 1 exists because we cannot trust.
+    // Two guards on profile size (kilobytes in practice):
+    //  1. Regular files only: QFile::size() is 0 for devices, FIFOs and /proc, which
+    //     would read forever (/dev/zero OOM, FIFO hang).
+    //  2. A bounded read of one byte past the cap enforces the limit without
+    //     trusting size().
     const QFileInfo info(filePath);
     if (!info.isFile()) {
         result.errors << QStringLiteral("%1 is not a regular file.")
@@ -694,22 +773,17 @@ MidiImportResult MidiSettings::importProfile(
     if (bindings.isEmpty())
         return result; // parsed, but every row was a named skip — nothing to store
 
-    // Store name = file base name; never overwrite an existing profile. The
-    // prompt-vs-suffix collision policy is an open maintainer call, and a
-    // suffix is the reversible default. Dots are replaced because the store
-    // round-trips names through QFileInfo::baseName(), which cuts at the
-    // first dot — a dotted name would list, load, and collide wrongly.
-    //
-    // completeBaseName() operates on fileName(), so any directory component of
-    // the chosen path is already stripped: "../../evil.map" yields "evil". That
-    // is what keeps this call site safe, because saveProfile() — and its load
-    // and delete siblings — concatenate the name straight into profileDir()
-    // with no sanitizing. Do not swap this for a name taken from the document
-    // body or from filePath without stripping separators first.
+    // Store name = file base name; never overwrite an existing profile (a suffix is
+    // the reversible default). Dotted names round-trip (#4974). completeBaseName()
+    // strips directories ("../../evil.map" -> "evil"), and the store rejects
+    // separator-bearing names itself (#4975).
     QString name = QFileInfo(filePath).completeBaseName().trimmed();
-    name.replace(QLatin1Char('.'), QLatin1Char('_'));
-    if (name.isEmpty())
+    // Not just isEmpty(): a file named "...map" derives ".." here, which the
+    // store rightly refuses — without this fallback the refusal surfaces as a
+    // misleading "couldn't write" error instead of a stored profile.
+    if (!isValidProfileName(name)) {
         name = QStringLiteral("Imported profile");
+    }
     const QStringList existing = availableProfiles();
     const auto taken = [&existing](const QString& candidate) {
         for (const auto& p : existing)
@@ -721,11 +795,9 @@ MidiImportResult MidiSettings::importProfile(
     for (int n = 2; taken(unique); ++n)
         unique = name + QStringLiteral(" (%1)").arg(n);
 
-    saveProfile(unique, bindings);
-
-    // The write path returns void, so prove the store took it before
-    // reporting success.
-    if (loadProfile(unique).size() != bindings.size()) {
+    // The write reports failure itself (#5077); the read-back additionally
+    // proves the stored document carries every binding before reporting success.
+    if (!saveProfile(unique, bindings) || loadProfile(unique).size() != bindings.size()) {
         result.errors << QStringLiteral("Couldn't write the profile into %1.")
                              .arg(QDir::toNativeSeparators(profileDir()));
         result.importedCount = 0;

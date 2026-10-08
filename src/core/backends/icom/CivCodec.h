@@ -6,23 +6,17 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
-// CI-V — the Icom command plane.
+// CI-V — the Icom command plane, common to every transport: over WiFi it rides
+// inside the RS-BA1 serial stream (IcomProtocol.h), over USB the same bytes go
+// straight to a serial port. Keep this file transport-, Qt- and socket-free so
+// civ_codec_test exercises it standalone.
 //
-// This is the half of the stack that is COMMON to every transport. Over WiFi it
-// travels inside the RS-BA1 serial stream (IcomProtocol.h); over USB the exact
-// same bytes go straight down a serial port with no envelope at all. Keeping
-// this file transport-free is what makes a future USB / local-serial mode a
-// small increment rather than a second backend.
-//
-// Grounded on Icom's own IC-705 CI-V Reference Guide (A7560-8EX-1, Jul 2020),
-// which is tier 1 in ~/oracles/icom/icom-oracle.md §0. Command numbers and
-// data ranges are facts from that document; nothing here is transcribed from
-// wfview (GPL-3, read-only reference).
-//
-// Qt-free and socket-free so civ_codec_test exercises it standalone.
+// Grounded on Icom's IC-705 CI-V Reference Guide (A7560-8EX-1, Jul 2020);
+// nothing here is transcribed from wfview (GPL-3, read-only reference).
 
 namespace AetherSDR::icom {
 
@@ -43,17 +37,9 @@ inline constexpr std::uint8_t kControllerAddress = 0xE0;
 // rather than with our address, so the receive path must accept it.
 inline constexpr std::uint8_t kBroadcastAddress = 0x00;
 
-// The cap past which an unterminated frame is a resync artefact rather than a
-// frame.
-//
-// NOT 80. Hamlib and kappanhang both use 80 and both are right for what they
-// do — 80 is the longest COMMAND frame, and neither of them decodes scope data.
-// A scope sweep is command 0x27 0x00 carrying 475 points, which is ~496 bytes
-// on an IC-705 and ~710 on an IC-7610, so an 80-byte cap silently discards
-// every panadapter frame while commands keep working perfectly. The symptom is
-// a black waterfall on a session that is demonstrably healthy.
-//
-// 1200 covers the widest sweep any current model produces with room to spare.
+// Cap past which an unterminated frame is a resync artefact. Not hamlib's 80
+// (the longest COMMAND frame): a 0x27 0x00 scope sweep of 475 points is ~496
+// bytes on an IC-705 and ~710 on an IC-7610. 1200 covers every current model.
 inline constexpr std::size_t kMaxFrameBytes = 1200;
 
 // The longest frame we will ever SEND, and the cap for frames forwarded from a
@@ -79,26 +65,30 @@ struct CivFrame {
 // Build a frame. `to` is the radio's CI-V address.
 [[nodiscard]] std::vector<std::uint8_t> buildFrame(std::uint8_t to, std::uint8_t cmd,
                                                    std::span<const std::uint8_t> payload = {});
+// Explicit Power ON only. Native-network framing is selected by the model profile.
+[[nodiscard]] std::vector<std::uint8_t> cmdPowerOn(std::uint8_t to,
+    std::size_t extraPreambleBytes = 0, std::uint8_t from = kControllerAddress);
+
 [[nodiscard]] std::vector<std::uint8_t> buildFrameSub(std::uint8_t to, std::uint8_t cmd,
                                                       std::uint8_t sub,
                                                       std::span<const std::uint8_t> payload = {});
 
+// Whether a command is sub-addressed — i.e. whether the byte after it is a
+// subcommand or the first byte of the payload. This is a per-command fact and
+// there is exactly ONE list of it: parseFrame() decodes by it, and the CI-V
+// trace labels by it. A second copy can drift, and a drift here produces the
+// wrong-but-plausible decode the enumeration exists to prevent.
+[[nodiscard]] bool commandHasSubcommand(std::uint8_t command);
+
 // Decode one complete frame (FE FE … FD). Returns nullopt if it is malformed.
 [[nodiscard]] std::optional<CivFrame> parseFrame(std::span<const std::uint8_t> frame);
 
-// Reassembles CI-V frames from an arbitrarily-chunked byte stream.
-//
-// The stream is NOT frame-aligned: a datagram can split a frame, batch several,
-// or start mid-frame after a loss. Three rules make resynchronisation reliable,
-// and all three come from the reference implementations having been bitten:
-//
-//   1. Sync on the DOUBLE preamble. A single 0xFE is not a frame start — it
-//      appears inside BCD data — and accepting one leaves the decoder
-//      permanently one frame behind.
-//   2. Terminate on 0xFD, and also on 0xFC. The radio uses 0xFC as an alternate
-//      terminator in some replies.
-//   3. Time out a partial frame. Without it, one truncated frame swallows every
-//      subsequent byte forever. The caller drives this via tick().
+// Reassembles CI-V frames from an arbitrarily-chunked byte stream (datagrams can
+// split, batch, or start mid-frame). Resync rules:
+//   1. Sync on the DOUBLE 0xFE preamble; a single 0xFE appears inside BCD data.
+//   2. Terminate on 0xFD, and also on 0xFC (alternate terminator in some replies).
+//   3. Time out a partial frame via tick(), or one truncated frame swallows the
+//      stream forever.
 class CivReassembler {
 public:
     // Feed bytes; returns every complete frame that became available.
@@ -114,20 +104,11 @@ private:
     bool m_sawOne  = false;   // exactly one preamble byte seen
 };
 
-// ---------------------------------------------------------------------------
-// BCD — and the two directions it runs
-// ---------------------------------------------------------------------------
-//
-// This is the single most common source of Icom bugs, so it gets named helpers
-// rather than open-coded shifts:
-//
-//   FREQUENCY runs LITTLE-endian  — least-significant digit pair FIRST.
+// BCD byte order:
+//   FREQUENCY is LITTLE-endian — least-significant digit pair first.
 //       14.250000 MHz -> 00 60 25 14 00
-//   EVERYTHING ELSE runs BIG-endian — most-significant pair first.
+//   everything else is BIG-endian — most-significant pair first.
 //       level 0255    -> 02 55
-//
-// Mixing them produces a radio that tunes to 21.4 MHz when asked for 14.21, or
-// a power level of 55 % when asked for 2 %.
 
 // Frequency, in Hz, as N BCD bytes little-endian. 5 bytes on every current
 // model; the IC-905 uses 6 above 10 GHz, which is why this is a parameter and
@@ -136,18 +117,17 @@ inline constexpr std::size_t kFreqBytes = 5;
 [[nodiscard]] std::vector<std::uint8_t> encodeFreq(std::uint64_t hz,
                                                     std::size_t bytes = kFreqBytes);
 [[nodiscard]] std::optional<std::uint64_t> decodeFreq(std::span<const std::uint8_t> bcd);
+// Use at command boundaries whose protocol shape declares an exact number of
+// frequency bytes. Generic decodeFreq() intentionally supports multiple Icom
+// models and therefore cannot enforce a command's arity by itself.
+[[nodiscard]] std::optional<std::uint64_t> decodeFreqExact(
+    std::span<const std::uint8_t> bcd, std::size_t expectedBytes);
 
-// A scope EDGE frequency, which can be NEGATIVE.
-//
-// The IC-7300MK2's CI-V guide documents `0xF` in the 1 GHz digit — the high
-// nibble of the last byte — as a sign flag meaning the lower edge is negative.
-// That happens when a wide span sits near the bottom of the tuning range, so
-// the scope window extends below 0 Hz.
-//
-// decodeFreq() stays STRICT and rejects it, deliberately: an OPERATING
-// frequency is never negative, and a corrupt one that decodes to something
-// still retunes the radio — on transmit that is an out-of-band emission. Only
-// the scope decoder should reach for this variant.
+// A scope EDGE frequency, which can be NEGATIVE: the IC-7300MK2 CI-V guide uses
+// 0xF in the 1 GHz digit (high nibble of the last byte) as a sign flag when a
+// wide span extends below 0 Hz. decodeFreq() stays strict because an operating
+// frequency is never negative and a corrupt one would retune the radio; only the
+// scope decoder uses this variant.
 [[nodiscard]] std::optional<std::int64_t> decodeFreqSigned(std::span<const std::uint8_t> bcd);
 
 // A 0000..9999 value as two BCD bytes, big-endian. This is the shape of every
@@ -178,13 +158,19 @@ inline constexpr std::uint8_t kReadFreq     = 0x03;
 inline constexpr std::uint8_t kReadMode     = 0x04;
 inline constexpr std::uint8_t kSetFreq      = 0x05;
 inline constexpr std::uint8_t kSetMode      = 0x06;
+inline constexpr std::uint8_t kReadRepeaterOffset = 0x0C; // 100 Hz units, LE BCD
+inline constexpr std::uint8_t kSetRepeaterOffset  = 0x0D;
+inline constexpr std::uint8_t kDuplex       = 0x0F;   // 10 simplex, 11 down, 12 up
 inline constexpr std::uint8_t kLevel        = 0x14;   // sub-addressed levels
 inline constexpr std::uint8_t kMeter        = 0x15;   // sub-addressed meters
 inline constexpr std::uint8_t kFunction     = 0x16;   // sub-addressed on/off functions
+inline constexpr std::uint8_t kCwMessage    = 0x17;   // up to 30 ASCII characters; FF aborts
 inline constexpr std::uint8_t kPower        = 0x18;   // 00 off, 01 on
 inline constexpr std::uint8_t kReadId       = 0x19;   // sub 00: read transceiver ID
 inline constexpr std::uint8_t kSetting      = 0x1A;   // memory / filter / SET menu
+inline constexpr std::uint8_t kTone         = 0x1B;   // sub 00: repeater CTCSS frequency
 inline constexpr std::uint8_t kControl      = 0x1C;   // PTT, tuner, XFC
+inline constexpr std::uint8_t kGps          = 0x23;   // position / GPS source
 inline constexpr std::uint8_t kScope        = 0x27;
 // The attenuator, and it is NOT sub-addressed like 0x14/0x16 — the single
 // data byte IS the setting, in BCD dB. The IC-705 takes 00 (off) and 20
@@ -196,21 +182,16 @@ inline constexpr std::uint8_t kRxAntenna   = 0x12;
 // RIT / dTX. Icom calls transmit incremental tuning "dTX"; the operator-facing
 // name everywhere else is XIT, and they are the same control.
 inline constexpr std::uint8_t kTuneOffset   = 0x21;
-// OPERATING MODE, DATA STATE AND IF FILTER — ALL THREE IN ONE FRAME.
-//
-// This is the command that tells USB from USB-D. Commands 01/04/06 carry only
-// the mode byte, and USB and USB-D share it (0x01), so nothing in that family
-// can express or report the DATA flag. 0x26 carries mode, DATA on/off and the
-// filter slot together, per VFO, and it is both readable and writable.
-//
-// ONE FRAME MATTERS, not just one command. Setting the three separately lets
-// them clobber each other: on a real radio an ordinary-mode write can clear
-// DATA, so a mode change followed by a DATA write is a race with the radio's
-// own side effects, and a filter change sent as a plain mode write drops the
-// operator straight out of DATA. 0x26 makes the three a single transaction the
-// radio applies or refuses as a unit.
+// 0x26: operating mode, DATA flag and IF filter slot in ONE frame, per VFO,
+// readable and writable. It is the only command that distinguishes USB from
+// USB-D (01/04/06 carry only the shared mode byte). Send the three together: as
+// separate writes, an ordinary mode write can clear DATA on the radio.
 inline constexpr std::uint8_t kVfoMode      = 0x26;
 }  // namespace cmd
+
+[[nodiscard]] std::vector<std::uint8_t> cmdSendCwMessage(
+    std::uint8_t to, std::string_view ascii);
+[[nodiscard]] std::vector<std::uint8_t> cmdAbortCwMessage(std::uint8_t to);
 
 // The subcommand of 0x26 is the VFO it addresses.
 //
@@ -239,6 +220,17 @@ inline constexpr std::uint8_t kNbLevel   = 0x12;
 // frequency, and not a depth. It moves with the filter, which is why the
 // seam carries this as a percentage rather than Hz.
 inline constexpr std::uint8_t kNotchPos  = 0x0D;
+// TWIN PBT — the two ends of the IF passband, 0000..0255 with 0128 at the
+// centre. NOT a width and NOT a frequency: each is a SHIFT, and how many Hz a
+// step is worth depends on the IF width currently in circuit (see pbtShiftHz).
+//
+// The pair is what makes an Icom's passband resizable at all. 1A 03 sets the
+// WIDTH symmetrically about the filter centre; moving both PBTs together slides
+// that window without changing it, and moving them apart narrows it from the
+// inside. Low-cut and high-cut are therefore not two commands on an Icom —
+// they are one width plus one shift, which is what setSliceFilter decomposes.
+inline constexpr std::uint8_t kPbtInner  = 0x07;
+inline constexpr std::uint8_t kPbtOuter  = 0x08;
 // VOX gain — the trigger threshold. NOT the delay: the guide puts VOX DELAY in
 // the SET menu at 1A 05 0359 (00..20), and 14 17 is the ANTI-vox gain, which is
 // a different control again.
@@ -265,6 +257,8 @@ inline constexpr std::uint8_t kAgc           = 0x12;   // 01 fast, 02 mid, 03 sl
 inline constexpr std::uint8_t kNoiseBlanker  = 0x22;
 inline constexpr std::uint8_t kNoiseReduce   = 0x40;
 inline constexpr std::uint8_t kAutoNotch     = 0x41;
+inline constexpr std::uint8_t kRepeaterTone  = 0x42;
+inline constexpr std::uint8_t kRepeaterAccess = 0x5D;
 inline constexpr std::uint8_t kCompressor    = 0x44;
 inline constexpr std::uint8_t kMonitorFn     = 0x45;
 inline constexpr std::uint8_t kVox           = 0x46;
@@ -273,6 +267,14 @@ inline constexpr std::uint8_t kManualNotch   = 0x48;
 // no seam verb carries a notch width, and overwriting the operator's own
 // choice would be worse than not offering it.
 inline constexpr std::uint8_t kManualNotchWidth = 0x57;
+// 00 SHARP, 01 SOFT — the DSP filter skirt for the operating band.
+inline constexpr std::uint8_t kIfFilterShape = 0x56;
+// WHICH SSB TRANSMIT BANDWIDTH IS IN CIRCUIT: 00 WIDE, 01 MID, 02 NAR. It
+// selects one of three SET-menu slots; the EDGES themselves live in those slots
+// (see ModelTxBandwidth), and which slot the radio uses also depends on whether
+// the speech compressor is on. So this alone never tells you the passband —
+// it tells you which stored passband to read.
+inline constexpr std::uint8_t kTxBandwidth   = 0x58;
 inline constexpr std::uint8_t kBreakIn       = 0x47;   // 00 off, 01 semi, 02 full
 inline constexpr std::uint8_t kDialLock      = 0x50;
 }  // namespace func
@@ -287,13 +289,66 @@ inline constexpr std::uint8_t kDialLock      = 0x50;
 // that is listening somewhere else.
 namespace setting {
 inline constexpr int kVoxDelay        = 359;   // 00..20, in 0.1 s steps
+inline constexpr int kNtpEnabled      = 167;   // 00 off, 01 on
+inline constexpr int kNtpServer       = 168;   // up to 64 ASCII characters
+inline constexpr int kGpsTimeCorrect  = 169;   // 00 off, 01 auto
 }  // namespace setting
+
+// The SUBCOMMANDS of 0x1A. 0x05 is the SET menu everything above reaches
+// through; 0x03 is a command in its own right and NOT a menu item.
+namespace settingSub {
+inline constexpr std::uint8_t kFilterWidth = 0x03;   // the IF width, in circuit now
+inline constexpr std::uint8_t kMenu        = 0x05;   // 1A 05 <item> — the SET menu
+inline constexpr std::uint8_t kNtpAccess   = 0x07;   // terminate/initiate NTP access
+inline constexpr std::uint8_t kNtpResult   = 0x08;   // accessing / succeeded / failed
+}  // namespace settingSub
 
 // Read or write a 1A 05 SET-menu item. `item` is the DECIMAL menu number as
 // printed in the guide (118, 119, ...); it is encoded as two BCD bytes.
 [[nodiscard]] std::vector<std::uint8_t> cmdReadSetting(std::uint8_t to, int item);
 [[nodiscard]] std::vector<std::uint8_t> cmdWriteSetting(std::uint8_t to, int item,
                                                         std::uint8_t value);
+// SET-menu levels use the same two-byte 0000..0255 BCD payload as command 14,
+// unlike the one-byte enums written by cmdWriteSetting().
+[[nodiscard]] std::vector<std::uint8_t> cmdWriteSettingLevel(std::uint8_t to, int item,
+                                                             int value);
+[[nodiscard]] std::vector<std::uint8_t> cmdWriteSettingData(
+    std::uint8_t to, int item, std::span<const std::uint8_t> value);
+
+// IC-705 GPS and clock control. The position wire shape is documented by
+// Icom's IC-705 CI-V Reference Guide pp. 21 and 25. It is intentionally kept
+// in this transport-free codec so a future local-serial Icom path gets exactly
+// the same validation as the RS-BA1 network path.
+namespace gps {
+inline constexpr std::uint8_t kPosition = 0x00;
+inline constexpr std::uint8_t kSource   = 0x01;
+inline constexpr std::uint8_t kManual   = 0x02;
+}  // namespace gps
+
+struct GpsPosition {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    std::optional<double> altitudeMetres;
+    std::optional<int> courseDegrees;
+    std::optional<double> speedKmh;
+    std::optional<std::string> utcIso8601;
+};
+
+[[nodiscard]] std::optional<GpsPosition>
+decodeGpsPosition(std::span<const std::uint8_t> data);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadGpsPosition(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadGpsSource(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdNtpAccess(std::uint8_t to, bool initiate);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadNtpAccessResult(std::uint8_t to);
+
+// Four zero-padded decimal IPv4 octets, each encoded in two BCD bytes, as used
+// by the Icom SET-menu network registers. Invalid BCD and octets >255 fail.
+[[nodiscard]] std::optional<std::array<std::uint8_t, 4>>
+decodeNetworkAddress(std::span<const std::uint8_t> data);
+[[nodiscard]] std::optional<std::array<std::uint8_t, 4>>
+subnetMaskFromBcdPrefix(std::uint8_t raw);
+[[nodiscard]] std::optional<std::string>
+decodeNetworkName(std::span<const std::uint8_t> data);
 
 // Command 0x21 — RIT and dTX (which is what Icom calls XIT).
 namespace tuneOffset {
@@ -313,6 +368,22 @@ inline constexpr std::uint8_t kTuner = 0x01;
 inline constexpr std::uint8_t kXfc   = 0x02;
 inline constexpr std::uint8_t kReadTxFreq = 0x03;
 }  // namespace control
+
+namespace repeaterAccess {
+inline constexpr std::uint8_t kFunction = 0x5D;
+}  // namespace repeaterAccess
+
+namespace repeaterTone {
+inline constexpr std::uint8_t kTxCtcss = 0x00;
+inline constexpr std::uint8_t kRxCtcss = 0x01;
+inline constexpr std::uint8_t kDtcs    = 0x02;
+}  // namespace repeaterTone
+
+struct RepeaterToneRegister {
+    int value = 0;
+    bool txReverse = false;
+    bool rxReverse = false;
+};
 
 namespace scope {
 inline constexpr std::uint8_t kWaveData    = 0x00;
@@ -369,25 +440,12 @@ struct VfoModeState {
     int filter = 0;
 };
 
-// Filter selection. The IC-705 offers three fixed IF filters, not a continuous
-// passband, so a request in Hz can only SNAP. Returns 1, 2 or 3.
-//
-// The widths are the radio's own SSB defaults; the operator can redefine them
-// in the SET menu and we have no way to read the redefinition back. So this is
-// a best-effort mapping, and the honest consequence is that the passband the
-// UI shows must come from what the radio reports, never from what we asked for.
-//
-// MODE-DEPENDENT, and that is the whole point. The radio has three filter slots
-// and what each one MEANS changes with the mode: FIL1 is 3.0 kHz in SSB, 1.2 kHz
-// in CW, 9 kHz in AM and 15 kHz in FM. Snapping every mode against the SSB
-// thresholds — which this used to do — put every AM width on FIL1 and every CW
-// width on FIL3, so the operator had three buttons and one filter.
-//
-// Ladders from the IC-705's own defaults (hamlib rigs/icom/ic7300.c,
-// RIG_MODEL_IC705). The operator can redefine them in the SET menu and there is
-// no command to read the redefinition back, so this stays best-effort — and the
-// consequence is load-bearing: the passband the UI shows must come from what the
-// radio REPORTS after the change, never from the width we asked for.
+// Filter slot (1, 2 or 3) for a requested width; the radio has three fixed IF
+// slots, so a request in Hz can only SNAP. Mode-dependent: FIL1 is 3.0 kHz in
+// SSB, 1.2 kHz in CW, 9 kHz in AM, 15 kHz in FM. Ladders are the IC-705 defaults
+// (hamlib rigs/icom/ic7300.c, RIG_MODEL_IC705); the operator can redefine them
+// and there is no way to read that back, so the UI passband must come from what
+// the radio REPORTS after the change, never from the width requested.
 [[nodiscard]] int filterForWidthHz(const std::string& mode, int widthHz) noexcept;
 
 // The widths that mode's filter slots hold, NARROWEST FIRST — deliberately the
@@ -397,12 +455,125 @@ struct VfoModeState {
 // the same narrow-to-wide order as every other filter row in the app.
 [[nodiscard]] std::vector<int> filterWidthsForMode(const std::string& mode);
 
+struct FilterPresetState {
+    int id = 0;
+    int widthHz = 0;
+
+    bool operator==(const FilterPresetState&) const = default;
+};
+
+// FIL1/FIL2/FIL3 in radio order. The selected slot may carry a custom width;
+// replacing its content must never reorder or rename the slot.
+[[nodiscard]] std::vector<FilterPresetState> filterPresetsForMode(
+    const std::string& mode, int selectedPresetId = 0, int selectedWidthHz = 0);
+
 // The passband that filter gives in that mode, in Hz relative to the carrier,
 // sign carrying the sideband (SliceModel's convention). The backend needs this
 // because an IC-705's IF filters cannot be read back as Hz — nothing else in
 // the chain can fill the window in.
 [[nodiscard]] std::pair<int, int> passbandForModeAndFilter(const std::string& mode,
                                                           int filter);
+
+// Complete wire plan for recalling a FIL button. The select command comes
+// first, followed (where the mode permits it) by the slot's factory width and
+// centred Twin-PBT writes. Keeping this Qt- and transport-free lets the exact
+// operator command sequence be mutation-tested without a fake radio socket.
+struct FilterPresetRecallPlan {
+    std::vector<std::vector<std::uint8_t>> commands;
+    int widthHz = 0;
+    int lowHz = 0;
+    int highHz = 0;
+    int pbtCode = 128;
+};
+[[nodiscard]] std::optional<FilterPresetRecallPlan> filterPresetRecallPlan(
+    std::uint8_t to, const std::string& ladderMode, CivMode wireMode,
+    bool dataMode, int presetId, bool useVfoMode);
+
+// IF filter WIDTH (1A 03). Three distinct things, never conflate them:
+//   * SLOT      — FIL1/2/3, chosen with 0x26 (or 0x06).
+//   * WIDTH     — 1A 03, the Hz the selected slot is currently defined as
+//                 (operator-redefinable, per mode, remembered by the radio).
+//   * PBT SHIFT — 14 07 / 14 08, position and inside cut of that width.
+// Width codes (identical on IC-705, IC-7300MK2 and current Icoms):
+//   SSB / CW        00..09 -> 50..500 Hz (50 Hz),  10..40 -> 600..3600 Hz (100 Hz)
+//   RTTY            00..09 -> 50..500 Hz (50 Hz),  10..31 -> 600..2700 Hz (100 Hz)
+//   AM              00..49 -> 200..10000 Hz (200 Hz)
+//   FM / DV / WFM   no settable width; 1A 03 does not apply
+// There is no 550 Hz code (wfview's `code <= 10` branch gets this wrong), so the
+// tables come from ONE function and the encoder searches it instead of inverting.
+
+// Which of the three code tables a mode uses. Fixed means the mode has no
+// settable width at all.
+enum class WidthClass : std::uint8_t { Ssb, Rtty, Am, Fixed };
+[[nodiscard]] WidthClass widthClassFor(const std::string& mode) noexcept;
+
+// The Hz that width code means in that mode, or nullopt when the code is
+// outside the mode's table (or the mode has no settable width). VALIDATES
+// rather than clamps: these bytes arrive from the network, and a code the
+// table does not define is a frame we have mis-parsed, not a narrow filter.
+[[nodiscard]] std::optional<int> filterWidthHzFromCode(const std::string& mode,
+                                                        std::uint8_t code) noexcept;
+
+// The code whose width is NEAREST to `hz`. Returns nullopt for a mode with no
+// settable width. Searches the decode table, so encode and decode cannot drift.
+[[nodiscard]] std::optional<std::uint8_t> filterWidthCodeFor(const std::string& mode,
+                                                              int hz) noexcept;
+
+// The narrowest and widest this mode can reach, and the step at the wide end.
+// {0, 0, 0} means the mode has no settable width — the caller must not offer a
+// resize control for it.
+struct FilterWidthLimits {
+    int minHz = 0;
+    int maxHz = 0;
+    int coarseStepHz = 0;   // the step above 500 Hz; below that it is 50 Hz
+};
+[[nodiscard]] FilterWidthLimits filterWidthLimitsFor(const std::string& mode) noexcept;
+
+[[nodiscard]] std::vector<std::uint8_t> cmdReadFilterWidth(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetFilterWidth(std::uint8_t to, std::uint8_t code);
+
+// ---------------------------------------------------------------------------
+// Twin PBT (14 07 / 14 08)
+// ---------------------------------------------------------------------------
+
+inline constexpr int kPbtCentreCode = 128;
+// Codes either side of centre. 0000..0255 with 0128 centred is 128 below and
+// 127 above, so the usable symmetric span is 127 — using 128 would make the
+// two directions disagree by one step at full deflection.
+inline constexpr int kPbtSpanCodes  = 127;
+
+// How many Hz that PBT code is worth. SCALED BY THE WIDTH IN CIRCUIT: full
+// deflection moves the passband by one whole width, so the same code means
+// 3.6 kHz in wide SSB and 250 Hz in narrow CW. A converter that assumed a
+// fixed Hz-per-step would be right in exactly one filter.
+[[nodiscard]] int pbtShiftHz(int code, int widthHz) noexcept;
+
+// The inverse, clamped to 0..255. Returns kPbtCentreCode for a zero or
+// unusable width rather than dividing by it.
+[[nodiscard]] int pbtCodeForShiftHz(int shiftHz, int widthHz) noexcept;
+
+// What the operator actually hears, given the width in circuit and both PBT
+// positions. Moving the pair TOGETHER slides the passband; moving them APART
+// narrows it from the inside — which is the only way an Icom produces an
+// asymmetric response, and the reason width alone can never describe one.
+//
+// `centreHz` is where this mode puts the passband centre relative to the
+// carrier, signed in SliceModel's convention (see passbandCentreHz).
+struct PassbandEdges {
+    int lowHz = 0;
+    int highHz = 0;
+};
+[[nodiscard]] PassbandEdges passbandFromWidthAndPbt(int centreHz, int widthHz,
+                                                     int innerCode, int outerCode) noexcept;
+
+// Signed CENTRE of this mode's passband relative to the carrier — not the low
+// edge: Icom SSB filters narrow and widen symmetrically about a fixed centre
+// (cf. "Filter Center" vs "Carrier Point", 1A 05 01 39 on the IC-7300MK2).
+// SSB centre is 1500 Hz, as wfview uses for every Icom (receiverwidget.cpp).
+// CW is 0 because the slice frequency in CW already is the pitch. RTTY keeps a
+// 150 Hz carrier-side edge (needs `widthHz`); the mark frequency (SET 0050) is
+// configurable and not modeled yet.
+[[nodiscard]] int passbandCentreHz(const std::string& mode, int widthHz) noexcept;
 
 // ---------------------------------------------------------------------------
 // Command builders
@@ -433,11 +604,61 @@ struct VfoModeState {
 [[nodiscard]] std::vector<std::uint8_t> cmdSetFunction(std::uint8_t to, std::uint8_t which,
                                                         int value);
 [[nodiscard]] std::vector<std::uint8_t> cmdSetPtt(std::uint8_t to, bool transmit);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetTransmitFrequencyCheck(std::uint8_t to,
+                                                                     bool on);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadTransmitFrequencyCheck(std::uint8_t to);
 // Attenuator. `db` is the dB figure the radio prints (0 or 20 on an
 // IC-705), encoded as one BCD byte. The read form carries no payload.
 [[nodiscard]] std::vector<std::uint8_t> cmdSetAttenuator(std::uint8_t to, int db);
 [[nodiscard]] std::vector<std::uint8_t> cmdReadAttenuator(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadRxAntenna(std::uint8_t to);
 [[nodiscard]] std::vector<std::uint8_t> cmdSetRxAntenna(std::uint8_t to, bool rxAntenna);
+enum class RepeaterOffsetDirection : std::uint8_t {
+    Simplex = 0x10,
+    Down = 0x11,
+    Up = 0x12,
+};
+[[nodiscard]] std::vector<std::uint8_t> cmdReadRepeaterOffsetDirection(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetRepeaterOffsetDirection(
+    std::uint8_t to, RepeaterOffsetDirection direction);
+[[nodiscard]] std::optional<RepeaterOffsetDirection> decodeRepeaterOffsetDirection(
+    std::span<const std::uint8_t> payload);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadRepeaterOffset(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetRepeaterOffset(std::uint8_t to,
+                                                             int offsetHz);
+[[nodiscard]] std::optional<int> decodeRepeaterOffsetHz(
+    std::span<const std::uint8_t> payload);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadRepeaterTone(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetRepeaterTone(std::uint8_t to,
+                                                           double toneHz);
+[[nodiscard]] std::optional<double> decodeRepeaterToneHz(
+    std::span<const std::uint8_t> payload);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadRepeaterAccess(std::uint8_t to);
+[[nodiscard]] std::optional<std::uint8_t> decodeRepeaterAccess(
+    std::span<const std::uint8_t> payload);
+// Normalized radio-state token for each documented IC-9700 16 5D value.
+// Empty means reserved/unknown. Kept here with the wire decoder so socket-free
+// protocol tests can pin every value without a fake radio session.
+[[nodiscard]] std::string_view repeaterAccessModeName(std::uint8_t value) noexcept;
+[[nodiscard]] std::optional<std::uint8_t> repeaterAccessModeValue(
+    std::string_view name) noexcept;
+[[nodiscard]] std::vector<std::uint8_t> cmdReadRepeaterToneRegister(
+    std::uint8_t to, std::uint8_t which);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetRepeaterToneRegister(
+    std::uint8_t to, std::uint8_t which, int value,
+    bool txReverse = false, bool rxReverse = false);
+[[nodiscard]] std::optional<std::vector<std::uint8_t>>
+repeaterToneConfirmationForWrite(std::uint8_t to, const CivFrame& write);
+[[nodiscard]] std::optional<RepeaterToneRegister> decodeRepeaterToneRegister(
+    std::span<const std::uint8_t> payload);
+[[nodiscard]] std::vector<std::uint8_t> cmdReadTransmitFrequency(std::uint8_t to);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetCtcssTone(std::uint8_t to,
+                                                        std::uint8_t which,
+                                                        double toneHz);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetDtcsTone(
+    std::uint8_t to, int code, bool txReverse, bool rxReverse);
+[[nodiscard]] std::vector<std::uint8_t> cmdSetRepeaterAccess(std::uint8_t to,
+                                                             std::uint8_t mode);
 // RIT / dTX read forms, and the antenna tuner. `21 xx` with no payload asks;
 // `1C 01` with no payload asks whether the tuner is on, off or mid-cycle.
 [[nodiscard]] std::vector<std::uint8_t> cmdReadTuneOffset(std::uint8_t to, std::uint8_t sub);
@@ -464,18 +685,9 @@ inline constexpr std::array<int, 8> kScopeSpansHz{
 };
 [[nodiscard]] int nearestScopeSpanHz(int requestedHz) noexcept;
 
-// The span one detent away from `spanHz`, in the given direction (-1 narrower,
-// +1 wider). Clamps at the ends of the table rather than wrapping.
-//
-// WHY THIS EXISTS, because "snap to nearest" looks like it should be enough and
-// is not. The spans above are spaced by ratios of 2 and 2.5, while the zoom
-// buttons scale the view by 1.5. Multiplying a span by 1.5 therefore NEVER
-// reaches the midpoint of the gap to the next one up, so nearest-snapping a
-// zoom-out request always returns the span it started from. Measured across the
-// whole table, zoom-out was inert at all eight spans and zoom-in worked at
-// seven — an asymmetry that reads as "zoom is broken" rather than "zoom is
-// quantised", and which no amount of clicking can escape because the view is
-// re-seeded from the radio's own sweep 30 times a second.
+// The span one detent away from `spanHz` (-1 narrower, +1 wider), clamped at the
+// table ends. Needed because the spans step by ratios of 2 and 2.5 while zoom
+// scales by 1.5, so nearest-snapping a zoom-out always returns the starting span.
 [[nodiscard]] int adjacentScopeSpanHz(int spanHz, int direction) noexcept;
 
 }  // namespace AetherSDR::icom

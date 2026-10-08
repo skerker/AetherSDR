@@ -33,6 +33,8 @@ struct _ch
 	int type;
 	volatile long run;			// when 1, thread loops; when 0, thread terminates
 	volatile long exchange;		// when 1, fexchange() operates; when 0, it just returns
+	volatile long mainGen;		// AetherSDR patch 4: launch sequence; start_thread() increments it per worker
+	volatile long mainExited;	// AetherSDR patch 4: the worker stores ITS OWN generation (held in a local, never read back from ch[]) here as its last act; pre_main_destroy() waits for it to equal mainGen. Generation-valued rather than 0/1 so a late store from an abandoned worker cannot satisfy a later wait
 	int in_rate;				// input samplerate
 	int out_rate;				// output samplerate
 	int in_size;				// input buffsize (complex samples) in a fexchange() operation
@@ -48,6 +50,7 @@ struct _ch
 	double tslewup;
 	double tdelaydown;
 	double tslewdown;
+	int exchangeDepth;			// AetherSDR patch 15: prepared ring slots; legacy Open resets to DSP_MULT
 	int bfo;					// 'block_for_output', block fexchange until output is available
 	volatile long flushflag;
 	struct	//io buffers
@@ -60,6 +63,8 @@ struct _ch
 extern struct _ch ch[];
 
 PORT void OpenChannel (int channel, int in_size, int dsp_size, int input_samplerate, int dsp_rate, int output_samplerate, int type, int state, double tdelayup, double tslewup, double tdelaydown, double tslewdown, int bfo);
+
+PORT int OpenChannelWithExchangeDepth (int channel, int in_size, int dsp_size, int input_samplerate, int dsp_rate, int output_samplerate, int type, int state, double tdelayup, double tslewup, double tdelaydown, double tslewdown, int bfo, int exchangeDepth);
 
 PORT void CloseChannel (int channel);
 

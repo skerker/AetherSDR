@@ -21,6 +21,13 @@ void TunerModel::setHandle(const QString& handle)
     m_handle = handle;
     bool nowPres = isPresent();
     qCDebug(lcTuner) << "TunerModel: handle set to" << m_handle;
+    // An empty handle means the relayed side lost the tuner; a tune reported before
+    // that would stay latched and let abortTune() start a tune on an idle tuner, so
+    // clear it. Not while a direct connection is up: it still watches the tune and
+    // reports the end itself (clearing would flip the key to TUNE mid-tune).
+    if (m_handle.isEmpty() && !hasDirectConnection()) {
+        clearTuning();
+    }
     if (wasPres != nowPres)
         emit presenceChanged(nowPres);
     emit stateChanged();
@@ -31,11 +38,19 @@ void TunerModel::applyChanges(const TunerDelta& d)
     // Apply only the present fields, change-gated — faithful to the prior
     // applyStatus (which iterated the wire kv-set). The SmartSDR key names and
     // "1"/toInt parsing now live in FlexBackend::decodeTunerStatus; informational
-    // fields (nickname/version/ant/dhcp/netmask/gateway/ptta/pttb) are dropped there.
+    // fields (nickname/version/dhcp/netmask/gateway) are dropped there.
     // Edge-signal emit order matches the old QMap key-sorted iteration:
     // antennaAChanged (key "antA") precedes tuningChanged (key "tuning").
+    // pttChanged is new, so it has no legacy position to preserve; it is
+    // emitted where its keys sort ("pttA"/"pttB", between the two) to keep
+    // that one rule describing the whole function rather than most of it.
+    const bool wasPresent = isPresent();
     bool changed = false;
+    std::optional<int> pendingAntennaA;
+    std::optional<bool> pendingTuning;
+    bool pttMoved = false;
 
+    if (d.handle && m_handle != *d.handle)           { m_handle = *d.handle;       changed = true; }
     if (d.serialNum && m_serialNum != *d.serialNum) { m_serialNum = *d.serialNum; changed = true; }
     if (d.model && m_model != *d.model)             { m_model = *d.model;         changed = true; }
     if (d.operate && m_operate != *d.operate)       { m_operate = *d.operate;     changed = true; }
@@ -43,29 +58,70 @@ void TunerModel::applyChanges(const TunerDelta& d)
     if (d.antennaA && m_antennaA != *d.antennaA) {
         m_antennaA = *d.antennaA;
         changed = true;
-        emit antennaAChanged(m_antennaA);        // "antA" sorts before "tuning"
+        pendingAntennaA = m_antennaA;
     }
     if (d.tuning && m_tuning != *d.tuning) {
         m_tuning = *d.tuning;
         changed = true;
-        emit tuningChanged(m_tuning);
+        pendingTuning = m_tuning;
     }
     if (d.relayC1 && m_relayC1 != *d.relayC1) { m_relayC1 = *d.relayC1; changed = true; }
     if (d.relayC2 && m_relayC2 != *d.relayC2) { m_relayC2 = *d.relayC2; changed = true; }
     if (d.relayL && m_relayL != *d.relayL)    { m_relayL = *d.relayL;   changed = true; }
     if (d.oneByThree && m_oneByThree != *d.oneByThree) { m_oneByThree = *d.oneByThree; changed = true; }
     if (d.ip && m_tgxlIp != *d.ip)                     { m_tgxlIp = *d.ip;              changed = true; }
+    if (d.portAAnt && m_portAAnt != *d.portAAnt) { m_portAAnt = *d.portAAnt; changed = true; }
+    if (d.portBAnt && m_portBAnt != *d.portBAnt) { m_portBAnt = *d.portBAnt; changed = true; }
+    if (d.pttA && m_pttA != *d.pttA) { m_pttA = *d.pttA; changed = true; pttMoved = true; }
+    if (d.pttB && m_pttB != *d.pttB) { m_pttB = *d.pttB; changed = true; pttMoved = true; }
 
-    if (changed)
+    const bool nowPresent = isPresent();
+    if (wasPresent != nowPresent) {
+        emit presenceChanged(nowPresent);
+    }
+    if (pendingAntennaA) {
+        emit antennaAChanged(*pendingAntennaA);  // "antA" sorts before "tuning"
+    }
+    if (pttMoved) {
+        emit pttChanged(m_pttA, m_pttB);
+    }
+    if (pendingTuning) {
+        emit tuningChanged(*pendingTuning);
+    }
+    if (changed) {
         emit stateChanged();
+    }
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
+
+void TunerModel::applyDirectTuning(const QMap<QString, QString>& kvs)
+{
+    if (!kvs.contains(QStringLiteral("tuning"))) return;
+    const bool tuning = kvs.value(QStringLiteral("tuning")) == QLatin1String("1");
+    if (m_tuning == tuning) return;
+    m_tuning = tuning;
+    emit tuningChanged(m_tuning);
+    emit stateChanged();
+}
+
+void TunerModel::clearTuning()
+{
+    if (!m_tuning) return;
+    m_tuning = false;
+    emit tuningChanged(false);
+    emit stateChanged();
+}
 
 void TunerModel::setOperate(bool on)
 {
     if (m_handle.isEmpty()) {
         qCDebug(lcTuner) << "TunerModel::setOperate: no handle yet, ignoring";
+        // A TGXL reached by manual IP alone (a non-Flex radio) is present and
+        // on screen, but only a Flex relays operate/standby. Say so.
+        if (m_directPresence) {
+            emit relayedCommandRefused(QStringLiteral("operate"));
+        }
         return;
     }
     // Neutral intent → Flex "tgxl set handle=<h> mode=" wire (via RadioModel).
@@ -79,6 +135,9 @@ void TunerModel::setBypass(bool on)
 {
     if (m_handle.isEmpty()) {
         qCDebug(lcTuner) << "TunerModel::setBypass: no handle yet, ignoring";
+        if (m_directPresence) {
+            emit relayedCommandRefused(QStringLiteral("bypass"));
+        }
         return;
     }
     // Neutral intent → Flex "tgxl set handle=<h> bypass=" wire (via RadioModel).
@@ -86,6 +145,26 @@ void TunerModel::setBypass(bool on)
     // Optimistic update: reflect the commanded state immediately so the
     // button label stays in sync even before the radio echoes back.
     if (m_bypass != on) { m_bypass = on; emit stateChanged(); }
+}
+
+void TunerModel::setOperateAndBypass(bool operate, bool bypass, bool operateFirst)
+{
+    if (m_handle.isEmpty()) {
+        qCDebug(lcTuner) << "TunerModel::setOperateAndBypass: no handle yet, ignoring";
+        // One press, one refusal: the two setters below would each refuse.
+        if (m_directPresence) {
+            emit relayedCommandRefused(operateFirst ? QStringLiteral("operate")
+                                                    : QStringLiteral("bypass"));
+        }
+        return;
+    }
+    if (operateFirst) {
+        setOperate(operate);
+        setBypass(bypass);
+    } else {
+        setBypass(bypass);
+        setOperate(operate);
+    }
 }
 
 void TunerModel::autoTune()
@@ -105,6 +184,29 @@ void TunerModel::autoTune()
     }
     // Neutral intent → Flex "tgxl autotune handle=<h>" wire. RadioModel applies
     // the TX interlock gate before dispatching (was a commandReady string-sniff).
+    emit autotuneRequested();
+}
+
+void TunerModel::abortTune()
+{
+    if (!m_tuning) return;
+
+    // `autotune` is a toggle: idle it starts a cycle; with tuning=1 it aborts, and
+    // the tuner acks with a bare R<seq>|0| instead of a state push (captured from
+    // 4O3A TunerGeniusDesk; FlexLib does not document it). The m_tuning guard above
+    // is what makes this an abort and never a start. The tuner stays in OPERATE
+    // across an abort, so nothing needs restoring.
+    qCDebug(lcTuner) << "TunerModel::abortTune: re-sending autotune to abort";
+    if (m_directConn && m_directConn->isConnected()) {
+        m_directConn->requestAutotune();
+        return;
+    }
+    if (m_handle.isEmpty()) {
+        qCDebug(lcTuner) << "TunerModel::abortTune: no direct conn and no handle, ignoring";
+        return;
+    }
+    // Relayed path: the radio passes `tgxl autotune` to the same firmware,
+    // which has no separate notion of start-vs-abort to lose in translation.
     emit autotuneRequested();
 }
 
@@ -144,9 +246,40 @@ void TunerModel::setDirectConnection(TgxlConnection* conn)
                 emit presenceChanged(false);
             emit directConnectionChanged(false);
         });
+        // Alerts are pushed to every client, so this arrives whether or not
+        // it was this client that asked for the tune.
+        connect(m_directConn, &TgxlConnection::alertChanged, this,
+                [this](const QString& text) {
+            if (m_alert == text) return;
+            m_alert = text;
+            emit alertChanged(m_alert);
+        });
+        // Clear a stale alert on disconnect — it describes a tuner we can no
+        // longer see, and the tuner's own clear can never reach us now.
+        connect(m_directConn, &TgxlConnection::disconnected, this, [this]() {
+            if (!m_alert.isEmpty()) {
+                m_alert.clear();
+                emit alertChanged(m_alert);
+            }
+            // And the tune: a latched `tuning` is not merely stale display,
+            // it is what unlocks abortTune() — which on this transport sends
+            // `autotune`, and `autotune` on an idle tuner starts one.
+            clearTuning();
+            // Same for the port readings: without the direct connection they
+            // stop being refreshed, and a frozen frequency is worse than
+            // falling back to what the radio can still tell us.
+            if (m_havePortInfo) {
+                m_havePortInfo = false;
+                m_portA = {};
+                m_portB = {};
+                emit portsChanged();
+            }
+        });
+
         // Update relay values from direct state pushes
         connect(m_directConn, &TgxlConnection::stateUpdated, this,
                 [this](const QMap<QString, QString>& kvs) {
+            applyDirectTuning(kvs);
             bool changed = false;
             if (kvs.contains("relayC1")) {
                 int v = kvs.value("relayC1").toInt();
@@ -177,6 +310,16 @@ void TunerModel::setDirectConnection(TgxlConnection* conn)
                 m_fwdPower = watts;
                 meters = true;
             }
+            // The device's rolling peak. Measured on a live transmission it
+            // holds for about a second after the last peak, then re-arms --
+            // a window, not a latch (`max` is the latch, and nothing here
+            // reads it). Our poll is slower than that window, so this is
+            // read every time it arrives rather than tracked for changes.
+            if (kvs.contains("peak")) {
+                float dBm = kvs.value("peak").toFloat();
+                m_fwdPeak = std::pow(10.0f, dBm / 10.0f) / 1000.0f;
+                meters = true;
+            }
             if (kvs.contains("swr")) {
                 float rl = kvs.value("swr").toFloat();  // return loss in dB (negative from TGXL)
                 float rho = std::pow(10.0f, rl / 20.0f);  // rl is already negative
@@ -184,11 +327,42 @@ void TunerModel::setDirectConnection(TgxlConnection* conn)
                 m_swr = ratio;
                 meters = true;
             }
-            if (meters) emit metersChanged(m_fwdPower, m_swr);
+            if (meters) emit metersChanged(m_fwdPower, m_swr, m_fwdPeak);
         });
-        // Also parse antA + meters from 1/sec status poll responses
+        // Also parse antA + meters + the per-port block from 1/sec status
+        // poll responses. The port fields appear only in `status`, never in
+        // the `state` push, so this is their one arrival point.
         connect(m_directConn, &TgxlConnection::statusUpdated, this,
                 [this](const QMap<QString, QString>& kvs) {
+            applyDirectTuning(kvs);
+            if (kvs.contains(QStringLiteral("modeA"))
+                || kvs.contains(QStringLiteral("modeB"))) {
+                auto readPort = [&kvs](QChar side) {
+                    TunerPortInfo p;
+                    p.live = kvs.value(QStringLiteral("mode%1").arg(side)) == QLatin1String("1");
+                    p.source = kvs.value(QStringLiteral("flex%1").arg(side));
+                    p.freqKhz = kvs.value(QStringLiteral("freq%1").arg(side)).toDouble();
+                    p.ptt = kvs.value(QStringLiteral("ptt%1").arg(side)) == QLatin1String("1");
+                    return p;
+                };
+                const TunerPortInfo a = readPort(QLatin1Char('A'));
+                const TunerPortInfo b = readPort(QLatin1Char('B'));
+                const bool first = !m_havePortInfo;
+                if (first || a != m_portA || b != m_portB) {
+                    m_portA = a;
+                    m_portB = b;
+                    m_havePortInfo = true;
+                    emit portsChanged();
+                }
+                // The direct status carries keying for both ports too, so the
+                // lamps track without waiting on the radio to relay it.
+                if (m_pttA != a.ptt || m_pttB != b.ptt) {
+                    m_pttA = a.ptt;
+                    m_pttB = b.ptt;
+                    emit pttChanged(m_pttA, m_pttB);
+                    emit stateChanged();
+                }
+            }
             if (kvs.contains("antA")) {
                 int v = kvs.value("antA").toInt();
                 if (m_antennaA != v) {
@@ -206,6 +380,16 @@ void TunerModel::setDirectConnection(TgxlConnection* conn)
                 m_fwdPower = watts;
                 meters = true;
             }
+            // The device's rolling peak. Measured on a live transmission it
+            // holds for about a second after the last peak, then re-arms --
+            // a window, not a latch (`max` is the latch, and nothing here
+            // reads it). Our poll is slower than that window, so this is
+            // read every time it arrives rather than tracked for changes.
+            if (kvs.contains("peak")) {
+                float dBm = kvs.value("peak").toFloat();
+                m_fwdPeak = std::pow(10.0f, dBm / 10.0f) / 1000.0f;
+                meters = true;
+            }
             if (kvs.contains("swr")) {
                 float rl = kvs.value("swr").toFloat();  // return loss in dB (negative from TGXL)
                 float rho = std::pow(10.0f, rl / 20.0f);  // rl is already negative
@@ -213,7 +397,7 @@ void TunerModel::setDirectConnection(TgxlConnection* conn)
                 m_swr = ratio;
                 meters = true;
             }
-            if (meters) emit metersChanged(m_fwdPower, m_swr);
+            if (meters) emit metersChanged(m_fwdPower, m_swr, m_fwdPeak);
         });
     }
 }

@@ -5,8 +5,12 @@
 #include <QStringList>
 #include <QMap>
 #include <QTimer>
+#include <QPointer>
+#include <array>
 
+#include "core/backends/NoiseBlankerKind.h"
 #include "core/backends/SliceDelta.h"
+#include "core/backends/ReceiveCommand.h"
 
 namespace AetherSDR {
 
@@ -21,9 +25,29 @@ class SliceModel : public QObject {
     Q_PROPERTY(int filterLow     READ filterLow  NOTIFY filterChanged)
     Q_PROPERTY(int filterHigh    READ filterHigh NOTIFY filterChanged)
     Q_PROPERTY(bool active       READ isActive   NOTIFY activeChanged)
+    Q_PROPERTY(bool inCapture    READ inCapture  NOTIFY inCaptureChanged)
     Q_PROPERTY(bool txSlice      READ isTxSlice  NOTIFY txSliceChanged)
 
 public:
+    struct ReceiveObservation {
+        std::optional<QString> mode;
+        std::optional<int> filterLowHz;
+        std::optional<int> filterHighHz;
+        std::optional<int> gain;
+        std::optional<bool> muted;
+        bool operator==(const ReceiveObservation&) const = default;
+    };
+    const ReceiveObservation& receiveObservation() const { return m_receiveObservation; }
+    // Records explicit filter intent without an optimistic value or a wire
+    // write. Adaptive filtering must still recognize a daemon operator edit.
+    void noteReceiveFilterIntent() { ++m_userFilterEpoch; }
+    // Conservative whole-MHz observation domain below JSON's 2^53-1 Hz
+    // integer limit. Keep target admission and MHz observation validation
+    // on this same bound; the general protocol integer domain is wider.
+    static constexpr qint64 kMaximumReportedFrequencyMhz = 9'007'199'254;
+    static constexpr qint64 kMaximumReportedFrequencyHz =
+        kMaximumReportedFrequencyMhz * 1'000'000;
+
     explicit SliceModel(int id, QObject* parent = nullptr);
     ~SliceModel() override;
 
@@ -39,6 +63,11 @@ public:
                                      : m_letter; }
     QString panId()      const { return m_panId; }       // e.g. "0x40000000"
     double  frequency()  const { return m_frequency; }   // MHz
+    // Separate from the optimistic desktop value. Only applyChanges writes
+    // this observation; a reused slice must wait for a fresh session report.
+    double reportedFrequency() const { return m_reportedFrequency; } // MHz
+    bool frequencyReportedKnown() const { return m_frequencyReportedKnown; }
+    void invalidateFrequencyObservation();
     QString mode()       const { return m_mode; }
     QStringList modeList() const { return m_modeList; }
     int     filterLow()  const { return m_filterLow; }   // Hz offset
@@ -57,6 +86,7 @@ public:
     bool    adaptiveHetReject()     const { return m_adaptiveHetReject; } // opt-in edge-het cut
     bool    adaptiveActive()        const { return m_adaptiveActive; }
     bool    isActive()   const { return m_active; }
+    bool    inCapture()  const { return m_inCapture; }
     bool    isTxSlice()  const { return m_txSlice; }
     float   rfGain()     const { return m_rfGain; }
     float   audioGain()  const { return m_externalReceiveAudioReplacement
@@ -75,7 +105,12 @@ public:
     QStringList txAntennaList() const { return m_txAntennaList; }
     bool    isLocked()    const { return m_locked; }
     bool    qskOn()       const { return m_qsk; }
-    bool    nbOn()        const { return m_nb; }
+    // WHETHER a blanker is running, for the many callers that only ask that:
+    // rigctl's NB, SmartCat's NB, TCI's rx_nb_enable, `get slice`, the MIDI
+    // mapping and the keyboard shortcut. nbKind() is WHICH one — see setNbKind().
+    bool    nbOn()        const { return m_nbKind != AetherSDR::NoiseBlankerKind::Off; }
+    AetherSDR::NoiseBlankerKind nbKind() const { return m_nbKind; }
+    AetherSDR::NoiseBlankerFill nbFill() const { return m_nbFill; }
     bool    nrOn()        const { return m_nr; }
     bool    anfOn()       const { return m_anf; }
     bool    nrlOn()       const { return m_nrl; }
@@ -108,6 +143,22 @@ public:
     int     receiveAgcThreshold() const { return m_externalReceiveAudioReplacement
                                               ? m_externalReceiveAgcThreshold
                                               : m_agcThreshold; }
+    // The AGC-T threshold's span on this slice: 0..100 on a Flex slice, the
+    // external receiver's dB span while it replaces the slice audio. Owned
+    // here so callers above the radio seam need no vendor header (#5384).
+    int     receiveAgcThresholdMinimum() const;
+    int     receiveAgcThresholdMaximum() const;
+    // The controller-surface AGC-T knob (MIDI/StreamDeck/Ulanzi registry,
+    // FlexControl/TMate2 wheel, keyboard) is one knob over two properties:
+    // agc_off_level while AGC is off, agc_threshold otherwise (FlexLib Slice.cs
+    // AGCOffLevel/AGCThreshold; docs/agc-t-calibration-design.md, #5384). Calibrator,
+    // CAT, TCI, bridge and band restore address the properties by name instead.
+    // agc_off_level is 0..100; the threshold spans receiveAgcThresholdMinimum/Maximum.
+    bool    agcTKnobUsesOffLevel() const;
+    int     agcTKnobMinimum() const;
+    int     agcTKnobMaximum() const;
+    int     agcTKnobLevel() const;
+    void    setAgcTKnobLevel(int value);
     int     agcOffLevel()  const { return m_agcOffLevel; }
     int     flexAgcOffLevel() const { return m_agcOffLevel; }
     int     receiveAgcOffLevel() const { return m_externalReceiveAudioReplacement
@@ -117,6 +168,9 @@ public:
                                       ? m_externalReceiveAudioMute
                                       : m_audioMute; }
     bool    flexAudioMute() const { return m_audioMute; }
+    // Only inbound reports establish current-session truth; local setters do not.
+    bool squelchStateKnown() const { return m_squelchOnKnown && m_squelchLevelKnown; }
+    void invalidateSquelchState() { m_squelchOnKnown = false; m_squelchLevelKnown = false; }
     bool    squelchOn()   const { return m_squelchOn; }
     bool    flexSquelchOn() const { return m_squelchOn; }
     bool    receiveSquelchOn() const { return m_externalReceiveAudioReplacement
@@ -127,6 +181,11 @@ public:
         return m_externalReceiveAutoSquelch;
     }
     int     squelchLevel()const { return m_squelchLevel; }
+    // Zero means not observed; never present a default as adopted DSP state.
+    int wfmDeemphasisUs() const { return m_wfmDeemphasisUs; }
+    bool wfmForceMono() const { return m_wfmForceMono; }
+    const WfmReceptionDiagnostics& wfmReceptionDiagnostics() const { return m_wfmReceptionDiagnostics; }
+    WfmStereoStatus wfmStereoStatus() const { return m_wfmStereoStatus; }
     int     flexSquelchLevel() const { return m_squelchLevel; }
     int     receiveSquelchLevel() const { return m_externalReceiveAudioReplacement
                                               ? m_externalReceiveSquelchLevel
@@ -138,22 +197,11 @@ public:
     // the active slice doesn't pull in another slice's threshold (#3326).
     int     manualSquelchLevel() const { return m_manualSquelchLevel; }
     void    setManualSquelchLevel(int level) { m_manualSquelchLevel = qBound(0, level, 100); }
-    // Whether a radio-echoed squelch_level for this slice should be taken as
-    // the operator's manual choice.  Driven by whichever surface owns the
-    // slice's SQL mode (RxApplet), and true only while that mode is Manual:
-    //   Manual — the echo is a genuine manual level (the operator's own
-    //            edit, another Multi-Flex client, or session restore) and
-    //            must update the manual memory.
-    //   Auto   — the level is algorithm-computed and re-pushed every tick.
-    //   Off    — the mode push sends sqlManualLevel(), but nothing keeps a
-    //            disabled squelch's level pinned, so an echo here is not a
-    //            threshold the operator chose either.
-    // Adopting the last two would silently overwrite the threshold the
-    // operator actually chose (#4592) — the same silent-overwrite class
-    // #3326 fixed, reached via the status-echo path rather than a direct
-    // client write.  Defaults true so a slice with no surface attached (a
-    // non-active VFO flag, a slice reclaimed from a previous session) still
-    // tracks genuine manual changes — the leak #4592 part 1 set out to close.
+    // Whether a radio-echoed squelch_level is the operator's manual choice. Set by
+    // the surface owning the SQL mode (RxApplet); true only in Manual. In Auto the
+    // level is algorithm-computed, and in Off nothing pins it, so adopting either
+    // would overwrite the operator's threshold (#4592). Defaults true so a slice
+    // with no surface attached still tracks genuine manual changes.
     void    setSquelchEchoIsManual(bool isManual) { m_squelchEchoIsManual = isManual; }
     bool    ritOn()       const { return m_ritOn; }
     int     ritFreq()     const { return m_ritFreq; }
@@ -166,8 +214,8 @@ public:
     // the two fight on reconnect. On a backend with no command plane there is no
     // radio opinion to defer to, the host bank owns the channel, and a recalled
     // step would otherwise never take because the wire command that normally
-    // round-trips it is dropped. Named for its one caller so the exception stays
-    // visible; see RadioModel::recallLocalMemory().
+    // round-trips it is dropped. Callers: RadioModel::recallCachedMemory() and
+    // RadioModel::applyClientOwnedSliceStep(), both only without a command plane.
     void    applyRecalledStepHz(int hz);
     QVector<int> stepList() const { return m_stepList; }
     int     daxChannel()  const { return m_daxChannel; }
@@ -185,6 +233,10 @@ public:
     // Getters — FM duplex/repeater
     QString fmToneMode()          const { return m_fmToneMode; }
     QString fmToneValue()         const { return m_fmToneValue; }
+    QString fmToneRxValue()       const { return m_fmToneRxValue; }
+    int     fmDtcsCode()          const { return m_fmDtcsCode; }
+    bool    fmDtcsTxReverse()     const { return m_fmDtcsTxReverse; }
+    bool    fmDtcsRxReverse()     const { return m_fmDtcsRxReverse; }
     QString repeaterOffsetDir()   const { return m_repeaterOffsetDir; }
     double  fmRepeaterOffsetFreq()const { return m_fmRepeaterOffsetFreq; }
     double  txOffsetFreq()        const { return m_txOffsetFreq; }
@@ -250,7 +302,18 @@ public:
     bool isLockedFeedbackActive() const { return m_lockedFeedbackActive; }
     static constexpr int kLockedFeedbackMs = 500;
     void setQsk(bool on);
+    // The bool door, kept because most callers have only one: true means the
+    // FIRST blanker (Impulse), which is what every one of them meant before a
+    // second existed. A caller that wants NB2 uses setNbKind().
     void setNb(bool on);
+    // WHICH blanker. Off/Impulse/Advanced; Advanced is reachable only on a radio
+    // that runs the blanker on this host (RadioCapabilities::
+    // hasHostNoiseBlanker), because it is WDSP's second stage and a radio-side
+    // blanker has nothing to map it onto but its one blanker.
+    void setNbKind(AetherSDR::NoiseBlankerKind kind);
+    // What Advanced puts in the blanked window. Remembered while another kind
+    // runs, so switching to NB2 and back does not reset the operator's choice.
+    void setNbFill(AetherSDR::NoiseBlankerFill fill);
     void setNr(bool on);
     void setAnf(bool on);
     void setNrl(bool on);
@@ -271,9 +334,14 @@ public:
     void setAnflLevel(int v);
     void setMnLevel(int v);
     void setAgcMode(const QString& mode);
+    // A stored AGC mode replayed by a bookmark recall; the backend decides
+    // whether it overrides the mode's own AGC default.
+    void recallAgcMode(const QString& mode);
     void setAgcThreshold(int value);
     void setAgcOffLevel(int value);
     void setSquelch(bool on, int level);
+    void setWfmDeemphasis(int microseconds);
+    void setWfmForceMono(bool forceMono);
     // For genuine operator-driven manual squelch input only (a VFO flag's
     // own SQL controls, a controller-mapped squelch knob) — setSquelch()
     // plus recording the level as the operator's manual choice, in one
@@ -299,9 +367,24 @@ public:
     // Setters — FM duplex/repeater
     void setFmToneMode(const QString& mode);
     void setFmToneValue(const QString& value);
+    void setFmToneRxValue(const QString& value);
+    void setFmDtcs(int code, bool txReverse, bool rxReverse);
     void setRepeaterOffsetDir(const QString& dir);
     void setFmRepeaterOffsetFreq(double mhz);
+    void applyRecalledFmRepeater(const QString& direction, double offsetMhz,
+                                 const QString& toneMode, double toneHz);
+    void applyRecalledFmRepeaterState(const QString& direction, double offsetMhz,
+                                      const QString& toneMode, double toneValue,
+                                      double rxToneValue, int dtcsCode = -1,
+                                      bool dtcsTxReverse = false,
+                                      bool dtcsRxReverse = false);
     void setTxOffsetFreq(double mhz);
+    // The signed TX offset a repeater direction + unsigned magnitude imply.
+    // Direction and magnitude each send only their own key, so tx_offset_freq
+    // — the field that actually moves the transmitter — has to be written
+    // alongside them; every caller that sets duplex must send all three.
+    // One copy, because three hand-rolled ones is how this drifted (#5102).
+    static double txOffsetForDirection(const QString& dir, double magnitudeMhz);
     void setFmDeviation(int hz);
 
     // Apply a normalized, typed slice delta from the backend
@@ -322,8 +405,18 @@ public:
 signals:
     void letterChanged(const QString& newLetter);
     void frequencyChanged(double mhz);
-    // Emitted after a local setter has issued a frequency command. Unlike
-    // frequencyChanged, radio-status application does not emit this signal.
+    // Emitted for every valid radio-reported frequency, including same-value
+    // reports. Unlike frequencyChanged(), this never represents an optimistic
+    // local tune request.
+    void frequencyStatusReported(double mhz);
+    // Supplemental observation notification when frequencyChanged does not
+    // fire (same-value reports, optimistic-value echoes, or invalidation).
+    void frequencyReported();
+    void receiveObservationChanged();
+    void receiveModeReported(); // including same-value reports after an intent
+    // Legacy local-intent notifications, not backend dispatch. In particular,
+    // linked slices consume frequencyChanged BEFORE frequencyCommandIssued
+    // arms their echo expectation. Status application emits neither request.
     void frequencyCommandIssued(double mhz);
     // Filter change originating from the OPERATOR, not from radio status.
     // filterChanged() fires for both, so it must not be used to drive a command
@@ -338,43 +431,23 @@ signals:
     // configuring a DSP AGC needs the pair to act on either.
     void agcCommandIssued(const QString& mode, int thresholdDb);
 
-    // RECEIVE DSP THE RADIO RUNS. Same contract as the signals above: emitted
-    // only by the operator-facing setters, never by status application, so a
-    // radio's own echo can never come back as a fresh command (Principle II).
-    //
-    // These exist because every one of these controls used to emit FlexRadio
-    // wire text and nothing else. On a Flex that string IS the command; on any
-    // other backend it was discarded, and there was no seam verb for a backend
-    // to implement instead — so declaring hasRadioSideDsp bought nothing and
-    // the control moved while the radio never heard about it.
-    //
-    // Enable and level travel TOGETHER because a radio that has a level
-    // register generally needs both to make either meaningful, and because the
-    // two arriving separately is how a toggle lands before the level it implies.
-    void noiseReductionCommandIssued(bool on, int level);
-    void noiseBlankerCommandIssued(bool on, int level);
-    void autoNotchCommandIssued(bool on);
-    // Enable and position together — see IRadioBackend::setSliceManualNotch
-    // for why turning the notch on without placing it is not enough.
-    void manualNotchCommandIssued(bool on, int position);
-    void squelchCommandIssued(bool on, int level);
+    // Canonical receive dispatch. Emitted after local notifications so a
+    // synchronous backend observation cannot be overwritten by an optimistic
+    // notification. RadioModel wires these once for every slice lifecycle.
+    // Explicit compatibility origins preserve Kiwi suppression and NRS profile
+    // restoration; routine status updates do not create operator intents.
+    void receiveTuneRequested(const AetherSDR::SliceTuneRequest& request);
+    void receiveFilterRequested(const AetherSDR::SliceFilterRequest& request);
+    void receiveAgcRequested(const AetherSDR::SliceAgcRequest& request);
+    void receiveDspRequested(const AetherSDR::SliceDspRequest& request);
+    void receiveAudioRequested(const AetherSDR::SliceAudioRequest& request);
+    void receiveSquelchRequested(const AetherSDR::SliceSquelchRequest& request);
+    void receiveRxAntennaRequested(const QString& antenna);
+    void receiveLockRequested(bool locked);
+
     // Receive and transmit incremental tuning.
     void ritCommandIssued(bool on, int hz);
     void xitCommandIssued(bool on, int hz);
-    // Operator-issued per-slice AUDIO changes, same discipline as the three
-    // above: audioMuteChanged/audioGainChanged/audioPanChanged also fire when
-    // radio status is applied, so driving a command off those would echo the
-    // radio's own state back as a request (Principle II).
-    //
-    // These exist because a Flex mixes its slices ON THE RADIO and these
-    // controls are wire commands to it, while a host-mixing backend (HL2)
-    // demodulates every receiver here and has to apply them in its own mixer.
-    // Without them the operator's mute moved the model and the fader, and the
-    // audio kept playing.
-    void audioMuteCommandIssued(bool mute);
-    void audioGainCommandIssued(int gainPercent);
-    void audioPanCommandIssued(int panPercent);      // 0=left, 50=centre, 100=right
-    void rxAntennaCommandIssued(const QString& antenna);
     // Operator asked for THIS slice to own transmit. A radio with one
     // transmitter and several receivers has to move it rather than set a flag.
     void txSliceCommandIssued();
@@ -395,6 +468,7 @@ signals:
     void adaptiveHetRejectChanged(bool on);
     void adaptiveActiveChanged(bool on);
     void activeChanged(bool active);
+    void inCaptureChanged(bool inCapture);
     void txSliceChanged(bool tx);
     void audioGainChanged(float gain);
     void audioPanChanged(int pan);
@@ -406,7 +480,12 @@ signals:
     void tuneBlockedByLock();
     void lockedFeedbackActiveChanged(bool active);
     void qskChanged(bool on);
+    // Stays a bool: every consumer of it (TCI's rx_nb_enable broadcast, the
+    // VFO button's checked state) asks whether a blanker is on. nbKindChanged
+    // follows for the one that also needs to know which.
     void nbChanged(bool on);
+    void nbKindChanged(AetherSDR::NoiseBlankerKind kind);
+    void nbFillChanged(AetherSDR::NoiseBlankerFill fill);
     void nrChanged(bool on);
     void anfChanged(bool on);
     void nrlChanged(bool on);
@@ -439,7 +518,14 @@ signals:
     void externalReceiveAgcThresholdChanged(int value);
     void externalReceiveAgcOffLevelChanged(int value);
     void externalReceiveAutoSquelchChanged(bool on);
+    void externalReceiveReplacementChanged(bool active);
     void squelchChanged(bool on, int level);
+    void wfmDeemphasisChanged(int microseconds);
+    void wfmForceMonoChanged(bool forceMono);
+    void wfmForceMonoRequested(bool forceMono);
+    void wfmReceptionDiagnosticsChanged(const AetherSDR::WfmReceptionDiagnostics& diagnostics);
+    void wfmStereoStatusChanged(AetherSDR::WfmStereoStatus status);
+    void wfmDeemphasisRequested(int microseconds);
     void externalReceiveSquelchChanged(bool on, int level);
     void stepChanged(int hz, const QVector<int>& stepList);
     void ritChanged(bool on, int hz);
@@ -453,20 +539,28 @@ signals:
     // FM duplex/repeater signals
     void fmToneModeChanged(const QString& mode);
     void fmToneValueChanged(const QString& value);
+    void fmToneRxValueChanged(const QString& value);
+    void fmDtcsChanged(int code, bool txReverse, bool rxReverse);
     void repeaterOffsetDirChanged(const QString& dir);
     void fmRepeaterOffsetFreqChanged(double mhz);
     void txOffsetFreqChanged(double mhz);
     void fmDeviationChanged(int hz);
+    void fmToneModeCommandIssued(const QString& mode);
+    void fmToneValueCommandIssued(double hz);
+    void fmToneRxValueCommandIssued(double hz);
+    void fmDtcsCommandIssued(int code, bool txReverse, bool rxReverse);
+    void repeaterOffsetDirCommandIssued(const QString& direction);
+    void fmRepeaterOffsetCommandIssued(double hz);
+    void fmRepeaterRecallCommandIssued(const QString& direction, double offsetHz,
+                                       const QString& toneMode, double toneHz);
 
     void modeListChanged(const QStringList& modes);
     void recordOnChanged(bool on);
     void playOnChanged(bool on);
     void playEnabledChanged(bool enabled);
     void commandReady(const QString& cmd);  // ready to send to radio
-    // aetherd RFC 2.3 encode template: express intent instead of building the
-    // wire string. RadioModel routes this to FlexBackend::setSliceMode, whose
-    // output goes through the TX-inhibit-guarded slice sink. (The other slice
-    // commands still use commandReady until they convert.)
+    // Mode dispatch precedes polarity normalization so synchronous backend
+    // defaults win. RadioModel routes it through IRadioBackend::setSliceMode.
     void modeChangeRequested(const QString& mode);
     void digitalVoiceSliceDisplaced(int sliceId, const QString& previousMode);
 
@@ -480,6 +574,53 @@ public:
     static bool filterCarrierStraddlingFamily(const QString& mode);
 
 private:
+    friend class RadioModel;
+    bool refuseOffThread(const char* setter) const;
+    void setControlPolicy(ReceiveControlPolicy policy) { m_controlPolicy = policy; }
+    bool confirmsControls() const { return m_controlPolicy == ReceiveControlPolicy::Confirmed; }
+    ReceiveControlPolicy m_controlPolicy = ReceiveControlPolicy::Optimistic;
+    // Local notifications can synchronously trigger a newer edit or reconnect.
+    // Do not dispatch the superseded intent when that notification returns.
+    // AGC fields are independent: a threshold edit must not cancel a mode edit.
+    quint64 m_tuneIntentRevision{0};
+    quint64 m_modeIntentRevision{0};
+    quint64 m_filterIntentRevision{0};
+    quint64 m_agcModeIntentRevision{0};
+    quint64 m_agcThresholdIntentRevision{0};
+    quint64 m_agcOffLevelIntentRevision{0};
+    std::array<std::array<quint64, 3>,
+        static_cast<std::size_t>(SliceDspRequest::Feature::Anft) + 1> m_dspIntentRevisions{};
+    std::array<quint64, 3> m_audioIntentRevisions{};
+    quint64 m_squelchIntentRevision{0};
+    bool m_squelchEnableIntentPending{false};
+    bool m_squelchLevelIntentPending{false};
+    quint64 m_rxAntennaIntentRevision{0};
+    quint64 m_lockIntentRevision{0};
+    template<class Notify, class Dispatch>
+    void publishReceiveIntent(quint64& epoch, Notify notify, Dispatch dispatch)
+    {
+        const QPointer<SliceModel> alive(this);
+        const quint64 revision = ++epoch;
+        notify();
+        if (alive && epoch == revision) {
+            dispatch();
+        }
+    }
+    SliceDspRequest currentDspRequest(SliceDspRequest::Feature feature,
+                                      SliceDspRequest::Field field) const;
+    template<class Notify>
+    void notifyReceiveDspIntent(SliceDspRequest::Feature feature,
+                               SliceDspRequest::Field field, Notify notify)
+    {
+        publishReceiveIntent(m_dspIntentRevisions[static_cast<size_t>(feature)][static_cast<size_t>(field)],
+                             notify, [this, feature, field] {
+            // A notification may edit the companion field. Carry its current
+            // value for paired backends without overwriting that newer edit.
+            emit receiveDspRequested(currentDspRequest(feature, field));
+        });
+    }
+    void notifyReceiveFilterIntent(SliceFilterRequest::Origin origin);
+    void applyAgcMode(const QString& mode, SliceAgcRequest::Origin origin);
     // Sign-guarded, idempotent (lo,hi)→(-hi,-lo) mirror of the stored filter
     // when its polarity is wrong for m_mode; true if it changed anything.
     bool normalizeFilterPolarity();
@@ -488,12 +629,15 @@ private:
     QString m_letter;          // per-client display letter from `index_letter`
     QString m_panId;           // panadapter assignment (e.g. "0x40000000")
     double  m_frequency{0.0};
+    double  m_reportedFrequency{0.0};
+    bool    m_frequencyReportedKnown{false};
+    ReceiveObservation m_receiveObservation;
     QString m_mode{"USB"};
     QString m_modeBeforeDigitalVoice;
     QStringList m_modeList;
     int     m_filterLow{-1500};
     int     m_filterHigh{1500};
-    quint64 m_userFilterEpoch{0};   // bumped only by setFilterWidth() (RFC #3878)
+    quint64 m_userFilterEpoch{0};   // setFilterWidth() and daemon filter intent (RFC #3878)
     // Adaptive RX filter — client-side config + runtime state (RFC #3878).
     // The filter edges themselves stay radio-authoritative (never persisted);
     // only enabled + the two bounds are persisted by the GUI.
@@ -506,6 +650,7 @@ private:
     bool    m_adaptiveHetReject{false};  // opt-in edge-het cut
     bool    m_adaptiveActive{false};     // a confident live fit is applied
     bool    m_active{false};
+    bool    m_inCapture{true};
     bool    m_txSlice{false};
     float   m_rfGain{0.0f};
     float   m_audioGain{50.0f};
@@ -539,7 +684,8 @@ private:
     bool    m_escEnabled{false};
     float   m_escGain{1.0f};
     float   m_escPhaseShift{0.0f};
-    bool    m_nb{false};
+    AetherSDR::NoiseBlankerKind m_nbKind{AetherSDR::NoiseBlankerKind::Off};
+    AetherSDR::NoiseBlankerFill m_nbFill{AetherSDR::kDefaultNoiseBlankerFill};
     bool    m_nr{false};
     bool    m_anf{false};
     bool    m_nrl{false};
@@ -564,8 +710,14 @@ private:
     QString m_agcMode{"med"};
     int     m_agcThreshold{65};
     int     m_agcOffLevel{10};
+    bool m_squelchOnKnown{false};
+    bool m_squelchLevelKnown{false};
     bool    m_squelchOn{false};
     int     m_squelchLevel{20};
+    int m_wfmDeemphasisUs{0};
+    bool m_wfmForceMono{false};
+    WfmReceptionDiagnostics m_wfmReceptionDiagnostics;
+    WfmStereoStatus m_wfmStereoStatus{WfmStereoStatus::Unavailable};
     int     m_manualSquelchLevel{20};
     bool    m_squelchEchoIsManual{true};
     int     m_stepHz{100};
@@ -574,6 +726,11 @@ private:
     int     m_ritFreq{0};
     bool    m_xitOn{false};
     int     m_xitFreq{0};
+    // True while setRit()/setXit() is inside its command emit. A backend that
+    // answers the enable and offset verbs synchronously publishes each step;
+    // those are adopted silently and announced once, as the final value.
+    bool    m_ritCommandInFlight{false};
+    bool    m_xitCommandInFlight{false};
     int     m_daxChannel{0};
     int     m_rttyMark{2125};
     int     m_rttyMarkDefault{2125};
@@ -592,6 +749,12 @@ private:
     // FM duplex/repeater state
     QString m_fmToneMode{"off"};
     QString m_fmToneValue{"100.0"};
+    QString m_fmToneRxValue{"100.0"};
+    // -1 means the radio has not established this register yet. Do not invent
+    // a plausible 023/NN value while connect-time readback is outstanding.
+    int     m_fmDtcsCode{-1};
+    bool    m_fmDtcsTxReverse{false};
+    bool    m_fmDtcsRxReverse{false};
     QString m_repeaterOffsetDir{"simplex"};
     double  m_fmRepeaterOffsetFreq{0.0};
     double  m_txOffsetFreq{0.0};

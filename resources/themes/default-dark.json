@@ -37,6 +37,7 @@
             "spectrum": "{color.gray.950}",
             "app":      "{color.gray.900}"
           },
+          "map": { "darkBackground": "#18212b", "darkDetail": "#c8d8e8" },
           "canvas": {
             "background": "#08080d",
             "dots":       "#50e6f0fa"
@@ -47,6 +48,8 @@
           "accent.warning": "{color.amber.500}",
           "accent.danger":  "{color.red.500}",
           "accent.success": "{color.green.500}",
+          "waterfall.timeMarker.foreground": "#c8d8e8",
+          "waterfall.timeMarker.background": "#dc0f0f1a",
           "waterfall.live":    "{color.red.500}",
           "waterfall.history": "{color.gray.500}",
           "tx.mox.border":       "#d08020",
@@ -59,11 +62,86 @@
             "label":     "{color.gray.500}",
             "disabled":  "{color.gray.600}"
           },
+          "control": {
+            "inactive":    "{color.gray.400}",
+            "unavailable": "{color.gray.600}"
+          },
           "border": {
             "subtle": "{color.gray.850}",
             "strong": "#2a3a4d",
             "accent": "{color.blue.500}",
             "tx":     "#5a4a28"
+          },
+          "titlebar": {
+            "background":             "#eb0d1624",
+            "border":                 "#2978bee6",
+            "tab": {
+              "hover":            "#12ffffff",
+              "active.background": "#1a00b4d8",
+              "active.border":     "#7300b4d8"
+            },
+            "status": {
+              "connected": "{color.green.500}",
+              "available": "{color.gray.500}",
+              "inUse":     "{color.amber.500}"
+            },
+            "menu": {
+              "background": "#eb0f0f1a"
+            },
+            "otherTx": {
+              "background": "#ffffff"
+            },
+            "caption": {
+              "glyph":       "{color.gray.400}",
+              "glyph.hover": "{color.gray.50}",
+              "hover":       "#14ffffff",
+              "close.hover": "#c42b1c",
+              "close.glyph": "#ffffff",
+              "semantic": {
+                "close":    "#ff5f57",
+                "minimize": "#febc2e",
+                "maximize": "#28c840",
+                "inactive": "#565a60",
+                "glyph":    "#a0000000"
+              }
+            }
+          },
+          "brand": {
+            "wordmark": "#eaf2fb",
+            "gradient": {
+              "type": "linear-gradient",
+              "angle": 100,
+              "stops": [
+                { "at": 0.00, "color": "#3aa7ff" },
+                { "at": 0.42, "color": "#5de3ff" },
+                { "at": 1.00, "color": "#8ef7e6" }
+              ]
+            }
+          },
+          "canon": {
+            "ground":   "#060b13",
+            "raised":   "#0a121e",
+            "nested":   "#0e1a2a",
+            "control":  "#12233a",
+            "ink":      "#eaf2fb",
+            "inkSoft":  "#c4d4e8",
+            "muted":    "#8598b4",
+            "line":     "#1f78a5d2",
+            "lineHi":   "#4778bee6",
+            "cyan":     "#5de3ff",
+            "aqua":     "#8ef7e6",
+            "onAccent": "#041019",
+            "sparkHot": "#e6fdff",
+            "sparkGold": "#ffd970",
+            "sparkGoldHot": "#fff6d8",
+            "bloom": { "blue": "#293aa7ff", "teal": "#1a7bf2dc" },
+            "grid":     "#0978aad2"
+          },
+          "cw": {
+            "confidence.high":   "#00ff88",
+            "confidence.medium": "#e0e040",
+            "confidence.fair":   "#ff9020",
+            "confidence.low":    "#ff4040"
           },
           "meter": {
             "crst":   "{color.red.500}",
@@ -91,7 +169,40 @@
             "trace":    "{color.blue.500}",
             "peakHold": "{color.amber.500}",
             "average":  "{color.gray.400}",
-            "grid":     "{color.gray.850}"
+            "grid":     "{color.gray.850}",
+            "zoomButton.disabled.background": "#5a0f0f1a",
+            "zoomButton.disabled.border":     "#5a304050",
+            "zoomButton.disabled.text":       "#8c90a0b0"
+          },
+          "spe.lcd": {
+            "background": "#102010",
+            "foreground": "#d6f5d6",
+            "dim":        "#3a553a",
+            "bezel":      "#222822"
+          },
+          "accessory": {
+            "dial.face":   "{color.blue.700}",
+            "dial.needle": "{color.gray.50}",
+            "dial.rim":    "{color.gray.600}",
+            "key.standby.background": "#5a3a0a",
+            "key.standby.foreground": "{color.amber.500}",
+            "key.bypass.background":  "#8a6000",
+            "key.bypass.foreground":  "#ffd9a0",
+            "key.meffa.active.background": "#006030",
+            "key.meffa.active.border":     "#008040",
+            "key.meffa.active.hover":      "#007040",
+            "key.meffa.active.foreground": "{color.gray.50}",
+            "key.meffa.standby.foreground": "#008040",
+            "swrScale": {
+              "type": "linear-gradient",
+              "angle": 90,
+              "stops": [
+                { "at": 0.00, "color": "#1a5c30" },
+                { "at": 0.35, "color": "#4a5520" },
+                { "at": 0.65, "color": "#6a4520" },
+                { "at": 1.00, "color": "#6e1f1f" }
+              ]
+            }
           },
           "waterfall.colormap": {
             "default": {
@@ -160,6 +271,17 @@
                 { "at": 0.75, "color": "#800080" },
                 { "at": 1.00, "color": "#ffffff" }
               ]
+            },
+            "glacier": {
+              "type": "linear-gradient",
+              "angle": 180,
+              "stops": [
+                { "at": 0.00, "color": "#05183c" },
+                { "at": 0.30, "color": "#0a5ad2" },
+                { "at": 0.55, "color": "#3ca0ff" },
+                { "at": 0.80, "color": "#a8dcff" },
+                { "at": 1.00, "color": "#ffffff" }
+              ]
             }
           },
           "slice": {
@@ -214,7 +336,13 @@
             "success.border.checked":     "{color.green.500}",
             "warning.background.checked": "#5a3a0a",
             "warning.foreground.checked": "{color.amber.500}",
-            "warning.border.checked":     "{color.amber.500}"
+            "warning.border.checked":     "{color.amber.500}",
+            "footer.warning.background.checked": "#2dffb84d",
+            "footer.warning.background.hover":   "#46ffb84d",
+            "footer.danger.background.checked":  "#2dff4d4d",
+            "footer.danger.background.hover":    "#46ff4d4d",
+            "footer.success.background.checked": "#2d4dd87a",
+            "footer.success.background.hover":   "#464dd87a"
           },
           "highlight": {
             "tx":      "#fc4500",

@@ -1,13 +1,8 @@
 #include "CwDecoder.h"
 #include "LogManager.h"
-#include "DeepCwCommitter.h"
-#include "DeepCwEngine.h"
-#include "Resampler.h"
 #include "ggmorse/ggmorse.h"
-#include <algorithm>
 #include <cstring>
-#include <string>
-#include <vector>
+#include <cmath>
 
 namespace AetherSDR {
 
@@ -20,39 +15,25 @@ CwDecoder::~CwDecoder()
     stop();
 }
 
-bool CwDecoder::loadDeepCwModel(const QString& modelPath)
+float CwDecoder::estimatedPitch() const
 {
-    if (!m_deepcw)
-        m_deepcw = std::make_unique<DeepCwEngine>();
-    const bool ok = m_deepcw->loadModel(modelPath.toStdString());
-    m_deepLoaded = ok;
-    qCInfo(lcDsp) << "CwDecoder: DeepCW model load" << (ok ? "ok" : "FAILED")
-                  << modelPath;
-    return ok;
+    QMutexLocker lock(&m_bufMutex);
+    return m_pitchLocked || !m_typedSource || m_source.current() ? m_pitch.load() : 0.0f;
+}
+
+float CwDecoder::estimatedSpeed() const
+{
+    QMutexLocker lock(&m_bufMutex);
+    return m_speedLocked || !m_typedSource || m_source.current() ? m_speed.load() : 0.0f;
 }
 
 void CwDecoder::start()
 {
     if (m_running) return;
 
-    const bool deep = (backend() == Backend::DeepCw);
-
-    if (!deep) {
-        // Create ggmorse instance for 24kHz mono int16 input
-        GGMorse::Parameters params;
-        params.sampleRateInp = 24000.0f;
-        params.sampleRateOut = 24000.0f;
-        params.samplesPerFrame = GGMorse::kDefaultSamplesPerFrame;
-        params.sampleFormatInp = GGMORSE_SAMPLE_FORMAT_I16;
-        params.sampleFormatOut = GGMORSE_SAMPLE_FORMAT_I16;
-
-        m_ggmorse = std::make_unique<GGMorse>(params);
-
-        // Auto-detect pitch and speed
-        GGMorse::ParametersDecode dp = GGMorse::getDefaultParametersDecode();
-        dp.frequency_hz = -1;  // auto
-        dp.speed_wpm = -1;     // auto
-        m_ggmorse->setParametersDecode(dp);
+    {
+        std::lock_guard lock(m_parametersMutex);
+        m_parametersDirty = true;
     }
 
     m_running = true;
@@ -60,61 +41,89 @@ void CwDecoder::start()
     {
         QMutexLocker lock(&m_bufMutex);
         m_ringBuf.clear();
+        m_source = {};
+        m_typedSource = false;
+        ++m_inputGeneration;
     }
 
     // Run decode loop on worker thread (CwDecoder stays on main thread)
-    auto* worker = QThread::create([this, deep]() {
-        if (deep) decodeLoopDeep();
-        else      decodeLoop();
-    });
+    auto* worker = QThread::create([this]() { decodeLoop(); });
     worker->setObjectName("CwDecoder");
-    connect(worker, &QThread::finished, worker, &QThread::deleteLater);
-    m_workerThread = worker;
+    m_workerThread.reset(worker);
     worker->start();
 
-    qCDebug(lcDsp) << "CwDecoder: started, backend:" << (deep ? "DeepCW" : "ggmorse");
+    qCDebug(lcDsp) << "CwDecoder: started";
 }
 
 void CwDecoder::stop()
 {
     if (!m_running) return;
     m_running = false;
+    ++m_inputGeneration;
 
     if (m_workerThread) {
-        m_workerThread->wait(2000);
-        m_workerThread = nullptr;
+        // A JOIN, never a timeout.  The callback checks m_running and each
+        // decode call is frame-bounded, so this returns promptly -- and the
+        // m_pitch/m_speed writes below run OUTSIDE m_parametersMutex, which
+        // the worker holds when writing the same members.  They are safe only
+        // because the worker is provably dead by the time wait() returns.
+        // Never destroy the buffer/owner while a slow frame is still running.
+        m_workerThread->wait();
+        m_workerThread.reset();
     }
 
-    m_ggmorse.reset();
-    qCDebug(lcDsp) << "CwDecoder: stopped";
-}
+    // The estimates died with the ggmorse instance — clear them so a later
+    // Zero Beat can't retune the slice on a pitch from a previous run
+    // (#5213).  Locked values are operator-set state, not estimates: keep
+    // them, or a restart would feed 0 into a still-pressed
+    // lock button on the next start.
+    if (!m_pitchLocked) m_pitch = 0;
+    if (!m_speedLocked) m_speed = 0;
+    if (!m_pitchLocked || !m_speedLocked) {
+        // Post the clearing emission through the event queue: the worker's
+        // cross-thread statsUpdated deliveries are queued, so a reading it
+        // posted just before m_running flipped would otherwise arrive AFTER
+        // a direct emit and re-show the dead estimate.  Queued-behind, the
+        // clear always lands last (and dies with the object at shutdown).
+        const quint64 generation = m_inputGeneration.load();
+        QMetaObject::invokeMethod(this, [this, generation] {
+            if (generation == m_inputGeneration.load()) {
+                emit statsUpdated(estimatedPitch(), estimatedSpeed());
+            }
+        }, Qt::QueuedConnection);
+    }
 
-// Build and apply current ggmorse decode parameters from all stored state.
-void CwDecoder::applyDecodeParameters()
-{
-    if (!m_ggmorse) return;
-    GGMorse::ParametersDecode dp = GGMorse::getDefaultParametersDecode();
-    dp.frequency_hz          = m_pitchLocked ? m_pitch.load() : -1.0f;
-    dp.speed_wpm             = m_speedLocked ? m_speed.load() : -1.0f;
-    dp.frequencyRangeMin_hz  = m_pitchRangeMin;
-    dp.frequencyRangeMax_hz  = m_pitchRangeMax;
-    dp.speedRangeMin_wpm     = m_speedRangeMin;
-    dp.speedRangeMax_wpm     = m_speedRangeMax;
-    m_ggmorse->setParametersDecode(dp);
+    qCDebug(lcDsp) << "CwDecoder: stopped";
 }
 
 void CwDecoder::lockPitch(bool lock)
 {
-    m_pitchLocked = lock;
-    applyDecodeParameters();
+    {
+        QMutexLocker inputLock(&m_bufMutex);
+        std::lock_guard guard(m_parametersMutex);
+        const float pitch = m_pitchLocked || !m_typedSource || m_source.current()
+            ? m_pitch.load() : 0.0f;
+        m_pitch = pitch;
+        m_pitchLocked = lock;
+        m_pendingParameters.pitchHz = lock ? pitch : -1.0f;
+        m_parametersDirty = true;
+    }
     qCDebug(lcDsp) << "CwDecoder: pitch" << (lock ? "locked at" : "unlocked from")
                    << m_pitch.load() << "Hz";
 }
 
 void CwDecoder::lockSpeed(bool lock)
 {
-    m_speedLocked = lock;
-    applyDecodeParameters();
+    {
+        QMutexLocker inputLock(&m_bufMutex);
+        std::lock_guard guard(m_parametersMutex);
+        const float speed = m_speedLocked || !m_typedSource || m_source.current()
+            ? m_speed.load() : 0.0f;
+        m_speed = speed;
+        m_speedLocked = lock;
+        m_pendingParameters.speedWpm = lock ? speed : -1.0f;
+        m_parametersDirty = true;
+    }
     qCDebug(lcDsp) << "CwDecoder: speed" << (lock ? "locked at" : "unlocked from")
                    << m_speed.load() << "WPM";
 }
@@ -123,8 +132,9 @@ void CwDecoder::setKnownParameters(float pitchHz, float speedWpm)
 {
     if (pitchHz <= 0.0f || speedWpm <= 0.0f) return;
 
-    const bool unchanged = qFuzzyCompare(m_pitch.load(), pitchHz)
-        && qFuzzyCompare(m_speed.load(), speedWpm)
+    std::lock_guard lock(m_parametersMutex);
+    const bool unchanged = qFuzzyCompare(m_pendingParameters.pitchHz, pitchHz)
+        && qFuzzyCompare(m_pendingParameters.speedWpm, speedWpm)
         && m_pitchLocked && m_speedLocked;
     if (unchanged) return;
 
@@ -133,6 +143,8 @@ void CwDecoder::setKnownParameters(float pitchHz, float speedWpm)
     // sidetone is generated at exactly that rate — ggmorse with both
     // values locked gets a reliable unit length and correctly classifies
     // 1u / 3u / 7u gaps so inter-word boundaries become " " separators.
+    m_pendingParameters.pitchHz = pitchHz;
+    m_pendingParameters.speedWpm = speedWpm;
     m_pitch = pitchHz;
     m_speed = speedWpm;
     m_pitchLocked = true;
@@ -142,92 +154,206 @@ void CwDecoder::setKnownParameters(float pitchHz, float speedWpm)
     // is 500–700 Hz but operators commonly use 700 / 750 / 800).  Also
     // drives ggmorse's internal HPF cutoff.
     constexpr float kPitchRangePad = 150.0f;
-    m_pitchRangeMin = std::max(100.0f, pitchHz - kPitchRangePad);
-    m_pitchRangeMax = pitchHz + kPitchRangePad;
+    m_pendingParameters.pitchRangeMin = std::max(100.0f, pitchHz - kPitchRangePad);
+    m_pendingParameters.pitchRangeMax = pitchHz + kPitchRangePad;
 
-    applyDecodeParameters();
+    m_parametersDirty = true;
     qCDebug(lcDsp) << "CwDecoder: known params pitch=" << pitchHz
                    << "Hz speed=" << speedWpm << "WPM";
 }
 
 void CwDecoder::setPitchRange(int minHz, int maxHz)
 {
-    m_pitchRangeMin = static_cast<float>(minHz);
-    m_pitchRangeMax = static_cast<float>(maxHz);
-    applyDecodeParameters();
+    std::lock_guard lock(m_parametersMutex);
+    m_pendingParameters.pitchRangeMin = static_cast<float>(minHz);
+    m_pendingParameters.pitchRangeMax = static_cast<float>(maxHz);
+    m_parametersDirty = true;
     qCDebug(lcDsp) << "CwDecoder: pitch range" << minHz << "-" << maxHz << "Hz";
 }
 
 void CwDecoder::setSpeedRange(int minWpm, int maxWpm)
 {
-    m_speedRangeMin = static_cast<float>(minWpm);
-    m_speedRangeMax = static_cast<float>(maxWpm);
-    applyDecodeParameters();
+    std::lock_guard lock(m_parametersMutex);
+    m_pendingParameters.speedRangeMin = static_cast<float>(minWpm);
+    m_pendingParameters.speedRangeMax = static_cast<float>(maxWpm);
+    m_parametersDirty = true;
     qCDebug(lcDsp) << "CwDecoder: speed range" << minWpm << "-" << maxWpm << "WPM";
 }
 
 void CwDecoder::feedAudio(const QByteArray& pcm24kStereo)
 {
-    if (!m_running) return;
-
-    const auto* src = reinterpret_cast<const float*>(pcm24kStereo.constData());
-    const int stereoSamples = pcm24kStereo.size() / (2 * static_cast<int>(sizeof(float)));
-
-    // Downmix stereo → mono once. ggmorse needs int16; the neural path keeps
-    // float32 so the 3200 Hz resample (worker thread) sees no quantization.
-    QByteArray mono;
-    if (backend() == Backend::DeepCw) {
-        mono.resize(stereoSamples * static_cast<int>(sizeof(float)));
-        auto* dst = reinterpret_cast<float*>(mono.data());
-        for (int i = 0; i < stereoSamples; ++i)
-            dst[i] = (src[2 * i] + src[2 * i + 1]) * 0.5f;
-    } else {
-        mono.resize(stereoSamples * static_cast<int>(sizeof(int16_t)));
-        auto* dst = reinterpret_cast<int16_t*>(mono.data());
-        for (int i = 0; i < stereoSamples; ++i) {
-            float avg = (src[2 * i] + src[2 * i + 1]) * 0.5f;
-            dst[i] = static_cast<int16_t>(std::clamp(avg * 32768.0f, -32768.0f, 32767.0f));
-        }
+    constexpr qsizetype kStereoBytes = 2 * sizeof(float);
+    if (!m_running || pcm24kStereo.size() % kStereoBytes != 0
+        || pcm24kStereo.size() / kStereoBytes > PcmFrame::kMaxFrames) {
+        return;
     }
+    const qsizetype frames = pcm24kStereo.size() / kStereoBytes;
+    QByteArray mono(frames * sizeof(int16_t), Qt::Uninitialized);
+    for (qsizetype i = 0; i < frames; ++i) {
+        float pair[2];
+        std::memcpy(pair, pcm24kStereo.constData() + i * kStereoBytes, sizeof(pair));
+        if (!std::isfinite(pair[0]) || !std::isfinite(pair[1])) {
+            resetInput();
+            return;
+        }
+        const float average = pair[0] * 0.5f + pair[1] * 0.5f;
+        const int16_t sample = static_cast<int16_t>(std::clamp(
+            double(average) * 32768.0, -32768.0, 32767.0));
+        std::memcpy(mono.data() + i * sizeof(sample), &sample, sizeof(sample));
+    }
+    appendMono(mono, {}, false, false);
+}
 
+void CwDecoder::feedPcmBlock(const DecoderPcmBlock& block)
+{
+    if (!m_running || !block.current() || block.samples.size() > PcmFrame::kMaxFrames) {
+        return;
+    }
+    QByteArray mono(block.samples.size() * sizeof(int16_t), Qt::Uninitialized);
+    for (qsizetype i = 0; i < block.samples.size(); ++i) {
+        if (!std::isfinite(block.samples[i])) {
+            resetInput();
+            return;
+        }
+        const int16_t sample = static_cast<int16_t>(std::clamp(
+            double(block.samples[i]) * 32768.0, -32768.0, 32767.0));
+        std::memcpy(mono.data() + i * sizeof(sample), &sample, sizeof(sample));
+    }
+    appendMono(mono, block.source, true, block.discontinuity);
+}
+
+void CwDecoder::appendMono(const QByteArray& mono, const PcmEpochLease& source,
+                          bool typed, bool discontinuity)
+{
     QMutexLocker lock(&m_bufMutex);
+    if (!m_running || (typed && !source.current())) {
+        return;
+    }
+    if (discontinuity || typed != m_typedSource
+        || (typed && source.stream() != m_source.stream())
+        || (typed && m_ringBuf.size() + mono.size() > RING_CAPACITY)) {
+        ++m_inputGeneration;
+        m_ringBuf.clear();
+        queueResetStats(m_inputGeneration.load());
+    }
+    m_source = source;
+    m_typedSource = typed;
     m_ringBuf.append(mono);
-
-    // Trim to capacity (drop oldest, keeping sample alignment for both formats)
-    if (m_ringBuf.size() > RING_CAPACITY) {
+    // Preserve the TX sidetone byte API's trim-oldest backlog policy. Typed RX
+    // overflow is a source discontinuity and retires its detector above.
+    if (!typed && m_ringBuf.size() > RING_CAPACITY) {
         m_ringBuf.remove(0, m_ringBuf.size() - RING_CAPACITY);
     }
 }
 
+void CwDecoder::resetInput()
+{
+    QMutexLocker lock(&m_bufMutex);
+    ++m_inputGeneration;
+    m_ringBuf.clear();
+    m_source = {};
+    m_typedSource = false;
+    queueResetStats(m_inputGeneration.load());
+}
+
+void CwDecoder::queueResetStats(quint64 generation)
+{
+    // Preserve #5645's coherent parameter snapshot and locked setpoints.
+    // Neutral publication is queued so callbacks never run under either mutex.
+    {
+        std::lock_guard lock(m_parametersMutex);
+        if (!m_pitchLocked) { m_pitch = 0; }
+        if (!m_speedLocked) { m_speed = 0; }
+    }
+    QMetaObject::invokeMethod(this, [this, generation] {
+        if (generation == m_inputGeneration.load()) {
+            emit statsUpdated(estimatedPitch(), estimatedSpeed());
+        }
+    }, Qt::QueuedConnection);
+}
+
 void CwDecoder::decodeLoop()
 {
+    // Create ggmorse instance for 24kHz mono int16 input
+    GGMorse::Parameters params;
+    params.sampleRateInp = 24000.0f;
+    params.sampleRateOut = 24000.0f;
+    params.samplesPerFrame = GGMorse::kDefaultSamplesPerFrame;
+    params.sampleFormatInp = GGMORSE_SAMPLE_FORMAT_I16;
+    params.sampleFormatOut = GGMORSE_SAMPLE_FORMAT_I16;
+
+    std::unique_ptr<GGMorse> engine;
+    quint64 generation = 0;
+
     // ggmorse requests samplesPerFrame * resampleFactor * sampleSize bytes per callback.
     // At 24kHz int16, factor=6 (24000/4000), frame=128: 128*6*2 = 1536 bytes.
-    const int resampleFactor = static_cast<int>(m_ggmorse->getSampleRateInp() / GGMorse::kBaseSampleRate);
-    const int bytesPerFrame = m_ggmorse->getSamplesPerFrame() * resampleFactor * m_ggmorse->getSampleSizeBytesInp();
+    const int resampleFactor = static_cast<int>(params.sampleRateInp / GGMorse::kBaseSampleRate);
+    const int bytesPerFrame = params.samplesPerFrame * resampleFactor * static_cast<int>(sizeof(int16_t));
     int feedCount = 0;
 
     qCDebug(lcDsp) << "CwDecoder: decode loop running, bytesPerFrame:" << bytesPerFrame;
 
     while (m_running) {
-        // Wait until we have at least one frame of data
+        PcmEpochLease source;
+        bool typed = false;
+        quint64 inputGeneration = 0;
+        // Snapshot ownership with the ring. Revocation never needs a QObject.
         {
             QMutexLocker lock(&m_bufMutex);
+            if (m_typedSource && !m_source.current()) {
+                m_ringBuf.clear();
+            }
             if (m_ringBuf.size() < bytesPerFrame) {
                 lock.unlock();
                 QThread::msleep(20);
                 continue;
             }
+            source = m_source;
+            typed = m_typedSource;
+            inputGeneration = m_inputGeneration.load();
+        }
+        const bool newInput = !engine || generation != inputGeneration;
+        if (newInput) {
+            engine = std::make_unique<GGMorse>(params);
+            generation = inputGeneration;
+        }
+        GGMorse& ggmorse = *engine;
+
+        DecodeParameters pending;
+        bool applyParameters = false;
+        {
+            std::lock_guard lock(m_parametersMutex);
+            if (m_parametersDirty || newInput) {
+                pending = m_pendingParameters;
+                m_parametersDirty = false;
+                applyParameters = true;
+            }
+        }
+        if (applyParameters) {
+            GGMorse::ParametersDecode dp = GGMorse::getDefaultParametersDecode();
+            dp.frequency_hz = pending.pitchHz;
+            dp.speed_wpm = pending.speedWpm;
+            dp.frequencyRangeMin_hz = pending.pitchRangeMin;
+            dp.frequencyRangeMax_hz = pending.pitchRangeMax;
+            dp.speedRangeMin_wpm = pending.speedRangeMin;
+            dp.speedRangeMax_wpm = pending.speedRangeMax;
+            ggmorse.setParametersDecode(dp);
         }
 
         int framesThisCall = 0;
 
-        bool gotData = m_ggmorse->decode([this, &framesThisCall](void* data, uint32_t nMaxBytes) -> uint32_t {
-            if (!m_running) return 0;
+        bool gotData = ggmorse.decode([this, &framesThisCall, generation, source, typed](void* data, uint32_t nMaxBytes) -> uint32_t {
+            // Return after one frame so continuously arriving audio cannot
+            // postpone pending parameter changes or stop indefinitely.
+            if (!m_running || framesThisCall > 0 || generation != m_inputGeneration.load()
+                || (typed && !source.current())) {
+                return 0;
+            }
 
             QMutexLocker lock(&m_bufMutex);
             // ggmorse requires exactly nMaxBytes — partial returns cause it to abort
-            if (static_cast<uint32_t>(m_ringBuf.size()) < nMaxBytes) return 0;
+            if (generation != m_inputGeneration.load()
+                || static_cast<uint32_t>(m_ringBuf.size()) < nMaxBytes) { return 0; }
 
             std::memcpy(data, m_ringBuf.constData(), nMaxBytes);
             m_ringBuf.remove(0, nMaxBytes);
@@ -239,96 +365,66 @@ void CwDecoder::decodeLoop()
 
         // Log periodically
         if (feedCount % 200 == 0 && feedCount > 0) {
-            const auto& stats = m_ggmorse->getStatistics();
-            const auto& rxData = m_ggmorse->getRxData();
+            const auto& stats = ggmorse.getStatistics();
+            const auto& rxData = ggmorse.getRxData();
             qCDebug(lcDsp) << "CwDecoder:" << feedCount << "frames fed, pitch:"
                      << stats.estimatedPitch_Hz << "Hz, speed:"
                      << stats.estimatedSpeed_wpm << "WPM, decode:" << gotData
                      << "rxLen:" << rxData.size()
-                     << "lastResult:" << m_ggmorse->lastDecodeResult();
+                     << "lastResult:" << ggmorse.lastDecodeResult();
         }
 
-        const auto& stats = m_ggmorse->getStatistics();
+        if (generation != m_inputGeneration.load() || (typed && !source.current())) {
+            continue;
+        }
+        const auto& stats = ggmorse.getStatistics();
 
         // Accept all decodes — color-coded by confidence in the UI
         GGMorse::TxRx rxData;
-        if (m_ggmorse->takeRxData(rxData) > 0 && stats.costFunction < 1.0f) {
+        if (ggmorse.takeRxData(rxData) > 0 && stats.costFunction < 1.0f) {
             QString text = QString::fromLatin1(
                 reinterpret_cast<const char*>(rxData.data()),
                 static_cast<int>(rxData.size()));
-            emit textDecoded(text, stats.costFunction);
+            const float cost = stats.costFunction;
+            QMetaObject::invokeMethod(this, [this, generation, source, typed, text, cost] {
+                if (m_running && generation == m_inputGeneration.load()
+                    && (!typed || source.current())) {
+                    emit textDecoded(text, cost);
+                }
+            }, Qt::QueuedConnection);
         }
 
         if (stats.estimatedPitch_Hz > 0) {
-            m_pitch = stats.estimatedPitch_Hz;
-            m_speed = stats.estimatedSpeed_wpm;
-            emit statsUpdated(m_pitch, m_speed);
+            {
+                std::lock_guard lock(m_parametersMutex);
+                if (generation != m_inputGeneration.load() || (typed && !source.current())) {
+                    continue;
+                }
+                // A just-completed old frame must not overwrite a newer lock
+                // request. Locked setpoints live in the pending snapshot.
+                // Nonpositive locks still mean automatic detection to GGMorse.
+                if (!m_pitchLocked || m_pendingParameters.pitchHz <= 0.0f) {
+                    m_pitch = stats.estimatedPitch_Hz;
+                }
+                if (!m_speedLocked || m_pendingParameters.speedWpm <= 0.0f) {
+                    m_speed = stats.estimatedSpeed_wpm;
+                }
+            }
+            // Read the members at DELIVERY, not here.  A value copied now is
+            // already stale by the time the queued emission lands if a setter
+            // ran in between, and when no further frame arrives the panel keeps
+            // that dead reading forever even though estimatedPitch() is right
+            // (#5645 review).  Same queued-read shape stop() uses below.
+            QMetaObject::invokeMethod(this, [this, generation, source, typed] {
+                if (m_running && generation == m_inputGeneration.load()
+                    && (!typed || source.current())) {
+                    emit statsUpdated(estimatedPitch(), estimatedSpeed());
+                }
+            }, Qt::QueuedConnection);
         }
     }
 
     qCDebug(lcDsp) << "CwDecoder: decode loop exiting, total frames:" << feedCount;
-}
-
-// DeepCW (neural) worker loop. feedAudio() has downmixed the RX audio to mono
-// float32 @24 kHz into m_ringBuf; here we drain it, resample to the model's
-// 3200 Hz with an anti-aliased r8brain SRC (a 7.5x decimation — a naive
-// drop/linear resample would fold energy into the 400-1200 Hz analysis band),
-// and hand it to DeepCwCommitter: a sliding window re-decoded every 2 s whose
-// characters are shown only once they are holdSec behind the live edge, so the
-// model's full-context reading reaches the panel instead of its first guess at
-// the ragged end of a short window, and no hard reset cuts words at a seam.
-// holdSec defaults to 5 s; AETHER_DEEPCW_HOLD_S overrides it (local bench knob).
-void CwDecoder::decodeLoopDeep()
-{
-    constexpr int kRate = DeepCwEngine::kModelSampleRate;  // 3200 Hz (post-resample)
-
-    // Anti-aliased 24k -> 3200 Hz SRC (r8brain via the in-tree wrapper). Owned by
-    // and used only on this worker thread, so its non-thread-safety is moot.
-    Resampler resampler(24000.0, static_cast<double>(kRate));
-
-    double holdSec = 5.0;
-    bool holdOk = false;
-    const double envHold = qEnvironmentVariable("AETHER_DEEPCW_HOLD_S").toDouble(&holdOk);
-    if (holdOk && envHold >= 1.0 && envHold <= 14.0) holdSec = envHold;
-    DeepCwCommitter committer(holdSec);
-
-    qCDebug(lcDsp) << "CwDecoder: DeepCW loop running, modelLoaded:" << m_deepLoaded.load()
-                   << "hold" << committer.holdSec() << "s window" << committer.windowSec() << "s";
-
-    while (m_running) {
-        // Drain the handoff ring (mono float32 @24k) and resample to 3200 Hz.
-        std::vector<float> in24k;
-        {
-            QMutexLocker lock(&m_bufMutex);
-            const int n = m_ringBuf.size() / static_cast<int>(sizeof(float));
-            if (n > 0) {
-                const auto* s = reinterpret_cast<const float*>(m_ringBuf.constData());
-                in24k.assign(s, s + n);
-                m_ringBuf.clear();
-            }
-        }
-        if (!in24k.empty() && m_deepLoaded && m_deepcw) {
-            const QByteArray out = resampler.process(in24k.data(), static_cast<int>(in24k.size()));
-            const auto* r = reinterpret_cast<const float*>(out.constData());
-            const auto m = static_cast<std::size_t>(out.size() / static_cast<int>(sizeof(float)));
-            const DeepCwCommitter::Result res = committer.push(r, m, *m_deepcw);
-
-            // Publish the dominant-tone pitch (no speed estimate for a CTC model)
-            // so zero-beat and the pitch readout work in neural mode too.
-            if (res.decoded && res.pitchHz > 0.0f) {
-                m_pitch = res.pitchHz;
-                emit statsUpdated(res.pitchHz, 0.0f);
-            }
-            // Map mean CTC confidence to the panel's cost convention (lower =
-            // better) so the Sensitivity slider filters shaky neural decodes.
-            if (!res.text.empty())
-                emit textDecoded(QString::fromStdString(res.text), 1.0f - res.meanConf);
-        }
-
-        QThread::msleep(200);
-    }
-
-    qCDebug(lcDsp) << "CwDecoder: DeepCW loop exiting";
 }
 
 } // namespace AetherSDR

@@ -5,21 +5,11 @@
 
 namespace AetherSDR {
 
-// Small, self-contained FFT analyzer used by the Client EQ editor to
-// render a live spectrum behind the response curve. Fixed 2048-point
-// radix-2 Cooley-Tukey — bin resolution fs/N = 11.7 Hz at 24 kHz, so
-// the first (non-DC) bin lands below the 20 Hz display floor and the
-// analyzer does not produce a visible "cutoff" artifact at the
-// leftmost visible frequency. Runs in ~200 µs on the UI thread, cheap
-// enough for a 25 Hz timer.
-//
-// Usage:
-//   ClientEqFftAnalyzer fft;
-//   fft.update(samples, ClientEqFftAnalyzer::kFftSize);  // from audio tap
-//   for (auto db : fft.magnitudesDb()) ...
-//
-// Magnitude bins are exponentially smoothed per-bin with asymmetric
-// attack (fast) and decay (slow) — the classic "analyzer follow" feel.
+// FFT analyzer for the Client EQ editor's live spectrum. Fixed 2048-point
+// radix-2: bin width fs/N = 11.7 Hz at 24 kHz, so the first non-DC bin sits
+// below the 20 Hz display floor (no visible cutoff at the left edge). ~200 µs
+// on the UI thread, fine for a 25 Hz timer. Bins are smoothed per bin with
+// fast attack and slow decay.
 class ClientEqFftAnalyzer {
 public:
     static constexpr int kFftSize = 2048;
@@ -43,6 +33,13 @@ public:
     static float binFreq(int bin, double sampleRate) {
         return static_cast<float>(bin * sampleRate / kFftSize);
     }
+
+    // dB to ADD to magnitudesDb() to read a bin as an absolute level (+6.02 dB
+    // for Hann). update() normalises by 2/N, which leaves the window's coherent
+    // gain (its mean, 1/2 for Hann) in place; it is not folded into `norm` so the
+    // EQ editor's display does not shift. Computed from the window actually
+    // built, so a buildWindow() change carries the constant with it.
+    float coherentGainCorrectionDb() const noexcept;
 
     static constexpr float kFloorDb = -100.0f;
 

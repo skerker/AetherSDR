@@ -8,20 +8,11 @@ namespace AetherSDR {
 
 class ClientPhaseRotator;
 
-// Client-side TX dynamics processor — the foundation of the Pro-XL-style
-// compression chain (#1661).  Phase 1 scope: core feed-forward compressor
-// with soft-knee static curve + attack/release envelope follower, plus a
-// brickwall peak limiter on the output.  Later phases will add expander/
-// gate, de-esser, tube, enhancer, low contour, and IKA/IRC auto modes.
-//
-// Thread model mirrors ClientEq: the UI thread writes parameters via
-// set*()  setters that update atomics and bump a version counter; the
-// audio thread reads the version once per block and recaches the values.
-// No locks, no allocations in process(), no exceptions.
-//
-// Stereo-linked detection: the envelope is driven by max(|L|, |R|) and
-// the computed gain multiplier is applied identically to both channels
-// so phase coherence is preserved.
+// Client-side TX compressor (#1661): feed-forward, soft-knee static curve with an
+// attack/release envelope follower, plus a brickwall peak limiter on the output.
+// Stereo-linked: envelope from max(|L|, |R|), same gain on both channels. UI
+// thread writes atomics + bumps a version; the audio thread recaches once per
+// block. No locks, allocations or exceptions in process().
 class ClientComp {
 public:
     ClientComp();
@@ -30,7 +21,8 @@ public:
     ClientComp(const ClientComp&)            = delete;
     ClientComp& operator=(const ClientComp&) = delete;
 
-    // Main thread — call before first process() and on sample-rate change.
+    // Audio owner — call before first process() and on sample-rate change.
+    // Never call concurrently with process(); parameter setters remain atomic.
     void prepare(double sampleRate);
 
     // Main thread — global enable / bypass. Lock-free.
@@ -86,7 +78,12 @@ public:
     bool  limiterActive() const noexcept;     // true while limiter is clamping
 
     // Sample rate this comp was prepared at.
-    double sampleRate() const noexcept { return m_sampleRate; }
+    // Audio owner: mirror a presented auxiliary source into UI-facing meters.
+    // Copies atomic snapshots only; parameters and processing histories stay local.
+    void copyMeteringFrom(const ClientComp& source) noexcept;
+
+    double sampleRate() const noexcept
+    { return m_sampleRate.load(std::memory_order_relaxed); }
 
 private:
     struct Atomics {
@@ -132,7 +129,8 @@ private:
     void recacheIfDirty() noexcept;
     float staticCurveGainDb(float envDb) const noexcept;
 
-    double   m_sampleRate{24000.0};
+    // Audio owner writes in prepare(); UI reads the displayed processing rate.
+    std::atomic<double> m_sampleRate{24000.0};
     Atomics  m_atomics;
     Cached   m_cached;
     Meters   m_meters;

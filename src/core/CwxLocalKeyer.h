@@ -13,32 +13,20 @@
 
 namespace AetherSDR {
 
-// Local Morse keyer — generates dit/dah timing events from CWX text so the
-// AetherSDR sidetone path can play a tone matching what the radio is
-// transmitting.  Independent of the radio's own keyer; both use the same
-// configured WPM, so they stay in sync within ±1 element on typical hardware.
-// If they drift, sidetone is informational only — the radio produces the
-// actual on-air CW.
-//
-// Threading
-// ─────────
-// The element schedule runs on a dedicated worker thread.  Each edge is timed
-// to an absolute std::chrono::steady_clock deadline (drift-corrected against
-// the run epoch) waited on an interruptible condition_variable — NOT a QTimer.
-// QTimer fires on whichever event loop owns it, and under panadapter paint +
-// VITA-49 burst handling that loop coalesces the firing, landing the edge a
-// block or two late and clipping individual CW elements (#3623).  IambicKeyer
-// abandoned QTimer for exactly this reason ("QTimer's jitter is too high for
-// CW"); this keyer now mirrors that pattern.
-//
-// Output
-// ──────
-// onKeyDownChange(bool down) flips the sidetone gate.  It is called directly
-// from the worker thread, so the receiver MUST be lock-free (e.g.
-// CwSidetoneGenerator::setKeyDown, which is std::atomic).
+// Local Morse keyer: dit/dah events from CWX text for the sidetone, at the same
+// WPM as the radio's keyer (informational; the radio makes the on-air CW).
+// The schedule runs on a worker thread waiting on absolute steady_clock deadlines
+// via an interruptible condition_variable, not a QTimer, whose event-loop
+// coalescing clips elements (#3623), as IambicKeyer does.
+// onKeyDownChange(down, when): `when` is the edge's SCHEDULED grid instant
+// (m_epoch + m_nextEdgeMs), so a consumer renders the intended rhythm (#4890,
+// #4977); off-grid edges (stop/abort/drain, first element) carry wall clock.
+// Called on the worker thread, so the receiver MUST be lock-free
+// (e.g. CwSidetoneGenerator::setKeyDown).
 class CwxLocalKeyer {
 public:
-    using KeyDownCallback = std::function<void(bool down)>;
+    using KeyDownCallback =
+        std::function<void(bool down, std::chrono::steady_clock::time_point when)>;
 
     CwxLocalKeyer();
     virtual ~CwxLocalKeyer();
@@ -78,6 +66,7 @@ protected:
     virtual void armTimer(int waitMs);       // record the next (drift-corrected) wait
     qint64 nextEdgeMsForTest() const { return m_nextEdgeMs; }
     bool elapsedValidForTest() const { return m_epochValid; }
+    std::chrono::steady_clock::time_point epochForTest() const { return m_epoch; }
 
 private:
     enum class Element : char { Dit, Dah, ElementGap, CharGap, WordGap };
@@ -88,7 +77,7 @@ private:
     void scheduleNext();
     void resetEpoch();
     void startEpoch();
-    void emitKeyDown(bool down);
+    void emitKeyDown(bool down, std::chrono::steady_clock::time_point when);
     void keyUpIfDown();
     void workerLoop();
 

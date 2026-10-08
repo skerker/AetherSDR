@@ -60,16 +60,9 @@ public:
     QWidget* setContent(QWidget* content);
     QWidget* content() const { return m_content; }
 
-    // ── Child-widget API (used by nesting) ───────────────────────
-    //
-    // A container's body is a QVBoxLayout; children stack vertically
-    // in insertion order.  Children can be leaf widgets or other
-    // ContainerWidgets — the container itself doesn't distinguish
-    // (ContainerManager tracks parent/child relationships for
-    // docking logic).
-    //
-    // insertChildWidget(-1, w)  → append
-    // insertChildWidget(i, w)   → insert at index i (clamped)
+    // Child widgets stack in a QVBoxLayout body in insertion order; leaf widgets
+    // and nested ContainerWidgets are treated alike (ContainerManager tracks the
+    // nesting). index -1 appends; otherwise inserts at the clamped index.
     void insertChildWidget(int index, QWidget* child);
     void removeChildWidget(QWidget* child);
     int  childWidgetCount() const;
@@ -89,6 +82,15 @@ public:
     // is the user's "show this container" flag, persisted separately.
     void setContainerVisible(bool visible);
     bool isContainerVisible() const { return m_visible; }
+
+    // Transient presentation only: unavailable applets retain their logical
+    // open/closed intent and workspace home. Direct show() calls from layout
+    // recall obey this gate too. Floating content stays shown inside its
+    // independently gated outer window. Other containers default available.
+    void setPresentationAvailable(bool available);
+    bool isPresentationAvailable() const { return m_presentationAvailable; }
+    bool isPresentationManaged() const { return m_presentationManaged; }
+    void setVisible(bool visible) override;
 
     // Access to the titlebar — callers can hide its close button
     // for root containers or customise the title dynamically.
@@ -136,6 +138,9 @@ signals:
     // Fired after setContainerVisible() changes state.
     void visibilityChanged(bool visible);
 
+    // Does not emit visibilityChanged: availability is never a user close.
+    void presentationAvailabilityChanged(bool available);
+
     // Fired after dockMode() changes — manager uses this to keep the
     // titlebar button label in sync.
     void dockModeChanged(DockMode mode);
@@ -170,6 +175,9 @@ private:
     QWidget*           m_content{nullptr};
     DockMode           m_dockMode{DockMode::PanelDocked};
     bool               m_visible{true};
+    bool               m_presentationAvailable{true};
+    bool               m_presentationManaged{false};
+    bool               m_requestedVisible{true};
     QSize              m_defaultFloatingSize;
     QHash<QWidget*, int> m_savedMaxWidths;  // child → docked maximumWidth (#3451)
 };

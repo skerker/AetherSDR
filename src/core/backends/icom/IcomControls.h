@@ -4,33 +4,13 @@
 #include <span>
 #include <string_view>
 
-// THE CONTROL REGISTRY — every CI-V message this backend knows about, declared
-// once, in a form something other than a human can read.
-//
-// WHY THIS EXISTS. The backend's knowledge of the radio used to live entirely in
-// switch statements: `cmd::kLevel` + `level::kNrLevel` decoded in one switch,
-// encoded in another, its 0..255-to-percent conversion inlined at both ends, and
-// the fact that a control is READ at connect but never SENT visible only by
-// grepping for the constant and finding one call site instead of two.
-//
-// That shape has one failure mode and the bring-up hit it repeatedly: a control
-// that is half-wired looks exactly like a control that works. `level::kRf` was
-// declared, named, and never sent or decoded — the RF Gain slider drove the
-// PREAMP instead, and nothing in the code said so. `filterForWidthHz` snapped
-// every mode against the SSB thresholds, so three filter buttons reached one
-// filter in AM and one in CW. Both were found by an operator noticing a wrong
-// number on screen, one control at a time.
-//
-// A table cannot prevent those. What it can do is make them ENUMERABLE: with the
-// wire address, the scale and the seam verb declared next to each other, an
-// agent can ask "which controls do we claim, which of those reach the radio, and
-// which have a UI that reaches them" and get an answer for all of them at once
-// instead of one at a time.
-//
-// THIS IS A CLAIM, NOT A PROOF. Every field here is what the code INTENDS. The
-// `controls.scrub` extension is what checks the intent against the wire — see
-// IcomCivBackend::invokeExtension. A row saying `seamVerb = "setSliceNoiseReduction"`
-// is a promise that something calls it; only the scrub can tell you it does.
+#include "core/backends/icom/IcomModels.h"
+
+// The control registry: every CI-V message this backend knows, with wire
+// address, scale and seam verb declared together so tools can enumerate which
+// controls are claimed, which reach the radio, and which have a UI.
+// This is a CLAIM, not a proof: the `controls.scrub` extension
+// (IcomCivBackend::invokeExtension) checks the intent against the wire.
 
 namespace AetherSDR::icom {
 
@@ -44,6 +24,10 @@ enum class Encoding : std::uint8_t {
     BcdFreq,     // five BCD bytes, little-endian, Hz
     ModeFilter,  // mode byte + filter slot byte
     Bcd4,        // four BCD digits (a scope span, a SET-menu item)
+    Bcd6,        // six BCD digits (repeater offset / CTCSS frequency)
+    Dtcs,        // polarity byte + three displayed BCD code digits
+    Ascii,       // bounded ASCII text after the command-specific address
+    GpsPosition, // latitude/longitude plus optional altitude/course/speed/UTC
 };
 
 // Which model the value belongs to once it is across the seam. Says where to
@@ -109,9 +93,19 @@ struct ControlSpec {
     // than its fields — the mode-dependent filter ladder, the attenuator's
     // band limits — this is where that lives, so the report explains itself.
     std::string_view note;
+
+    // The model-profile facet required before this row is effective. Core is
+    // the backend's model-neutral CI-V floor; Scope follows the discovered
+    // model's transport geometry. Their evidence can still be "none" so the
+    // registry distinguishes reachability from guide/live attestation.
+    IcomFeature requiredFeature = IcomFeature::Core;
 };
 
 [[nodiscard]] std::span<const ControlSpec> controlSpecs();
+[[nodiscard]] bool controlSupported(const IcomModel& model,
+                                    const IcomModelProfile& profile,
+                                    const ControlSpec& spec) noexcept;
+[[nodiscard]] int speechProcessorRawLevel(int maximum, int level) noexcept;
 
 [[nodiscard]] std::string_view encodingName(Encoding e);
 [[nodiscard]] std::string_view planeName(Plane p);

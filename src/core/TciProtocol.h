@@ -2,6 +2,7 @@
 #ifdef HAVE_WEBSOCKETS
 
 #include <QString>
+#include <QStringList>
 #include <optional>
 
 namespace AetherSDR {
@@ -35,6 +36,13 @@ public:
         bool transmitting { false };
         QString source;
     };
+    static std::optional<TrxRequest> parseTrxRequest(const QStringList& args);
+
+    struct TuneRequest
+    {
+        int trx { 0 };
+        bool tune { false };
+    };
 
     explicit TciProtocol(RadioModel* model, TciRoutingState* routingState = nullptr,
                          const TciTrxMap* trxMap = nullptr);
@@ -53,6 +61,7 @@ public:
     std::optional<VfoRequest> takeVfoRequest();
     std::optional<SplitRequest> takeSplitRequest();
     std::optional<TrxRequest> takeTrxRequest();
+    std::optional<TuneRequest> takeTuneRequest();
 
     // After handleCommand(), if the command was a master-volume SET, this
     // returns the requested level (0-100). -1 means no master-volume change
@@ -74,20 +83,15 @@ public:
     // TciServer directly (same pattern as pendingMasterVolume).
     int pendingTxGain() const { return m_pendingTxGain; }
 
-    // Which TCI TRX currently holds GUI focus (#4160). TciServer owns this
-    // value and pushes it in — it cannot be derived reliably by scanning
-    // slices for isActive(): SliceModel::setActive() sets the new slice's
-    // flag optimistically (SliceModel.cpp, #3854 review) while the outgoing
-    // slice keeps its flag until the radio echoes active=0, so for one round
-    // trip TWO slices report active and a scan returns whichever comes first
-    // in slice order. -1 = not yet known, in which case the scan is used as
-    // the startup fallback (before any focus change has been observed).
-    // The letter is sanitized here, not just at the TciServer call site: this
-    // is the boundary the value crosses on its way to the wire, and a raw
-    // radio-supplied ',' or ';' would corrupt TCI framing for every client on
-    // the socket. Enforcing it in the setter keeps the invariant independent of
-    // any caller remembering (Principle VII). Sanitizing is idempotent, so the
-    // server sanitizing first costs nothing.
+    // GUI-focused TRX (#4160), pushed in by TciServer: scanning isActive() is
+    // unreliable because two slices report active for one round trip after a
+    // focus change. -1 = unknown; the scan is then the startup fallback. The
+    // letter is sanitized here (the wire boundary) since a ',' or ';' would break
+    // TCI framing; sanitizing is idempotent.
+    // The IQ sample rate is server-wide state, seeded here because it's announced
+    // in this client's init burst.
+    void setIqSampleRate(int rate) { m_iqSampleRate = rate; }
+
     void setActiveSlice(int trx, const QString& letter)
     {
         m_activeTrx = trx;
@@ -129,7 +133,7 @@ private:
     QString cmdRxNrEnable(const QStringList& args, bool isSet);
     QString cmdRxAnfEnable(const QStringList& args, bool isSet);
     QString cmdRxApfEnable(const QStringList& args, bool isSet);
-    // AetherSDR extensions (DVK record/play)
+    // AetherSDR extensions (slice quick-record record/play)
     QString cmdRxRecord(const QStringList& args, bool isSet);
     QString cmdRxPlay(const QStringList& args, bool isSet);
     QString cmdActiveSlice(const QStringList& args);
@@ -141,9 +145,6 @@ private:
     QString cmdStart();
     QString cmdStop();
     QString cmdTxEnable(const QStringList& args);
-    QString cmdIqStart(const QStringList& args);
-    QString cmdIqStop(const QStringList& args);
-    QString cmdIqSampleRate(const QStringList& args, bool isSet);
     QString cmdKeyer(const QStringList& args);
     QString cmdCwKeyerSpeed(const QStringList& args, bool isSet);
     QString cmdCwMacrosDelay(const QStringList& args, bool isSet);
@@ -220,6 +221,15 @@ public:
     // still holds the model placeholder (#3910, #3913 review).
     static long long ddsCenterHz(RadioModel* model, const SliceModel* slice);
 
+    // Extract the text from `cw_macros:<trx>,<text>` (#4997). A base-10
+    // integer first argument is always a receiver address: an in-range value
+    // is stripped and an out-of-range/stale value fails closed. A nonnumeric
+    // first argument is retained for compatibility with index-less clients.
+    // Public and pure so the boundary rule can be tested without a radio-side
+    // CW keyer; trxCount is the same dynamic count advertised to TCI clients.
+    [[nodiscard]] static QString cwMacrosTextFromArgs(const QStringList& args,
+                                                      int trxCount);
+
 private:
 
     RadioModel* m_model;
@@ -231,9 +241,11 @@ private:
     std::optional<VfoRequest> m_vfoRequest;
     std::optional<SplitRequest> m_splitRequest;
     std::optional<TrxRequest> m_trxRequest;
+    std::optional<TuneRequest> m_tuneRequest;
     int         m_pendingMasterVolume{-1};   // -1 = no change requested
     int         m_pendingTxGain{-1};         // -1 = no change requested
     int         m_activeTrx{-1};             // -1 = focus not yet known (#4160)
+    int         m_iqSampleRate{48000};       // seeded by TciServer, see setIqSampleRate
     QString     m_activeLetter;              // focused slice's display letter (#4160)
     bool        m_started{false};  // client sent START
 };

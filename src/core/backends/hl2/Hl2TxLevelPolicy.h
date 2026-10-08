@@ -1,68 +1,37 @@
 #pragma once
 
-// The two level calculations on the HL2's transmit path, as pure functions.
-//
-// Both were live bugs rather than refinements, and both are the kind that a
-// running radio reports as "the control does nothing" — which is the hardest
-// symptom to act on, because it is indistinguishable from the operator having
-// misunderstood the control.
-//
-// They live in a header, evaluated by Hl2Backend rather than copied into it, so
-// the suite exercises the SAME expressions the backend runs. A test against a
-// re-typed copy of a mapping proves only that two copies agree; the convention
-// error it is meant to catch would sit in both.
-//
-// See Hl2Backend::setMicGain and Hl2Backend::publishTelemetry for the reasoning
-// about WHY each is shaped this way; this header is the arithmetic only.
+// The HL2 transmit-path level calculations, as pure functions. Hl2Backend
+// calls these directly so the tests exercise the same expressions it runs.
+// Reasoning lives at Hl2Backend::setMicGain and Hl2Backend::publishTelemetry.
 
 #include <cmath>
+#include <cstddef>
+#include <string_view>
+#include <utility>
 
 namespace AetherSDR::hl2 {
 
 // ---- Microphone gain -------------------------------------------------------
 
-// The Phone applet's MIC slider (0..100) as dB of gain.
-//
-// 50 is unity, because TransmitModel constructs m_micLevel at 50 and nothing
-// restores it at startup: a session where the operator never touches the slider
-// must leave the modulator exactly at its own 1.0 default. +/-20 dB across the
-// travel, linear in dB.
-//
-// Level 0 is NOT -20 dB — see micSliderToLinear, which handles it as a mute.
-// This function is the continuous part of the mapping only.
+// The Phone applet's MIC slider (0..100) as dB of gain. 50 is unity (a radio
+// with nothing stored leaves the modulator at 1.0), so it must not move.
+// Below 50: 0.4 dB/step to -20 dB. Above 50: 0.8 dB/step to +40 dB, because
+// the ALC has no makeup gain and speech (~-32 dBFS) is ~30 dB short of its
+// 0.85 target. The join at 50 is continuous in value, not slope;
+// hl2_tx_level_policy_test pins it. Level 0 is a mute (micSliderToLinear).
 [[nodiscard]] constexpr double micSliderToGainDb(int level) noexcept
 {
     const int clamped = level < 0 ? 0 : (level > 100 ? 100 : level);
-    return (static_cast<double>(clamped) - 50.0) * 0.4;
+    const double fromUnity = static_cast<double>(clamped) - 50.0;
+    return fromUnity <= 0.0 ? fromUnity * 0.4 : fromUnity * 0.8;
 }
 
-// The same slider as the linear multiplier the modulator takes.
-//
-// Level 0 mutes outright rather than resolving to the -20 dB the line above
-// would give it. A slider at the bottom of its travel means off — and a mic
-// merely 20 dB down would be hauled back up by the ALC's 40 dB of makeup
-// anyway, so without the special case "0" would sound barely different from
-// "50", which is the sort of control that teaches an operator to distrust every
-// other one on the panel.
-//
-// SCOPE, because "mic" undersells it: this multiplier is applied to everything
-// entering Hl2TxDsp::processAudioBlock, and on a host-modulating backend that
-// includes digital-mode and WSPR-beacon audio arriving through submitTxAudio,
-// not only voice. For MIC-path audio, above the ALC's hold threshold it is
-// very nearly a no-op — the ALC normalizes each block's peak to alcTargetPeak
-// and hands the gain straight back. For CLIENT-LEVELED audio (TCI/DAX) the ALC
-// may only reduce, never lift (#4796), so below its target there is no handing
-// back: this slider is a straight proportional attenuator on that path, and
-// TX gain 5 (-18 dB) is a real -18 dB on the air. It stops being straight only
-// where it has to — drive a full-scale client through the top of this slider's
-// +20 dB and the ALC limits, rather than letting the modulator's hard clamp
-// flat-top it, so the last stretch of travel buys reduced headroom rather than
-// more power. At 0 neither path transmits: the mic path because silence
-// sits below the hold threshold so the ALC declines to lift it, the
-// client-leveled path as a plain 0.0x multiply. That is the honest reading of
-// a slider at the bottom of its travel on a host modulator — there is one
-// modulator and it is off — but it is worth knowing before parking the control
-// at 0 between voice sessions.
+// The slider as the modulator's linear multiplier; level 0 mutes. Applies to
+// Microphone and ClientLeveled audio (voice, AX.25, TCI/DAX), not the WSPR
+// pump (Hl2TxDsp substitutes 1.0), so 0 does not silence a beacon. The ALC
+// only reduces, and reduction is instantaneous (`m_alcGain = target`), so a
+// full-scale source at the slider top is limited by the ALC, not flat-topped
+// by the modulator clamp; hl2_txdsp_test's slider-top case asserts it.
 [[nodiscard]] inline double micSliderToLinear(int level) noexcept
 {
     if (level <= 0)
@@ -70,28 +39,33 @@ namespace AetherSDR::hl2 {
     return std::pow(10.0, micSliderToGainDb(level) / 20.0);
 }
 
+// ---- Persisted level migration ---------------------------------------------
+
+// The curve micSliderToGainDb implements, stored with persisted levels.
+// Curve 1: +/-20 dB at 0.4 dB/step. Curve 2: lower leg unchanged, upper leg
+// +40 dB at 0.8 dB/step. A curve number (what a stored number means), not a
+// schema version (what keys exist).
+inline constexpr int kMicLevelCurve = 2;
+
+// A curve-1 slider position re-expressed on curve 2 so it puts the same gain on
+// the air (curve-1 80 = +12 dB; raw 80 on curve 2 would be +24 dB). Identity
+// at and below 50. Odd positions round up, at most 0.4 dB above the old level.
+[[nodiscard]] constexpr int micLevelFromCurve1(int level) noexcept
+{
+    if (level <= 50)
+        return level;
+    const int clamped = level > 100 ? 100 : level;
+    // +1 before the integer divide is round-half-up on a non-negative value.
+    return 50 + (clamped - 50 + 1) / 2;
+}
+
 // ---- Forward-power peak hold -----------------------------------------------
 
-// One step of the transmit forward-power peak hold, in watts.
-//
-// The HL2's forward power is a single 12-bit conversion from an I2C
-// instrumentation ADC with no peak detector and no averaging in the gateware
-// (rtl/slow_adc.v), reaching us at 10 Hz. Speech peaks last tens of
-// milliseconds, so sampling that envelope at 10 Hz lands on a peak essentially
-// never: an SSB reading sat 8-12 dB below PEP while constant-envelope FT8 —
-// where every instant IS the peak — read full scale. Both were making the same
-// power.
-//
-// Instant attack, exponential release. What this recovers is NOT an
-// instantaneous PEP reading; no filter can recover a peak that was never
-// sampled. What it does is accumulate the maximum ACROSS a transmission, so the
-// displayed value climbs toward PEP as the over goes on and settles within a
-// few dB of it.
-//
-// `keyed` is a real term, not a guard: unkeyed, the reading must follow the
-// instantaneous sample straight down, or a hold outliving the transmission
-// keeps re-arming MeterModel's filter and the gauge claims power out of a radio
-// that has stopped.
+// One step of the TX forward-power peak hold, in watts. Forward power is one
+// unaveraged 12-bit I2C ADC sample (rtl/slow_adc.v), re-sampled every other EP6
+// response (control.v:261); the input is each publish window's maximum. Instant
+// attack and exponential release carry the max across an over. Unkeyed, the
+// reading follows the instant sample so the gauge drops when TX stops.
 [[nodiscard]] constexpr double fwdPeakHoldStep(double previousPeakW,
                                                double instantW,
                                                bool keyed,
@@ -102,6 +76,35 @@ namespace AetherSDR::hl2 {
     if (instantW >= previousPeakW)
         return instantW;
     return previousPeakW + releaseAlpha * (instantW - previousPeakW);
+}
+
+// ---- Transmit passband -----------------------------------------------------
+
+// The default TX audio passband for a mode, in Hz. Lives here so
+// hl2_txdsp_test's sweep uses these pairs rather than a copy. ASCII-uppercases
+// its input to stay Qt-free (Hl2Backend wraps it for QString). This is the
+// mode default only: Hl2Backend::effectiveTxPassband returns the operator's
+// setTxFilter override instead for USB/LSB.
+[[nodiscard]] constexpr std::pair<int, int>
+defaultTxPassbandForModeName(std::string_view mode) noexcept
+{
+    constexpr auto eq = [](std::string_view a, std::string_view b) {
+        if (a.size() != b.size())
+            return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            char c = a[i];
+            if (c >= 'a' && c <= 'z')
+                c = static_cast<char>(c - 'a' + 'A');
+            if (c != b[i])
+                return false;
+        }
+        return true;
+    };
+    if (eq(mode, "DIGU") || eq(mode, "DIGL")) return {150, 3000};
+    if (eq(mode, "CWU") || eq(mode, "CW") || eq(mode, "CWL")) return {300, 900};
+    if (eq(mode, "AM") || eq(mode, "SAM") || eq(mode, "DSB")) return {100, 3000};
+    if (eq(mode, "FM") || eq(mode, "NFM")) return {100, 3000};
+    return {300, 2700};   // USB/LSB and anything else: the voice default
 }
 
 }  // namespace AetherSDR::hl2

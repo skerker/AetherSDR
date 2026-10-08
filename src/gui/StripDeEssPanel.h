@@ -11,30 +11,17 @@ class AudioEngine;
 class ClientCompKnob;             // reused — generic rotary knob
 class ClientDeEssCurveWidget;
 
-// Floating editor for the client-side de-esser.  Three-column layout
-// inspired by Ableton's Compressor (the de-esser preset), using our
-// actual de-esser parameters:
-//
-//   ┌─ bypass ──────────────────── × ┐
-//   │ ┌──────┐ ┌────────────┐ ┌────┐ │
-//   │ │ FREQ │ │            │ │ AMT│ │
-//   │ │      │ │  bandpass  │ │    │ │
-//   │ │  Q   │ │  response  │ │ ATK│ │
-//   │ │      │ │  + live    │ │    │ │
-//   │ │ THR  │ │  ball      │ │ REL│ │
-//   │ └──────┘ └────────────┘ └────┘ │
-//   └────────────────────────────────┘
+// Floating editor for the client-side de-esser, three columns: FREQ/Q/THR
+// knobs, bandpass response with live ball, AMT/ATK/REL knobs.
 class StripDeEssPanel : public QWidget {
     Q_OBJECT
 
 public:
-    enum class Side { Tx, Rx };
 
     explicit StripDeEssPanel(AudioEngine* engine, QWidget* parent = nullptr);
     ~StripDeEssPanel() override;
 
     void showForTx();
-    void showForRx();
 
     // Pull every knob / button / label state from the bound engine.
     // Called after preset load when the engine is mutated externally.
@@ -69,7 +56,6 @@ private:
     void               saveDeEssSettings() const;
 
     AudioEngine*            m_audio{nullptr};
-    Side                    m_side{Side::Tx};
     QWidget*                m_titleBar{nullptr};   // EditorFramelessTitleBar*
     ClientDeEssCurveWidget* m_curve{nullptr};
     QWidget*                m_grBar{nullptr};   // gain-reduction bar below curve

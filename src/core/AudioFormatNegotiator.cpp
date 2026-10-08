@@ -16,9 +16,16 @@ namespace {
 // 44.1k rung and the device-preferred rung are appended by buildLadder() so
 // every sink gets the SAME complete fallback set (no more "Quindar has no
 // fallback / RX never tries 44.1k" divergence — #3306, #3385).
-QList<int> primaryRateOrder(TargetOs os, Direction dir, int internalRate)
+QList<int> primaryRateOrder(TargetOs os, Direction dir,
+                            ResamplerPolicy policy, int internalRate)
 {
     if (dir == Direction::Output) {
+        if (internalRate == 48000 && policy == ResamplerPolicy::PreservePan) {
+            // Preserve a native 48 kHz stereo producer's bandwidth when possible.
+            // Keep 24 kHz as an explicit last fallback: an advertised preferred
+            // 48 kHz format does not guarantee that opening it will succeed.
+            return {48000, 44100, 24000};
+        }
         switch (os) {
         // Windows: force 48k — WASAPI's shared-mode resampler adds artifacts at
         // 24k that become audible once radio-side NR removes the noise floor;
@@ -29,8 +36,8 @@ QList<int> primaryRateOrder(TargetOs os, Direction dir, int internalRate)
         case TargetOs::MacOS:   return {48000, internalRate};
         // Linux: native 24k is fine (no WASAPI resampler in the path) — avoid an
         // unnecessary upsample. Deliberate, documented divergence from Win/Mac.
-        // RX is still canonically 24 kHz, so this stays 24k-first even though
-        // the Linux *input* ladder now leads with 48k for the TX voice strip.
+        // Callers using the default 24 kHz producer retain this order even
+        // though the Linux input ladder leads with 48k for the TX voice strip.
         case TargetOs::Linux:   return {internalRate, 48000};
         }
     } else { // Input (mic / TX capture)
@@ -58,15 +65,32 @@ QList<int> primaryRateOrder(TargetOs os, Direction dir, int internalRate)
 // native is Int16; Float is the virtual-driver / Float-only fallback — #1090).
 // Int16-native playback sinks (QSO/Pudu) pass Int16First so they avoid a
 // conversion on normal devices while still falling back to Float.
-QList<SampleFmt> formatOrder(Direction dir, FormatPreference pref)
+QList<SampleFmt> formatOrder(TargetOs os, Direction dir, FormatPreference pref)
 {
     if (pref == FormatPreference::Int16First)
         return {SampleFmt::Int16, SampleFmt::Float32};
     if (pref == FormatPreference::Float32First)
         return {SampleFmt::Float32, SampleFmt::Int16};
-    return dir == Direction::Output
-        ? QList<SampleFmt>{SampleFmt::Float32, SampleFmt::Int16}
-        : QList<SampleFmt>{SampleFmt::Int16, SampleFmt::Float32};
+    if (dir == Direction::Output)
+        return {SampleFmt::Float32, SampleFmt::Int16};
+
+    // Input leads with Float32: TxVoiceProcessor is float and WASAPI shared mode,
+    // PipeWire and PulseAudio all mix in float, so Int16 capture would only add a
+    // quantize/widen round trip at the chain's entrance. Int16 remains the next rung
+    // for Int16-only endpoints.
+    switch (os) {
+    case TargetOs::Windows:
+    case TargetOs::Linux:
+        return {SampleFmt::Float32, SampleFmt::Int16};
+    // macOS deliberately keeps Int16-first. The argument above applies to
+    // CoreAudio too, but this change only measures Windows and Linux, and the
+    // mac input ladder additionally leads with the device's preferredFormat for
+    // BT-HFP / 16k-native mics (#2615 / #2930). Left for a follow-up with real
+    // hardware behind it rather than changed blind.
+    case TargetOs::MacOS:
+        return {SampleFmt::Int16, SampleFmt::Float32};
+    }
+    Q_UNREACHABLE();
 }
 
 bool ladderHas(const QList<FormatCandidate>& ladder, int rate, SampleFmt fmt)
@@ -90,6 +114,66 @@ ResamplerKind resamplerKindFor(int deviceRate, ResamplerPolicy policy, int inter
     return ResamplerKind::None;
 }
 
+QList<TxOpenAttempt> txOpenLadder(int initialChannels)
+{
+    // Stage 0 must reproduce exactly what AudioEngine opens first: 48 kHz
+    // Float32 at whatever channel count survived the maximumChannelCount()
+    // clamp. Everything after it is recovery.
+    const int initial = (initialChannels <= 1) ? 1 : 2;
+
+    QList<TxOpenAttempt> ladder;
+    const auto add = [&](int rate, SampleFmt fmt, int channels) {
+        const TxOpenAttempt candidate{rate, fmt, channels};
+        for (const auto& existing : ladder) {
+            if (existing == candidate) return;
+        }
+        ladder.append(candidate);
+    };
+
+    // Rate outermost, then format, then channels. At 48 kHz: Float32/clamped,
+    // Float32/mono, Int16/clamped, Int16/mono, so a mono-only mic recovers in one
+    // reopen (#2929). Null-open and silent-open failures share these rungs.
+    for (int rate : {48000, 44100, 24000, 16000}) {
+        for (SampleFmt fmt : {SampleFmt::Float32, SampleFmt::Int16}) {
+            add(rate, fmt, initial);
+            add(rate, fmt, 1);
+        }
+    }
+    return ladder;
+}
+
+TxOpenCursor::TxOpenCursor(int initialChannels, int stage)
+    : m_ladder(txOpenLadder(initialChannels))
+{
+    // A persisted stage from a previous pass is clamped rather than trusted:
+    // the ladder's LENGTH depends on the channel clamp, so a stage carried
+    // across a device change could otherwise index past the end.
+    m_stage = qBound(0, stage, static_cast<int>(m_ladder.size()) - 1);
+}
+
+bool TxOpenCursor::advance()
+{
+    if (!hasNext())
+        return false;
+    ++m_stage;
+    return true;
+}
+
+int walkTxOpen(TxOpenCursor& cursor,
+               const std::function<TxOpenOutcome(const TxOpenAttempt&)>& probe)
+{
+    for (;;) {
+        const TxOpenOutcome outcome = probe(cursor.attempt());
+        if (outcome == TxOpenOutcome::Delivers)
+            return cursor.stage();
+        // Null and SilentNonNull take the same branch on purpose — see the
+        // enum's comment. If the ladder is exhausted the mic never opens
+        // (null) or never speaks (silent); either way there is nothing left.
+        if (!cursor.advance())
+            return -1;
+    }
+}
+
 QList<FormatCandidate> buildLadder(TargetOs os,
                                    Direction dir,
                                    const DeviceCaps& caps,
@@ -98,7 +182,7 @@ QList<FormatCandidate> buildLadder(TargetOs os,
                                    FormatPreference pref)
 {
     QList<FormatCandidate> ladder;
-    const QList<SampleFmt> fmts = formatOrder(dir, pref);
+    const QList<SampleFmt> fmts = formatOrder(os, dir, pref);
 
     const auto add = [&](int rate, SampleFmt fmt, const QString& reason) {
         if (rate <= 0) return;
@@ -112,19 +196,24 @@ QList<FormatCandidate> buildLadder(TargetOs os,
         ladder.append(c);
     };
 
-    // macOS / preferred-first inputs: the device's own preferred rate leads the
-    // ladder so we never force a 16k-native or BT-HFP mic up to 48k (#2930 /
-    // #2615). preferredFormat is honoured here too.
+    // macOS inputs: the device's preferred rate leads so a 16k-native or BT-HFP mic
+    // is never forced to 48k (#2930/#2615). Only the RATE is taken from caps:
+    // CoreAudio reports Float as preferred, and formatOrder() is the format policy.
+    // The preferredFormat catch-all rung at the bottom keeps Float32-only endpoints
+    // working.
     const bool preferredFirst =
         (dir == Direction::Input && os == TargetOs::MacOS && caps.preferredRate > 0);
     if (preferredFirst) {
-        add(caps.preferredRate, caps.preferredFormat,
+        const QString reason =
             caps.isBluetoothHfp ? QStringLiteral("macOS Bluetooth-HFP native rate (#2615)")
-                                : QStringLiteral("macOS mic preferred rate first (#2930)"));
+                                : QStringLiteral("macOS mic preferred rate first (#2930)");
+        for (SampleFmt fmt : fmts) {
+            add(caps.preferredRate, fmt, reason);
+        }
     }
 
     // Main per-OS rate order × format order.
-    const QList<int> rates = primaryRateOrder(os, dir, internalRate);
+    const QList<int> rates = primaryRateOrder(os, dir, policy, internalRate);
     for (int rate : rates) {
         for (SampleFmt fmt : fmts) {
             QString reason = (rate == rates.first())

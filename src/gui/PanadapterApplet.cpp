@@ -1,9 +1,12 @@
 #include "PanadapterApplet.h"
+#include "models/CwRxModel.h"
+#include "RttyDecodeSettings.h"
+#include "RttyDecoderSensitivity.h"
 #include "CallsignCard.h"
 #ifdef AETHER_ASR_ENABLED
 #include "CopyAssistPanel.h"
 #endif
-#include "CwDecodeSettings.h"
+#include "models/CwDecodeSettings.h"
 #include "FramelessMoveHelper.h"
 #include "GuardedSlider.h"
 #include "RangeSlider.h"
@@ -18,25 +21,54 @@
 #include <QHBoxLayout>
 #include <QComboBox>
 #include <QSlider>
+#include <QSignalBlocker>
 #include <QEvent>
 #include <QLabel>
 #include <QDateTime>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPushButton>
-#include <QGraphicsOpacityEffect>
 #include <QTextEdit>
 #include <QTextCharFormat>
-#include <QTextCursor>
-#include <QColor>
 #include <QWindow>
 #include <QGuiApplication>
 #include <QClipboard>
+#include <QAccessible>
 #include "core/ThemeManager.h"
 
 #include <algorithm>
+#include <array>
 
 namespace AetherSDR {
+
+namespace {
+void setDecoderInputHint(QLabel* label, const QString& hint, const QString& reason,
+                         const QString& accessibleName)
+{
+    const bool textChanged = label->text() != hint;
+    const bool reasonChanged = label->accessibleDescription() != reason;
+    if (!textChanged && !reasonChanged) {
+        return;
+    }
+    label->setText(hint);
+    label->setToolTip(reason);
+    label->setAccessibleName(accessibleName);
+    label->setAccessibleDescription(reason);
+    ThemeManager::instance().applyStyleSheet(label, reason.isEmpty()
+        ? "QLabel { color: {{color.meter.bar.fill}}; font-size: 9px; background: transparent; }"
+        : "QLabel { color: {{color.accent.warning}}; font-size: 9px; background: transparent; }");
+    // A reason that changes under an unchanged hint is the whole content of the
+    // update for a screen reader, and NameChanged does not carry it (#4896).
+    if (textChanged) {
+        QAccessibleEvent event(label, QAccessible::NameChanged);
+        QAccessible::updateAccessibility(&event);
+    }
+    if (reasonChanged) {
+        QAccessibleEvent event(label, QAccessible::DescriptionChanged);
+        QAccessible::updateAccessibility(&event);
+    }
+}
+} // namespace
 
 PanadapterApplet::PanadapterApplet(QWidget* parent)
     : QWidget(parent)
@@ -163,62 +195,10 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     auto* cwTitle = new QLabel("CW");
     AetherSDR::ThemeManager::instance().applyStyleSheet(cwTitle, "QLabel { color: {{color.accent}}; font-size: 10px; font-weight: bold; background: transparent; }");
     cwBar->addWidget(cwTitle);
-    auto* cwHint = new QLabel("(requires PC Audio)");
-    AetherSDR::ThemeManager::instance().applyStyleSheet(cwHint, "QLabel { color: {{color.meter.bar.fill}}; font-size: 9px; background: transparent; }");
-    cwBar->addWidget(cwHint);
-
-    // Decoder engine toggle: DSP (ggmorse) <-> Neural (DeepCW). The label shows
-    // the *active* engine; clicking flips it and MainWindow downloads the neural
-    // model on first use, then swaps the live RX decoder (see reconcileCwBackend).
-    //
-    // Only offered when the neural backend can actually exist: HAVE_ONNX (the ONNX
-    // engine is compiled in, not the inert stub) AND AETHER_ASR_ENABLED (the shared
-    // model-download manager is available). Without both — e.g. the default CI
-    // build with no ONNX Runtime — CW decode is ggmorse-only and the toggle is
-    // omitted so the header never advertises a backend that can't load.
-#if defined(HAVE_ONNX) && defined(AETHER_ASR_ENABLED)
-    auto* decoderLabel = new QLabel("Decoder:");
-    AetherSDR::ThemeManager::instance().applyStyleSheet(decoderLabel, "QLabel { color: {{color.text.label}}; font-size: 9px; background: transparent; }");
-    cwBar->addWidget(decoderLabel);
-    m_cwBackendBtn = new QPushButton;
-    m_cwBackendBtn->setCheckable(true);
-    m_cwBackendBtn->setFixedHeight(16);
-    m_cwBackendBtn->setMinimumWidth(50);
-    m_cwBackendBtn->setToolTip("CW decode engine — DSP (ggmorse) or Neural (DeepCW, downloaded on first use)");
-    // Bright/readable in BOTH states: DSP shows primary text, Neural adds the
-    // accent color + border. (Not the dim text.label, which read as disabled.)
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwBackendBtn,
-        "QPushButton { background: {{color.background.1}}; color: {{color.text.primary}}; border: 1px solid {{color.background.2}};"
-        " border-radius: 2px; font-size: 9px; font-weight: bold; padding: 0 6px; }"
-        "QPushButton:checked { color: {{color.accent}}; border-color: {{color.accent}}; }"
-        "QPushButton:hover { color: {{color.text.primary}}; }");
-    {
-        const bool neural = CwDecodeSettings::deepCwSelected();
-        m_cwBackendBtn->setChecked(neural);
-        m_cwBackendBtn->setText(neural ? "Neural" : "DSP");
-    }
-    connect(m_cwBackendBtn, &QPushButton::clicked, this, [this](bool checked) {
-        m_cwBackendBtn->setText(checked ? "Neural" : "DSP");
-        setCwNeuralUi(checked);
-        emit cwBackendChanged(checked);
-    });
-    cwBar->addWidget(m_cwBackendBtn);
-#endif
-
-    // Zero Beat — tune so the received CW note matches the configured pitch
-    // (same action as the VFO flag's Zero Beat, #2516). Works in both engines.
-    m_cwZeroBeatBtn = new QPushButton("Zero Beat");
-    m_cwZeroBeatBtn->setFixedHeight(16);
-    m_cwZeroBeatBtn->setToolTip("Tune so the received CW note matches your configured pitch");
-    // Style independently of the (optionally-absent) decoder toggle above.
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwZeroBeatBtn,
-        "QPushButton { background: {{color.background.1}}; color: {{color.text.primary}}; border: 1px solid {{color.background.2}};"
-        " border-radius: 2px; font-size: 9px; font-weight: bold; padding: 0 6px; }"
-        "QPushButton:hover { color: {{color.text.primary}}; }");
-    connect(m_cwZeroBeatBtn, &QPushButton::clicked, this, [this]() {
-        emit cwZeroBeatRequested();
-    });
-    cwBar->addWidget(m_cwZeroBeatBtn);
+    m_cwInputHint = new QLabel;
+    m_cwInputHint->setObjectName(QStringLiteral("cwInputHint"));
+    setCwInputHint({}, {});
+    cwBar->addWidget(m_cwInputHint);
 
     m_cwStatsLabel = new QLabel;
     AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwStatsLabel, "QLabel { color: {{color.text.label}}; font-size: 10px; background: transparent; }");
@@ -248,6 +228,28 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
             settings.save();
         });
     cwBar->addWidget(m_cwSensSlider);
+
+#ifdef HAVE_DEEPFIST
+    m_cwEngineCombo = new GuardedComboBox(this);
+    m_cwEngineCombo->setObjectName("cwRxEngine");
+    m_cwEngineCombo->setAccessibleName(tr("CW receive decoder"));
+    m_cwEngineCombo->setAccessibleDescription(tr("Select ggmorse or the experimental DeepFist decoder for the selected slice"));
+    for (const QString& key : CwRxModel::availableBackends()) {
+        m_cwEngineCombo->addItem(key == "deepfist" ? tr("DeepFist") : key, key);
+    }
+    m_cwEngineCombo->setToolTip(tr("Receive decoder; transmit sidetone continues to use ggmorse"));
+    cwBar->addWidget(m_cwEngineCombo);
+    m_cwModelAction = new QPushButton(tr("Cancel"), this);
+    m_cwModelAction->setObjectName("cwModelAction");
+    m_cwModelAction->setAccessibleName(tr("CW model download action"));
+    m_cwModelAction->setFixedHeight(22);
+    m_cwModelAction->hide();
+    cwBar->addWidget(m_cwModelAction);
+    connect(m_cwModelAction, &QPushButton::clicked, this, &PanadapterApplet::cwModelActionRequested);
+    connect(m_cwEngineCombo, &QComboBox::currentIndexChanged, this, [this](int index) {
+        emit cwEngineChanged(m_cwEngineCombo->itemData(index).toString());
+    });
+#endif
 
     // Lock Pitch button
     m_lockPitchBtn = new QPushButton("\xF0\x9F\x94\x92P");  // 🔒P
@@ -341,7 +343,7 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
         " padding: 1px 6px; }"
         "QPushButton:hover { color: #ff6060; background: {{color.background.1}}; }");
     connect(closeBtn, &QPushButton::clicked, this, [this]() {
-        m_cwPanel->hide();
+        setCwPanelVisible(false);
         emit cwPanelCloseRequested();
     });
     cwBar->addWidget(closeBtn);
@@ -387,6 +389,7 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     cwTextRow->addWidget(m_cwCallsignCard, 0, Qt::AlignTop);
     cwLayout->addLayout(cwTextRow);
 
+
     m_cwPanel->hide();
     layout->addWidget(m_cwPanel);
 
@@ -410,6 +413,10 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     AetherSDR::ThemeManager::instance().applyStyleSheet(rttyTitle,
         "QLabel { color: {{color.accent}}; font-size: 10px; font-weight: bold; background: transparent; }");
     rttyBar->addWidget(rttyTitle);
+    m_rttyInputHint = new QLabel;
+    m_rttyInputHint->setObjectName(QStringLiteral("rttyInputHint"));
+    setRttyInputHint({}, {});
+    rttyBar->addWidget(m_rttyInputHint);
 
     const QString comboStyle =
         "QComboBox { background: #1a2a3a; color: #c8d8e8; border: 1px solid #304050;"
@@ -532,6 +539,32 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     });
     rttyBar->addWidget(m_rttyRevBtn);
 
+    // Sensitivity slider — drops low-confidence characters so noise between
+    // transmissions is not rendered (#5028).  Mirrors the CW pane's control.
+    auto* rttySensLabel = new QLabel("Sens:");
+    AetherSDR::ThemeManager::instance().applyStyleSheet(rttySensLabel, "QLabel { color: {{color.text.label}}; font-size: 9px; background: transparent; }");
+    rttyBar->addWidget(rttySensLabel);
+    m_rttySensSlider = new GuardedSlider(Qt::Horizontal);
+    m_rttySensSlider->setObjectName(QStringLiteral("rttySensSlider"));
+    m_rttySensSlider->setAccessibleName(QStringLiteral("RTTY decoder sensitivity"));
+    m_rttySensSlider->setToolTip(QStringLiteral(
+        "Squelch for the decoded text: drops characters the decoder is not confident\n"
+        "about, so noise between transmissions stops filling the pane with gibberish.\n"
+        "0 (default) shows every decoded character — exactly the behavior before this\n"
+        "control existed. Higher values drop more; ~38 filters what the stats bar\n"
+        "calls UNLOCK; 100 keeps only near-certain copy. Affects display only —\n"
+        "nothing is retuned and no audio changes."));
+    m_rttySensSlider->setRange(0, 100);
+    const int savedRttySens = RttyDecodeSettings::sensitivity();
+    m_rttySensSlider->setValue(savedRttySens);
+    m_rttySensSlider->setFixedWidth(60);
+    applyPrimarySliderStyle(m_rttySensSlider);
+    m_rttyConfThreshold = rttyConfThresholdFor(savedRttySens);
+    connectSliderSetting(m_rttySensSlider,
+        [this](int v) { m_rttyConfThreshold = rttyConfThresholdFor(v); },
+        [](int v) { RttyDecodeSettings::setSensitivity(v); });
+    rttyBar->addWidget(m_rttySensSlider);
+
     // Stats
     m_rttyStatsLabel = new QLabel;
     m_rttyStatsLabel->setTextFormat(Qt::RichText);
@@ -577,6 +610,8 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
 
     // ── Text area ─────────────────────────────────────────────────────────
     m_rttyText = new QTextEdit;
+    m_rttyText->setObjectName(QStringLiteral("rttyDecodeText"));
+    m_rttyText->setAccessibleName(QStringLiteral("RTTY decoded text"));
     m_rttyText->setReadOnly(true);
     m_rttyText->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     AetherSDR::ThemeManager::instance().applyStyleSheet(m_rttyText,
@@ -787,8 +822,24 @@ int PanadapterApplet::pitchRangeHigh() const
     return m_pitchRangeSlider ? m_pitchRangeSlider->high() : 700;
 }
 
+QString PanadapterApplet::cwCostColor(float cost)
+{
+    // Color by confidence: lower cost = higher confidence
+    //   < 0.15  green   (high confidence)
+    //   < 0.35  yellow  (medium)
+    //   < 0.60  orange  (meh)
+    //   >= 0.60 red     (low confidence)
+    if (cost < 0.15f) { return QStringLiteral("#00ff88"); }
+    if (cost < 0.35f) { return QStringLiteral("#e0e040"); }
+    if (cost < 0.60f) { return QStringLiteral("#ff9020"); }
+    return QStringLiteral("#ff4040");
+}
+
 void PanadapterApplet::appendCwText(const QString& text, float cost)
 {
+#ifdef HAVE_DEEPFIST
+    if (deepFistEngineSelected()) { return; }
+#endif
     // Filter by sensitivity threshold — drop low-confidence decodes
     if (cost >= m_cwCostThreshold) return;
 
@@ -797,36 +848,96 @@ void PanadapterApplet::appendCwText(const QString& text, float cost)
     QString clean = text;
     clean.replace('\n', ' ');
 
-    // Color by confidence: lower cost = higher confidence
-    //   < 0.15  green   (high confidence)
-    //   < 0.35  yellow  (medium)
-    //   < 0.60  orange  (meh)
-    //   >= 0.60 red     (low confidence)
-    QString color;
-    if (cost < 0.15f)      color = "#00ff88";
-    else if (cost < 0.35f) color = "#e0e040";
-    else if (cost < 0.60f) color = "#ff9020";
-    else                   color = "#ff4040";
+    const QString color = cwCostColor(cost);
 
-    // Plain-text insert with a colour format, not insertHtml(): the HTML
-    // parser drops a fragment's leading whitespace (and a whitespace-only
-    // fragment entirely), which glued words together whenever a decode
-    // chunk began with its word space (measured, Qt 6.8.3).
-    QTextCursor cur = m_cwText->textCursor();
-    cur.movePosition(QTextCursor::End);
+    m_cwText->moveCursor(QTextCursor::End);
     // Switching back from TX → RX inserts a separator space so the [TX]
     // burst and the following RX text don't run together (#2417).
     if (m_lastCwTextSource == CwTextSource::Tx)
-        cur.insertText(QStringLiteral(" "));
+        m_cwText->insertHtml(QStringLiteral(" "));
     m_lastCwTextSource = CwTextSource::Rx;
-    QTextCharFormat fmt;
-    fmt.setForeground(QColor(color));
-    cur.insertText(clean, fmt);
-    m_cwText->setTextCursor(cur);
+    m_cwText->insertHtml(QString("<span style=\"color:%1\">%2</span>")
+        .arg(color, clean.toHtmlEscaped()));
     m_cwText->moveCursor(QTextCursor::End);
 
     emit cwRxTextDisplayed(clean);
 }
+
+#ifdef HAVE_DEEPFIST
+bool PanadapterApplet::deepFistEngineSelected() const
+{
+    // Compare the stored key, never the row: findData() returns -1 for a key
+    // this build does not offer, and the catalog is meant to grow.
+    return m_cwEngineCombo
+        && m_cwEngineCombo->itemData(m_cwEngineCombo->currentIndex()).toString()
+               == QLatin1String("deepfist");
+}
+void PanadapterApplet::setCwBackendState(const QString& key, bool tuning, const QString& status,
+    bool preparing, bool canRetry, const QString& detail)
+{
+    const QSignalBlocker blocker(m_cwEngineCombo);
+    m_cwEngineCombo->setCurrentIndex(m_cwEngineCombo->findData(key));
+    const bool selected = !tuning;
+    const QString unavailableReason = tuning ? QString{}
+        : tr("%1 does not support manual decoder tuning.")
+              .arg(m_cwEngineCombo->currentText());
+    // A description with no name gives a screen reader nothing to anchor it to
+    // (docs/a11y.md; #4896), so name them here rather than only explaining why
+    // they are unavailable.
+    const std::array<std::pair<QWidget*, QString>, 5> tuningControls{{
+        {m_cwSensSlider, tr("CW decode sensitivity")},
+        {m_lockPitchBtn, tr("Lock CW pitch estimate")},
+        {m_lockSpeedBtn, tr("Lock CW speed estimate")},
+        {m_pitchRangeSlider, tr("CW pitch search range")},
+        {m_speedRangeSlider, tr("CW speed search range")}}};
+    for (const auto& [control, name] : tuningControls) {
+        if (control->accessibleName().isEmpty()) { control->setAccessibleName(name); }
+        control->setAccessibleDescription(unavailableReason);
+        control->setEnabled(tuning);
+    }
+    m_cwModelAction->setVisible(selected && (preparing || canRetry));
+    m_cwModelAction->setText(preparing ? tr("Cancel") : tr("Retry"));
+    m_cwModelAction->setToolTip(preparing ? tr("Cancel model preparation") : tr("Retry model preparation"));
+    m_cwStatsLabel->setToolTip(selected
+        ? (detail.isEmpty() ? tr("Decodes the selected slice independently of speaker volume or mute.") : detail)
+        : QString{});
+    if (selected) { m_cwStatsLabel->setText(status); }
+}
+void PanadapterApplet::appendUnscoredCwText(const QString& text)
+{
+    QString clean = text;
+    clean.replace('\n', ' ');
+    m_cwText->moveCursor(QTextCursor::End);
+    if (m_lastCwTextSource == CwTextSource::Tx) { m_cwText->insertPlainText(" "); }
+    m_lastCwTextSource = CwTextSource::Rx;
+    QTextCharFormat format;
+    format.setForeground(ThemeManager::instance().color(this, "color.text.primary"));
+    QTextCursor cursor = m_cwText->textCursor();
+    cursor.insertText(clean, format);
+    m_cwText->moveCursor(QTextCursor::End);
+    // For a backend that reports no per-letter score.
+}
+void PanadapterApplet::appendColoredCwText(const QString& text, float cost)
+{
+    // The cost is 1 - the backend's own per-letter posterior. It picks the
+    // color (ggmorse's four bands, as theme tokens) and is never compared
+    // with the Sens threshold, which is on ggmorse's scale.
+    QString clean = text;
+    clean.replace('\n', ' ');
+    m_cwText->moveCursor(QTextCursor::End);
+    if (m_lastCwTextSource == CwTextSource::Tx) { m_cwText->insertPlainText(" "); }
+    m_lastCwTextSource = CwTextSource::Rx;
+    QTextCharFormat format;
+    const QString band = cost < 0.15f ? QStringLiteral("high")
+        : cost < 0.35f ? QStringLiteral("medium")
+        : cost < 0.60f ? QStringLiteral("fair") : QStringLiteral("low");
+    format.setForeground(AetherSDR::ThemeManager::instance().color(
+        m_cwText, QStringLiteral("color.cw.confidence.") + band));
+    QTextCursor cursor = m_cwText->textCursor();
+    cursor.insertText(clean, format);
+    m_cwText->moveCursor(QTextCursor::End);
+}
+#endif
 
 void PanadapterApplet::appendCwTextTx(const QString& text, float cost)
 {
@@ -853,46 +964,22 @@ void PanadapterApplet::appendCwTextTx(const QString& text, float cost)
     m_cwText->moveCursor(QTextCursor::End);
 }
 
-void PanadapterApplet::setCwStats(float pitchHz, float speedWpm)
+void PanadapterApplet::setCwInputHint(const QString& hint, const QString& reason)
 {
-    if (pitchHz > 0 && speedWpm > 0)
-        m_cwStatsLabel->setText(QString("%1 Hz  %2 WPM").arg(pitchHz, 0, 'f', 0).arg(speedWpm, 0, 'f', 0));
-    else if (pitchHz > 0)
-        // Neural (CTC) decode reports pitch but no speed — show pitch alone.
-        m_cwStatsLabel->setText(QString("%1 Hz").arg(pitchHz, 0, 'f', 0));
+    const QString text = hint.isEmpty() ? tr("(selected slice)") : hint;
+    setDecoderInputHint(m_cwInputHint, text, reason, tr("CW receive input: %1").arg(text));
 }
 
-void PanadapterApplet::setCwNeuralUi(bool neural)
+void PanadapterApplet::setCwStats(float pitchHz, float speedWpm)
 {
-    if (m_cwBackendBtn) {
-        m_cwBackendBtn->setChecked(neural);
-        m_cwBackendBtn->setText(neural ? "Neural" : "DSP");
-    }
-    // ggmorse-only search controls — a neural (CTC) model ignores them, so grey
-    // them out to make clear they have no effect. Sens stays live (it filters on
-    // the model's per-decode confidence); Zero Beat stays live (works in both).
-    // RangeSlider is custom-painted and ignores setEnabled() visually, so dim
-    // with an opacity effect for a clear "inactive" cue in addition to disabling.
-    auto dim = [neural](QWidget* w) {
-        if (!w) return;
-        if (neural) {
-            // No QObject parent: setGraphicsEffect() takes sole ownership. Passing
-            // the widget as parent too would double-own the effect (double-free).
-            auto* fx = new QGraphicsOpacityEffect;
-            fx->setOpacity(0.35);
-            w->setGraphicsEffect(fx);   // widget takes ownership; replaces any prior
-        } else {
-            w->setGraphicsEffect(nullptr);  // remove -> full opacity
-        }
-        w->setEnabled(!neural);
-    };
-    dim(m_pitchRangeSlider);
-    dim(m_speedRangeSlider);
-    dim(m_lockPitchBtn);
-    dim(m_lockSpeedBtn);
-    // Drop the stale DSP pitch/WPM readout; setCwStats() repopulates it (pitch
-    // only in neural mode) on the next decode.
-    if (m_cwStatsLabel) m_cwStatsLabel->clear();
+#ifdef HAVE_DEEPFIST
+    // ggmorse may still have queued deliveries after the engine selector changes.
+    if (deepFistEngineSelected()) { return; }
+#endif
+    if (pitchHz > 0 && speedWpm > 0)
+        m_cwStatsLabel->setText(QString("%1 Hz  %2 WPM").arg(pitchHz, 0, 'f', 0).arg(speedWpm, 0, 'f', 0));
+    else
+        m_cwStatsLabel->clear();   // decoder stopped — don't show a dead estimate (#5213)
 }
 
 void PanadapterApplet::clearCwText()
@@ -968,17 +1055,10 @@ bool PanadapterApplet::eventFilter(QObject* obj, QEvent* ev)
                 m_canvasPressed  = true;
                 m_canvasDragging = false;
                 m_canvasPressPos = me->globalPosition().toPoint();
-                // CONSUME the press.  The strip is a plain QWidget whose
-                // default handler IGNORES presses; an ignored press
-                // propagates to the applet and leaves the implicit mouse
-                // grab there, so every subsequent MouseMove bypasses this
-                // filter and the drag can never start (the 8600 "can't
-                // drag the pan" report — the selection that DID happen came
-                // from the canvas's press-raise filter on the propagated
-                // event, which masked the break).  ContainerTitleBar never
-                // had the problem: its reimplemented handler accepts.  The
-                // press's side effect is re-created here since the tail of
-                // this filter is no longer reached:
+                // Consume the press: the strip's default handler ignores it,
+                // and an ignored press leaves the implicit grab on the applet,
+                // so later moves never reach this filter. Re-emit the press's
+                // side effect here since the filter tail is skipped.
                 emit activated(m_panId);
                 return true;
             }
@@ -1056,6 +1136,14 @@ bool PanadapterApplet::rttyReverse() const
 
 void PanadapterApplet::appendRttyText(const QString& text, float confidence)
 {
+    // Filter by sensitivity threshold — drop low-confidence decodes.  Above
+    // the CR/LF handling on purpose: Baudot CR and LF are ordinary codepoints
+    // that noise hits as often as any other, and a dropped character must
+    // not still spray blank lines down the pane. (#5028)
+    if (confidence < m_rttyConfThreshold) {
+        return;
+    }
+
     // CR is a no-op in a wrapped text view; LF becomes a line break.
     // Standard RTTY sends CR+LF pairs — discarding CR and converting LF
     // to <br> produces exactly one new line per pair.
@@ -1080,6 +1168,12 @@ void PanadapterApplet::appendRttyText(const QString& text, float confidence)
     m_rttyText->insertHtml(QString("<span style=\"color:%1\">%2</span>")
         .arg(color, escaped));
     m_rttyText->moveCursor(QTextCursor::End);
+}
+
+void PanadapterApplet::setRttyInputHint(const QString& hint, const QString& reason)
+{
+    const QString text = hint.isEmpty() ? tr("(selected slice)") : hint;
+    setDecoderInputHint(m_rttyInputHint, text, reason, tr("RTTY receive input: %1").arg(text));
 }
 
 void PanadapterApplet::setRttyStats(float markLevel, float /* spaceLevel */, float snrDb, bool locked)

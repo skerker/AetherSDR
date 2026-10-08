@@ -1,11 +1,15 @@
 #pragma once
 
 #include "PersistentDialog.h"
+#include "PeripheralConnectionSource.h"
+#include "RadioSetupIpConfigPresentation.h"
 
 #include <QHash>
 #include <QVector>
 #include <array>
 #include <functional>
+#include <memory>
+#include <vector>
 
 class QLabel;
 class QLineEdit;
@@ -34,6 +38,9 @@ class KiwiSdrManager;
 class AcomConnection;
 class SpeConnection;
 class VkampConnection;
+class Kpa1500Connection;
+class LpMeterConnection;
+struct PeripheralDeviceUi;
 
 // Radio Setup dialog — searchable, category-based configuration window.
 class RadioSetupDialog : public PersistentDialog {
@@ -48,10 +55,26 @@ public:
                               AcomConnection* acom = nullptr,
                               SpeConnection* spe = nullptr,
                               VkampConnection* vkamp = nullptr,
+                              LpMeterConnection* lpMeter = nullptr,
+                              Kpa1500Connection* kpa1500 = nullptr,
                               QWidget* parent = nullptr);
     void selectTab(const QString& tabName);
+    void done(int result) override;
+    // Like selectTab("Serial & Controllers"), but also scrolls the page so
+    // the FlexControl Tuning Knob group is actually in view instead of just
+    // landing at the top of a long, scroll-wrapped page (#4940 follow-up —
+    // PR #5157 review).
+    void revealFlexControlSettings();
     void refreshFlexControlButtonActions();
     void setFlexControlConnectionStatus(bool connected, const QString& port = {});
+    // Result of the automation-bridge start the Network-tab toggle kicked off
+    // (#4181). The start is ASYNCHRONOUS — the token read has to land before
+    // the socket can listen — so the toggle handler can't know whether the
+    // bridge came up. MainWindow reports back here; on failure we revert the
+    // toggle so the operator isn't told the bridge is listening when nothing
+    // is. MainWindow owns persistence. No-op if the Network tab hasn't
+    // been built (m_automationBridgeBtn == nullptr).
+    void reportAutomationBridgeStartResult(bool ok);
 
 signals:
     void txBandSettingsRequested();
@@ -84,12 +107,34 @@ signals:
     // PeripheralSettings before this fires; MainWindow re-reads it and
     // pushes the new scale into VkampApplet::setVariant().
     void vkampVariantChanged();
+    // Emitted after a peripheral row has been removed and its settings cleared.
+    void peripheralRemoved(const QString& id);
+
+public:
+    // Test seam: answers the Remove confirmation without a modal box. Receives
+    // the device label and the confirmation text; return true to confirm. Pass
+    // an empty function to restore the real box.
+    // Test seam: a copy of what Setup currently shows for a peripheral, and a
+    // way to set the typed-code bookkeeping the way a pending attempt would.
+    PeripheralDeviceStatus peripheralStatusForTest(const QString& id) const;
+    void editPeripheralStatusForTest(const QString& id,
+                                     const std::function<void(PeripheralDeviceStatus&)>& edit);
+    static void setRemovalConfirmationHookForTest(
+        std::function<bool(const QString& label, const QString& text)> hook);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
     void showEvent(QShowEvent* event) override;
 
 private:
+    friend class RadioSetupDialogTestAccess;
+    bool confirmFirmwareClose();
+    bool m_firmwareClosePromptOpen{false};
+    bool isFlexOnlyPage(const QTreeWidgetItem* item) const;
+    bool isCapabilityPageAvailable(const QTreeWidgetItem* item) const;
+    bool isGpsSetupAvailable() const;
+    bool isGpsPage(const QTreeWidgetItem* item) const;
+    void updateRadioCapabilityVisibility();
     QWidget* buildRadioTab();
     QWidget* buildNetworkTab();
     QGroupBox* buildIpConfigGroup();
@@ -102,6 +147,22 @@ private:
     // hostFrequencyCalibration — the HL2 today). A Flex calibrates itself and
     // keeps its own Frequency Offset group on the Receive page.
     QWidget* buildCalibrationTab();
+    // Live DDC0 droop-correction sweep, for families with a measured DDC edge
+    // droop (RadioCapabilities::hostDroopCalibration -- the ANAN-G2 today).
+    // Mirrors buildCalibrationTab()'s own shape (gated on the capability, not
+    // the family; a m_droopReseed lambda re-synced the same two ways).
+    QWidget* buildDroopCalibrationTab();
+    // Which Hermes-Lite 2 variant is attached: codec, the dither bit's three
+    // meanings, companion filter board, CL1 reference, gateware ATU. Protocol 1 exposes none of
+    // it, so these are operator settings (Hl2HardwareOptions). Gated on the
+    // backend's declared extension namespace; every control writes through the
+    // hl2 extension, which refuses anything else.
+    QWidget* buildHl2HardwareTab();
+    // Whether the connected backend declares the "hl2" extension namespace —
+    // i.e. whether anything will answer the hw.get / hw.set verbs this page is
+    // built on. NOT a family-string check: #5554 bars new ones, and the name a
+    // backend carries is a different question from the verbs it answers.
+    bool declaresHl2Extension() const;
     QWidget* buildAudioTab();
     QWidget* buildFiltersTab();
     QWidget* buildXvtrTab();
@@ -110,13 +171,25 @@ private:
     void     refreshApdSamplerCombo(const QString& txAnt);
     QWidget* buildUsbCablesTab();
     QWidget* buildPeripheralsTab();
+    // One builder per kind of device; each lays out its own detail page.
+    // RadioSetupDialog_Peripherals.cpp.
+    void buildAuthNetworkDevice(PeripheralDeviceUi& ui, QWidget* stackParent,
+                                const std::function<void()>& refresh);
+    void buildSerialNetworkDevice(PeripheralDeviceUi& ui, QWidget* stackParent,
+                                  const std::function<void()>& refresh,
+                                  const std::shared_ptr<QVector<std::function<void()>>>& pageReseeds);
+    void buildVkampDevice(PeripheralDeviceUi& ui, QWidget* stackParent,
+                          const std::function<void()>& refresh);
+    void buildKpa1500Device(PeripheralDeviceUi& ui, QWidget* stackParent,
+                            const std::function<void()>& refresh);
+    PeripheralDeviceUi* peripheralDevice(const QString& id) const;
     QWidget* buildUiEnhancementsTab();
     // Phase 2 of GHSA-wfx7-w6p8-4jr2 (#2951) — Pinned Certificates list
     // (host, sha256 fingerprint, pinned date) with per-row Forget and a
     // Forget All button. Backed by WanCertCache in WanConnection.cpp.
     QWidget* buildSmartLinkTab();
     // QRZ.com account for callsign lookups (CW decoder contact card +
-    // View → Callsign Lookup).  Username in AppSettings, password in the
+    // Tools → Callsign Lookup).  Username in AppSettings, password in the
     // OS keychain, lookups cached 7 days by CallsignLookupService.
     QWidget* buildQrzTab();
 
@@ -136,6 +209,8 @@ private:
     // file scope above; full type comes from <QTableWidget> in the cpp.
     QTableWidget* m_pinnedCertsTable{nullptr};
 
+    bool m_peripheralRemovalPending{false};
+    bool confirmPeripheralRemoval(const QString& label, const QString& toggleLabel = {});
     RadioModel*  m_model;
     AudioEngine* m_audio{nullptr};
     TgxlConnection*    m_tgxl{nullptr};
@@ -145,6 +220,8 @@ private:
     AcomConnection* m_acom{nullptr};
     SpeConnection* m_spe{nullptr};
     VkampConnection* m_vkamp{nullptr};
+    LpMeterConnection* m_lpMeter{nullptr};
+    Kpa1500Connection* m_kpa1500{nullptr};
     QTreeWidget* m_navigation{nullptr};
     QStackedWidget* m_pages{nullptr};
     QLabel* m_pageTitle{nullptr};
@@ -154,9 +231,36 @@ private:
     // Stashed by the search filter and committed on Enter, so typing highlights
     // the match without eagerly building deferred, hardware-probing pages.
     QTreeWidgetItem* m_searchFirstMatch{nullptr};
+    int m_filtersPageIndex{-1};
+    int m_smartLinkPageIndex{-1};
+    int m_gpsPageIndex{-1};
+    QWidget* m_flexControlInfoField{nullptr};
+    QWidget* m_multiFlexInfoField{nullptr};
+    QWidget* m_remoteOnInfoField{nullptr};
+    QWidget* m_rebootInfoField{nullptr};
+    QGroupBox* m_licenseInfoGroup{nullptr};
+    QGroupBox* m_firmwareUpdateGroup{nullptr};
+    QLabel* m_firmwareDisclaimer{nullptr};
+    QGroupBox* m_networkIdentityGroup{nullptr};
+    QWidget* m_vitaReceiveBufferLabel{nullptr};
+    QWidget* m_vitaReceiveBufferControls{nullptr};
+    QWidget* m_vitaReceiveBufferStatus{nullptr};
+    QWidget* m_networkMtuLabel{nullptr};
+    QWidget* m_networkMtuControl{nullptr};
+    QWidget* m_privateIpPolicyLabel{nullptr};
+    QWidget* m_privateIpPolicyControl{nullptr};
+    QPushButton* m_ipDhcpButton{nullptr};
+    QPushButton* m_ipStaticButton{nullptr};
+    QLineEdit* m_staticIpEdit{nullptr};
+    QLineEdit* m_staticMaskEdit{nullptr};
+    QLineEdit* m_staticGatewayEdit{nullptr};
+    QPushButton* m_ipApplyButton{nullptr};
+    IpConfigPresentationState m_ipConfigPresentation;
+    QGroupBox* m_audioCompressionGroup{nullptr};
     QHash<QString, QComboBox*> m_flexControlActionCombos;
     QHash<QString, QString> m_flexControlActionDefaults;
     QLabel* m_flexControlStatusLabel{nullptr};
+    QGroupBox* m_flexControlGroup{nullptr};
     QPushButton* m_flexControlDetectButton{nullptr};
     QPushButton* m_flexControlCloseButton{nullptr};
     QCheckBox* m_flexControlInvertCheck{nullptr};
@@ -183,6 +287,9 @@ private:
     QLineEdit* m_nicknameEdit{nullptr};
     QLineEdit* m_callsignEdit{nullptr};
     QPushButton* m_remoteOnBtn{nullptr};
+    // Network tab → Agent Automation (MCP) toggle. Held so the async start
+    // result can reconcile it (#4181); null until buildNetworkTab() runs.
+    QPushButton* m_automationBridgeBtn{nullptr};
 
     // License Info
     QLabel* m_licSubscriptionLabel{nullptr};
@@ -205,12 +312,39 @@ private:
     // External APD page (visible only when the radio reports apd configurable=1)
     int                       m_apdPageIndex{-1};
     int                       m_calibrationPageIndex{-1};
+    int                       m_rtlReceiverPageIndex{-1};
     // Re-seeds the Calibration page from the LIVE backend value. The page is
     // built once per process (buildDeferredTab erases the builder) and the
     // dialog is a showOrRaisePersistent singleton, so without this the spinbox
     // keeps whatever it read at first build — and the next Trim press would
     // commit that stale number to whichever radio is connected now.
     std::function<void()>     m_calibrationReseed;
+    int                       m_droopCalibrationPageIndex{-1};
+    int                       m_hl2HardwarePageIndex{-1};
+    // Same reason as m_calibrationReseed: the page is built once per process
+    // and the dialog is a persistent singleton, so a different HL2 connected
+    // later would otherwise be shown — and written — with the first one's
+    // hardware options.
+    std::function<void()>     m_hl2HardwareReseed;
+    // Whether the connected HL2 is locked to an external 10 MHz reference at
+    // CL1. Cached from the HL2 Hardware page's hw.get reply because the control
+    // it gates — the manual ppb spin box — lives on the CALIBRATION page, which
+    // reads its own value straight out of the settings scope and has no reason
+    // to issue an hl2 extension call of its own. §4 of
+    // docs/architecture/hl2-frequency-calibration.md requires that control to
+    // be disabled under a locked reference; the backend refuses the verb too,
+    // so a stale cache dims the wrong thing at worst and never writes one.
+    bool                      m_hl2ExternalRefLocked = false;
+    // Same reason as m_calibrationReseed above, for the Droop Correction page.
+    std::function<void()>     m_droopReseed;
+    // Re-fills the Audio page's PC Input/Output combos from a LIVE device
+    // enumeration. Same cause as m_calibrationReseed — page built once, dialog
+    // a persistent singleton — but the stale thing here is the LIST, not one
+    // value: without it a headset connected after first build never appears,
+    // with or without closing the dialog. A QMediaDevices watcher on the page
+    // drives the same lambda so the pane also updates while it is open.
+    std::function<void()>     m_audioDeviceReseed;
+    QMetaObject::Connection   m_droopStatusConnection;
     QHash<QString, QComboBox*> m_apdSamplerCombos;
 
     // Peripherals tab — savers run on dialog close to persist field edits
@@ -219,6 +353,13 @@ private:
     // → wipe the saved manual IP/port. New-IP edits still require an
     // explicit Connect click so an unfinished value cannot leak in.
     QVector<std::function<void()>> m_peripheralRowSavers;
+    std::vector<std::shared_ptr<PeripheralDeviceUi>> m_peripheralDevices;
+
+    // Refresh already-built serial pages without rebuilding their controls.
+    // Each page is built once per dialog instance; normal close deletes the
+    // dialog. Used by showEvent and Refresh buttons, and empty until the
+    // owning page is built so enumeration remains deferred (#1776).
+    QVector<std::function<void()>> m_serialPortReseeds;
 };
 
 } // namespace AetherSDR

@@ -1,6 +1,7 @@
 #include "RadioHealthDialog.h"
 
 #include "core/ThemeManager.h"
+#include "core/backends/HealthSnapshotMerge.h"
 #include "models/RadioModel.h"
 
 #include <QApplication>
@@ -110,7 +111,16 @@ void RadioHealthDialog::refresh()
 {
     if (!m_model)
         return;
-    const IRadioBackend::HealthSnapshot snap = m_model->backendHealthSnapshot();
+    // Same merge as the bridge (backends/HealthSnapshotMerge.h): offline rows
+    // are the base and in-band rows win. The backend blanks in-band rows when
+    // the stream is not delivering, so unmerged they would show dashes exactly
+    // when the offline source matters. offlineHealthRows() is non-const on
+    // purpose: reading rows is the poller's demand signal.
+    const IRadioBackend::HealthSnapshot snap =
+        m_model->hasOfflineHealth()
+            ? mergeHealthSnapshots(m_model->offlineHealthRows(),
+                                   m_model->backendHealthSnapshot())
+            : m_model->backendHealthSnapshot();
 
     if (snap.isEmpty()) {
         m_table->setRowCount(0);

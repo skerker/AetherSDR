@@ -1,43 +1,30 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QList>
 #include <QString>
 
 namespace AetherSDR {
 
-// The typed restore contract of RFC #4603 proposal B: what the client's
-// settings store remembers about a radio whose declared ClientSettingsDomains
-// make the client its memory. Handed to the backend BEFORE connect
-// (IRadioBackend::applyRestoredState) so the connect/pushInitialState path can
-// bring the radio up where the operator left it.
-//
-// Shape follows the aetherd 2.3 universal/extension field classification:
-// typed fields for state every family shares, plus a per-family extension
-// document that ONLY the owning backend writes, reads, and validates
-// (Principle VII — boundary input validation lives with the owner). Generic
-// engine code (RadioStateMemory) round-trips the extension opaquely and must
-// never interpret it.
-//
-// A zero/empty field means "not restored" — the backend keeps its own default.
-// Restoring NEVER keys transmit (Principle VI): the struct carries setpoints,
-// and the TX gate is untouched.
+// The typed restore contract of RFC #4603 proposal B: what the client remembers
+// about a radio whose ClientSettingsDomains make the client its memory, handed to
+// the backend BEFORE connect (IRadioBackend::applyRestoredState). Typed universal
+// fields plus a per-family extension document that only the owning backend
+// writes, reads and validates; RadioStateMemory round-trips it opaquely. A
+// zero/empty field means "not restored". Restoring NEVER keys transmit.
 struct RestoredRadioState {
     // Universal — gated per-domain by RadioCapabilities::clientSettingsDomains
     double rfFrequencyHz = 0.0;   // Tuning
     QString mode;                 // Tuning
+    int tuningStepHz = 0;         // Tuning — the client-side step on a radio with
+                                  // no command plane; 0 = not restored
     double filterLowHz = 0.0;     // Passband
     double filterHighHz = 0.0;    // Passband
     int sampleRateHz = 0;         // SpanRate
 
-    // Agc. The AGC lives in the HOST's DSP for a radio with no AGC of its own,
-    // so the operator's choice has nowhere to live but here — without it every
-    // launch reopened the WDSP channel on Config's construction defaults
-    // ("med" / 65) and silently discarded the setting (#4909).
-    //
-    // The threshold sentinel is -1, NOT 0: zero is a legitimate AGC-T the
-    // operator can select, so "not restored" needs a value outside the 0..100
-    // control range or a deliberate 0 would be indistinguishable from an
-    // absent field and would round-trip into the default.
+    // Agc. Persisted here because on a radio without its own AGC it lives in the
+    // host's DSP (#4909). The threshold sentinel is -1, NOT 0: zero is a selectable
+    // AGC-T, so "not restored" needs a value outside the 0..100 range.
     QString agcMode;              // Agc — "off" | "slow" | "med" | "fast"
     int agcThreshold = -1;        // Agc — 0..100 OPERATOR UNITS, not dB; -1 = not
                                   // restored. Deliberately NOT "…Db": the backend
@@ -45,14 +32,36 @@ struct RestoredRadioState {
                                   // real dB, and KiwiSdrClient has a genuine
                                   // agcThresholdDb nearby. Matches
                                   // SliceDelta::agcThreshold, the same 0..100 scale.
+    // The AGC-off level (the fixed gain with AGC off), one entry per receiver in
+    // receiver order. Gated by the Agc domain AND hasAgcThreshold: a backend
+    // with no writable off level neither stores nor receives it.
+    QList<int> agcOffLevels;      // Agc — 0..100 each; -1 = not restored
 
-    // Per-family extension document (per-band gain/drive maps live here —
-    // RFC PR 3). Versioned by its owner. GATED PER DOMAIN at the top level:
-    // the engine hands over only the sub-objects named for declared domains —
-    // "rfGain" (ClientSettingsDomain::RfGain) and "txSetpoints"
-    // (ClientSettingsDomain::TxSetpoints) — and each sub-object's CONTENTS
-    // stay opaque to everything above the seam; the owning backend writes and
-    // validates them (Principle VII; PR #4614 review).
+    // CW controls. Flex persists and reports these in the radio; a host-keyed
+    // backend has no such authority, so a backend declaring the Cw domain makes
+    // the client its radio-scoped memory. Sentinel values distinguish an older
+    // document with no CW section from deliberate zero/false selections.
+    int cwSpeed = 0;              // Cw — 5..100 WPM; 0 = not restored
+    int cwPitch = 0;              // Cw — 100..6000 Hz; 0 = not restored
+    int cwBreakIn = -1;           // Cw — 0/1; -1 = not restored
+    int cwDelay = -1;             // Cw — 0..2000 ms; -1 = not restored
+    int cwSidetone = -1;          // Cw — 0/1; -1 = not restored
+    int cwIambic = -1;            // Cw — 0/1; -1 = not restored
+    int cwIambicMode = -1;        // Cw — 0=A, 1=B; -1 = not restored
+    int cwSwapPaddles = -1;       // Cw — 0/1; -1 = not restored
+    int cwlEnabled = -1;          // Cw — 0/1; -1 = not restored
+    int monGainCw = -1;           // Cw — 0..100; -1 = not restored
+    int monPanCw = -1;            // Cw — 0..100; -1 = not restored
+
+    // ReceiveOutputLevel — the radio's own output level, 0..100. The sentinel
+    // is -1, not 0, as for agcThreshold: a silenced speaker is a choice that
+    // must survive a restart. Not restored = the backend's default.
+    int receiveOutputLevelPct = -1;
+
+    // Per-family extension document (per-band gain/drive maps), versioned by its
+    // owner. GATED PER DOMAIN: the engine hands over only the sub-objects named for
+    // declared domains ("rfGain" for RfGain, "txSetpoints" for TxSetpoints); their
+    // contents are opaque above the seam and validated by the owning backend.
     int extensionSchemaVersion = 0;
     QJsonObject extension;
 
@@ -63,9 +72,16 @@ struct RestoredRadioState {
     // that is worth spelling out: its absent value is -1, not 0.
     bool isEmpty() const
     {
-        return rfFrequencyHz == 0.0 && mode.isEmpty() && filterLowHz == 0.0
+        return rfFrequencyHz == 0.0 && mode.isEmpty() && tuningStepHz == 0
+               && filterLowHz == 0.0
                && filterHighHz == 0.0 && sampleRateHz == 0
                && agcMode.isEmpty() && agcThreshold < 0
+               && agcOffLevels.isEmpty()
+               && cwSpeed == 0 && cwPitch == 0 && cwBreakIn < 0
+               && cwDelay < 0 && cwSidetone < 0 && cwIambic < 0
+               && cwIambicMode < 0 && cwSwapPaddles < 0 && cwlEnabled < 0
+               && monGainCw < 0 && monPanCw < 0
+               && receiveOutputLevelPct < 0
                && extension.isEmpty();
     }
 };

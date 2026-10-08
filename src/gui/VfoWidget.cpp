@@ -1,5 +1,18 @@
 #include "VfoWidget.h"
+#include <QScopeGuard>
+#include "ControlAvailabilityRegistry.h"
+#include "AntennaChoiceGate.h"
+#include "SplitAudioProfile.h"
+#include "VfoDisplayDefaults.h"
+#ifdef HAVE_DEEPFIST
+#include "models/CwDecodeSettings.h"
+#endif
+#include "ScopedChildWidget.h"
+#include "AgcModeAvailability.h"
+#include "FmTonePresentation.h"
+#include "gui/CtcssToneLabel.h"
 #include "PhaseKnob.h"
+#include "ModeFilterPresets.h"
 #include "VoiceModeGate.h"   // isCwMode() — one CW-mode list, not thirteen
 #include "SmartMtrWidget.h"
 #include "MeterViewController.h"
@@ -42,8 +55,6 @@
 #include <QStackedWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QGridLayout>
 #include <QMenu>
 #include <QDoubleSpinBox>
@@ -114,16 +125,10 @@ private:
     int m_resetVal;
 };
 
-// ResetSlider whose fill anchors from the centre outward — for L/R pan
-// and L/R balance controls where the meaningful zero is the midpoint,
-// not the left edge.  Also paints a small centre-mark dot on the groove
-// so the operator can see the neutral position at a glance.
-//
-// The default Qt stylesheet sub-page rule paints (0 → handle) which
-// reads wrong for centre-anchored controls.  We over-paint that region
-// here: erase the unwanted half of the sub-page with groove colour, then
-// add the desired (centre → handle) fill in accent colour.  Clipping
-// excludes the handle pixel disc so the overpaint never bleeds into it.
+// ResetSlider filled from the centre outward with a centre-mark dot, for pan /
+// balance controls. Over-paints the stylesheet's (0 -> handle) sub-page with
+// groove colour, then fills (centre -> handle) in accent, clipped around the
+// handle disc.
 class CenterMarkSlider : public ResetSlider {
 public:
     explicit CenterMarkSlider(int resetVal, Qt::Orientation o, QWidget* parent = nullptr)
@@ -458,8 +463,19 @@ static const QString kModeBtn =
     "QPushButton:checked { background: #0070c0; color: #ffffff; border: 1px solid #0090e0; }"
     "QPushButton:hover { border: 1px solid #0090e0; }";
 
+// Shared :disabled rule: a stylesheet colour beats the disabled palette, so
+// a label in a disabled row stays bright unless the sheet says otherwise.
+// #5e6e7c is ~0.45 of makeOptLabel()'s #c8d8e8 over the flag background (a
+// lighter step, ~0.65, from kLabelStyle's #8aa8c0). Used by kLabelStyle and
+// by makeOptLabel() below. Note the rule only bites a label whose row is
+// disabled as a container: today that is the APF level row while APF is off
+// (#4658); rows that disable just their slider (SQL) keep a bright label.
+static const QString kDisabledLabelRule =
+    "QLabel:disabled { color: #5e6e7c; }";
+
 static const QString kLabelStyle =
-    "QLabel { background: transparent; border: none; color: #8aa8c0; font-size: 13px; }";
+    "QLabel { background: transparent; border: none; color: #8aa8c0; font-size: 13px; }"
+    + kDisabledLabelRule;
 
 // Meter-view selector buttons.  Unselected look matches the DSP NR/NB/ANF
 // toggles exactly (kDspToggle base + hover); the selected/checked look matches
@@ -531,6 +547,8 @@ QString VfoWidget::accessibleSummary() const
     QString s = letter.isEmpty() ? QStringLiteral("VFO")
                                  : QStringLiteral("VFO slice %1").arg(letter);
     s += QStringLiteral(", %1 MHz").arg(m_slice->frequency(), 0, 'f', 6);
+    if (!m_slice->inCapture())
+        s += QStringLiteral(", out of capture; receive audio and decoders inactive");
     if (m_slice->isTxSlice())
         s += QStringLiteral(", transmit slice");
     if (m_collapsed)
@@ -743,6 +761,13 @@ VfoWidget::~VfoWidget()
     delete m_lockVfoBtn.data();
     delete m_recordBtn.data();
     delete m_playBtn.data();
+    // The label still routes its own teardown events through eventFilter(),
+    // whose `obj == m_collapsedFreqLabel` downcasts through QPointer<QLabel> --
+    // undefined once ~QLabel has run and the object is only a QWidget (UBSan,
+    // #6154). Detach the filter before deleting it.
+    if (m_collapsedFreqLabel) {
+        m_collapsedFreqLabel->removeEventFilter(this);
+    }
     delete m_collapsedFreqLabel.data();
 }
 
@@ -775,6 +800,20 @@ void VfoWidget::buildUI()
             return;
         }
         QPointer<SliceModel> slice = m_slice;
+        // Nothing real to choose -- the radio published no port and no Kiwi
+        // receiver is on offer: refuse visibly instead of opening a menu of
+        // invented ANT1/ANT2 whose pick moves the label and nothing else.
+        {
+            const bool connected = m_radioModel && m_radioModel->isConnected();
+            const bool published = !slice->rxAntennaList().isEmpty()
+                || (m_radioModel && !m_radioModel->antennaList().isEmpty());
+            const bool virtualAntennas = m_kiwiSdrManager
+                && !m_kiwiSdrManager->virtualAntennaTokens().isEmpty();
+            if (rxAntennaChoiceRefused(connected, published, virtualAntennas)) {
+                emit antennaChoiceRefused(false);
+                return;
+            }
+        }
         QStringList menuOptions = rxAntennaOptions();
         if (m_kiwiSdrManager) {
             for (const QString& ant : m_kiwiSdrManager->virtualAntennaTokens()) {
@@ -791,6 +830,10 @@ void VfoWidget::buildUI()
                 ? m_kiwiSdrManager->assignedProfileForSlice(slice->sliceId())
                 : QString();
         QMenu* menu = new QMenu(m_rxAntBtn);
+        // Same as RxApplet: the entry is labelled with the alias / KiwiSDR
+        // profile name, so the tooltip carrying the raw antenna token only
+        // renders once the menu opts in (#5546).
+        menu->setToolTipsVisible(true);
         connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
         for (const QString& ant : menuOptions) {
             auto* act = menu->addAction(antennaMenuLabel(ant, menuOptions));
@@ -829,18 +872,40 @@ void VfoWidget::buildUI()
     m_txAntBtn->setStyleSheet(kFlatBtn + "QPushButton { color: #ff4444; }");
     connect(m_txAntBtn, &QPushButton::clicked, this, [this] {
         if (!m_slice) return;
-        QMenu menu(this);
+        // Same non-blocking shape as the RX antenna menu above: no nested
+        // event loop, so widget teardown or a slice change while the popup is
+        // open cannot strand a suspended frame (#5566).
+        QPointer<SliceModel> slice = m_slice;
+        // Same rule for TX, without the Kiwi escape: a virtual receiver is
+        // never a transmit destination (AntennaChoiceGate.h).
+        {
+            const bool connected = m_radioModel && m_radioModel->isConnected();
+            const bool published = !m_slice->txAntennaList().isEmpty()
+                || (m_radioModel && !m_radioModel->antennaList().isEmpty());
+            if (txAntennaChoiceRefused(connected, published)) {
+                emit antennaChoiceRefused(true);
+                return;
+            }
+        }
+        QMenu* menu = new QMenu(m_txAntBtn);
+        menu->setToolTipsVisible(true);  // raw token behind the alias (#5546)
+        connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
         const QStringList options = txAntennaOptions();
         for (const QString& ant : options) {
-            auto* act = menu.addAction(antennaMenuLabel(ant, options));
+            auto* act = menu->addAction(antennaMenuLabel(ant, options));
             act->setData(ant);
             act->setCheckable(true);
             act->setChecked(ant == m_slice->txAntenna());
             act->setToolTip(ant);
             act->setStatusTip(ant);
         }
-        if (auto* sel = menu.exec(m_txAntBtn->mapToGlobal(QPoint(0, m_txAntBtn->height()))))
-            m_slice->setTxAntenna(sel->data().toString());
+        connect(menu, &QMenu::triggered, this, [slice](QAction* sel) {
+            if (!sel || !slice) {
+                return;
+            }
+            slice->setTxAntenna(sel->data().toString());
+        });
+        menu->popup(m_txAntBtn->mapToGlobal(QPoint(0, m_txAntBtn->height())));
     });
     hdr->addWidget(m_txAntBtn);
 
@@ -866,6 +931,14 @@ void VfoWidget::buildUI()
             emit swapRequested();
         else
             emit splitToggled();
+    });
+    // Right-click is where the split offsets, Monitor TX and the remembered
+    // audio arrangement live. Without it the arrangement is learned and applied
+    // with nothing anywhere to show it exists or to clear it. (#2242, #311)
+    m_splitBadge->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_splitBadge, &QPushButton::customContextMenuRequested,
+            this, [this](const QPoint& pos) {
+        emit splitBadgeMenuRequested(m_splitBadge->mapToGlobal(pos));
     });
     hdr->addWidget(m_splitBadge);
 
@@ -1087,6 +1160,18 @@ void VfoWidget::buildUI()
         root->addLayout(freqRow);
     }
 
+    m_captureStatusLabel = new QLabel(tr("OUT OF CAPTURE"));
+    m_captureStatusLabel->setObjectName(QStringLiteral("sliceCaptureStatus"));
+    m_captureStatusLabel->setAccessibleName(tr("Receive status: out of capture"));
+    m_captureStatusLabel->setAccessibleDescription(tr(
+        "This slice is parked because its full filter passband is outside the usable capture. "
+        "Audio and decoders resume when capture returns."));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_captureStatusLabel,
+        "QLabel { color: {{color.accent.warning}}; font-size: 10px; font-weight: bold; "
+        "background: transparent; border: none; }");
+    m_captureStatusLabel->hide();
+    root->addWidget(m_captureStatusLabel);
+
 #ifdef HAVE_RADE
     // ── RADE info row: [callsign] [SNR] [offset] [stretch] ──────────────
     // Hidden when RADE inactive; appears below frequency, above S-meter.
@@ -1270,11 +1355,10 @@ void VfoWidget::buildUI()
         auto* lbl = new QLabel(text);
         // :disabled dims the label when its row is disabled — a render()-compatible
         // replacement for the old QGraphicsOpacityEffect (which QWidget::render()
-        // can't rasterize, so it blanked these rows in GPU flag sprites). #5e6e7c is
-        // ~0.45 of the normal text over the flag background.
+        // can't rasterize, so it blanked these rows in GPU flag sprites).
         lbl->setStyleSheet("QLabel { background: transparent; border: none; "
                            "color: #c8d8e8; font-size: 12px; }"
-                           "QLabel:disabled { color: #5e6e7c; }");
+                           + kDisabledLabelRule);
         return lbl;
     };
 
@@ -1437,6 +1521,7 @@ void VfoWidget::buildUI()
             // Right-click on speaker tab toggles mute directly
             btn->setContextMenuPolicy(Qt::CustomContextMenu);
             connect(btn, &QPushButton::customContextMenuRequested, this, [this](const QPoint&) {
+                AetherSDR::SplitAudioOperatorEdit op;  // #2242: operator-origin
                 if (m_slice) m_slice->setAudioMute(!m_slice->audioMute());
             });
         }
@@ -1744,12 +1829,16 @@ void VfoWidget::buildTabContent()
         connect(m_afGainSlider, &QSlider::valueChanged, this, [this, afVal](int v) {
             afVal->setText(QString::number(v));
             if (!m_updatingFromModel) {
+                AetherSDR::SplitAudioOperatorEdit op;  // #2242: operator-origin
                 if (m_slice) m_slice->setAudioGain(v);
                 emit afGainChanged(v);
             }
         });
         connect(m_muteBtn, &QPushButton::toggled, this, [this](bool on) {
-            if (!m_updatingFromModel && m_slice) m_slice->setAudioMute(on);
+            if (!m_updatingFromModel && m_slice) {
+                AetherSDR::SplitAudioOperatorEdit op;  // #2242: operator-origin
+                m_slice->setAudioMute(on);
+            }
             m_muteBtn->setText(on ? QString::fromUtf8("AF  \xF0\x9F\x94\x87")    // 🔇 AF
                                   : QString::fromUtf8("AF  \xF0\x9F\x94\x8A"));  // 🔊 AF
             m_tabBtns[0]->setText(on ? QString::fromUtf8("\xF0\x9F\x94\x87")
@@ -1796,7 +1885,7 @@ void VfoWidget::buildTabContent()
             }
         });
         connect(m_agcCmb, &QComboBox::currentTextChanged, this, [this](const QString& text) {
-            if (!m_updatingFromModel && m_slice) {
+            if (!m_updatingFromModel && m_slice && currentAgcModeAvailable(m_agcCmb)) {
                 QString mode = text.toLower();
                 if (mode == "off") mode = "off";
                 else if (mode == "slow") mode = "slow";
@@ -1811,13 +1900,16 @@ void VfoWidget::buildTabContent()
             m_agcTSlider->setToolTip(agcOff
                 ? QString("AGC Off Level: %1 dB").arg(v)
                 : QString("AGC Threshold: %1 dB").arg(v));
-            if (!m_updatingFromModel && m_slice) {
+            if (!m_updatingFromModel && m_slice && m_agcTSlider->isEnabled()) {
                 if (agcOff) m_slice->setAgcOffLevel(v);
                 else m_slice->setAgcThreshold(v);
             }
         });
         connect(m_panSlider, &QSlider::valueChanged, this, [this](int v) {
-            if (!m_updatingFromModel && m_slice) m_slice->setAudioPan(v);
+            if (!m_updatingFromModel && m_slice) {
+                AetherSDR::SplitAudioOperatorEdit op;  // #2242: operator-origin
+                m_slice->setAudioPan(v);
+            }
             if (!m_updatingFromModel) emit rxPanChanged(v);  // (#1460)
         });
         connect(m_divBtn, &QPushButton::toggled, this, [this](bool on) {
@@ -1936,29 +2028,41 @@ void VfoWidget::buildTabContent()
         // Client-side AetherDSP launcher — same kDspToggle styling and
         // single-cell width as the radio-side toggles, but non-checkable.
         // Placed by relayoutDspGrid() at the end of the radio-side toggle list.
-        m_aetherDspBtn = new QPushButton("ADSP");
+        m_aetherDspBtn = new QPushButton("AetherRX");
         m_aetherDspBtn->setObjectName("aetherDspBtn");
         m_aetherDspBtn->setCheckable(false);
         m_aetherDspBtn->setFixedHeight(26);
         m_aetherDspBtn->setStyleSheet(kDspToggle);
-        m_aetherDspBtn->setAccessibleName("AetherDSP Settings");
-        m_aetherDspBtn->setToolTip("Open AetherDSP Settings (client-side NR2 / NR4 / DFNR / RN2 / BNR / MNR)");
+        m_aetherDspBtn->setAccessibleName("AetherRX");
+        m_aetherDspBtn->setToolTip("Open AetherRX — the receive chain: noise reduction, gate, EQ, compressor, tube, voice processor, output");
         connect(m_aetherDspBtn, &QPushButton::clicked, this,
                 &VfoWidget::aetherDspRequested);
 
-        // AetherVoice launcher — opens the Aetherial Audio Channel Strip.
-        // 2 columns wide (cols 2-3 of the same row that hosts ADSP).
-        m_aetherVoiceBtn = new QPushButton("AetherVoice");
+        // AetherTX launcher — opens the transmit chain window. Placed by
+        // relayoutDspGrid() beside AetherRX, always at the same width.
+        m_aetherVoiceBtn = new QPushButton("AetherTX");
+        m_aetherVoiceBtn->setObjectName("aetherVoiceBtn");
         m_aetherVoiceBtn->setCheckable(false);
         m_aetherVoiceBtn->setFixedHeight(26);
         m_aetherVoiceBtn->setStyleSheet(kDspToggle);
-        m_aetherVoiceBtn->setAccessibleName("Aetherial Audio Channel Strip");
-        m_aetherVoiceBtn->setToolTip("Open Aetherial Audio Channel Strip — unified TX DSP suite");
+        m_aetherVoiceBtn->setAccessibleName("AetherTX");
+        m_aetherVoiceBtn->setToolTip("Open AetherTX — the transmit chain: gate, EQ, compressor, de-esser, tube, voice processor, reverb, output");
         connect(m_aetherVoiceBtn, &QPushButton::clicked, this,
                 &VfoWidget::aetherVoiceRequested);
 
+        // The pair share one row container so they can split whatever width
+        // the toggles leave on their row -- three cells as readily as four or
+        // two -- with no empty cell at the end. Same gap between them as the
+        // grid keeps between its cells.
+        m_aetherLauncherRow = new QWidget;
+        auto* launcherBox = new QHBoxLayout(m_aetherLauncherRow);
+        launcherBox->setContentsMargins(0, 0, 0, 0);
+        launcherBox->setSpacing(m_dspGrid->spacing());
+        launcherBox->addWidget(m_aetherDspBtn, 1);
+        launcherBox->addWidget(m_aetherVoiceBtn, 1);
+
         // Radio-side DSP buttons only \u2014 client-side modules (NR2 / NR4 /
-        // MNR / BNR / DFNR / RN2) live in the spectrum overlay menu and
+        // MNR / BNR / DFNR / RN2 / NNR) live in the spectrum overlay menu and
         // the AetherDSP applet; users toggle them there to keep the VFO
         // grid focused on what the radio supplies.  4-column layout:
         m_dspGrid->addWidget(m_nrBtn,   0, 0);
@@ -2025,7 +2129,8 @@ void VfoWidget::buildTabContent()
 
         // DSP button tooltips
         m_nrBtn->setToolTip("Radio-side noise reduction \u2014 attenuates uncorrelated background noise.");
-        m_nbBtn->setToolTip("Noise blanker \u2014 detects and removes fast impulse noise from sparks and switching sources.");
+        m_nbBtn->setToolTip("Noise blanker \u2014 detects and removes fast impulse noise from sparks and switching sources. "
+                            "Where this host runs the blanker, clicking again selects NB2, which reconstructs the blanked window instead of silencing it.");
         m_anfBtn->setToolTip("Auto notch filter \u2014 detects and cancels persistent unwanted tones.");
         m_apfBtn->setToolTip("CW audio peaking filter \u2014 narrows the audio passband around the CW pitch frequency to improve S/N.");
         m_nrlBtn->setToolTip("Leaky LMS adaptive filter \u2014 preserves correlated signals while removing uncorrelated noise. Best for daily SSB/CW.");
@@ -2053,7 +2158,7 @@ void VfoWidget::buildTabContent()
             apfVb->addWidget(lbl);
             m_apfSlider = new GuardedSlider(Qt::Horizontal);
             m_apfSlider->setAccessibleName("APF bandwidth");
-            m_apfSlider->setAccessibleDescription("CW audio peaking filter bandwidth");
+            m_apfSlider->setAccessibleDescription("CW audio peaking filter bandwidth. Enabled when APF is on in the DSP grid.");
             m_apfSlider->setRange(0, 100);
             m_apfSlider->setValue(50);
             applyPrimarySliderStyle(m_apfSlider);
@@ -2077,6 +2182,63 @@ void VfoWidget::buildTabContent()
             m_apfContainer->setEnabled(false);
             m_apfContainer->hide();
             dspVb->addWidget(m_apfContainer);
+        }
+
+        // NB2 fill mode — what WDSP's second blanker puts in the window it
+        // blanked. Its own row rather than a cell in the toggle grid, because it
+        // is a choice among five and not a switch, and it appears only while NB2
+        // is the running blanker: the same rule the shared level row follows, for
+        // the same reason. On a radio whose blanker is its own firmware it never
+        // appears at all, since NB2 is not reachable there.
+        {
+            m_nbFillContainer = new QWidget;
+            auto* fillHb = new QHBoxLayout(m_nbFillContainer);
+            fillHb->setContentsMargins(0, 2, 0, 0);
+            fillHb->setSpacing(3);
+
+            // Styled through ThemeManager rather than a bare setStyleSheet, as
+            // the shared level row's label is: the colour comes from a token
+            // instead of a literal, and the colour ratchet counts call sites, so
+            // a new one would raise the count whatever colour it carried.
+            auto* lbl = new QLabel("NB2");
+            AetherSDR::ThemeManager::instance().applyStyleSheet(lbl,
+                "QLabel { color: {{color.text.primary}}; font-size: 13px;"
+                "  font-weight: bold; min-width: 26px; }");
+            lbl->setFixedWidth(26);
+            fillHb->addWidget(lbl);
+
+            m_nbFillCombo = new GuardedComboBox;
+            // Addressable by the automation bridge, like the DSP toggles: a
+            // control the bridge cannot name is a control no script can prove.
+            m_nbFillCombo->setObjectName(QStringLiteral("dspNB2FillCombo"));
+            m_nbFillCombo->setAccessibleName("NB2 fill");
+            m_nbFillCombo->setAccessibleDescription(
+                "What the second noise blanker puts in the window it blanked.");
+            m_nbFillCombo->setFixedHeight(26);
+            // Order and index ARE WDSP's mode numbering — see
+            // AetherSDR::NoiseBlankerFill — so the index is the value and there
+            // is no table here to fall out of step with the engine.
+            m_nbFillCombo->addItems({"Zero", "Sample hold", "Mean hold",
+                                     "Hold sample", "Interpolate"});
+            AetherSDR::applyComboStyle(m_nbFillCombo);
+            m_nbFillCombo->setToolTip(
+                "NB2 fill — Zero blanks the impulse to silence, as NB does. "
+                "The others reconstruct the blanked window from the samples "
+                "either side, which sounds better when the impulse lands on a "
+                "signal and worse when the noise is dense.");
+            fillHb->addWidget(m_nbFillCombo, 1);
+
+            connect(m_nbFillCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this](int index) {
+                if (m_updatingFromModel || !m_slice
+                    || !AetherSDR::isValidNoiseBlankerFill(index)) {
+                    return;
+                }
+                m_slice->setNbFill(static_cast<AetherSDR::NoiseBlankerFill>(index));
+            });
+
+            m_nbFillContainer->hide();
+            dspVb->addWidget(m_nbFillContainer);
         }
 
         // RTTY Mark/Shift controls (hidden unless RTTY mode)
@@ -2300,9 +2462,9 @@ void VfoWidget::buildTabContent()
 
             m_fmContainer = new QWidget;
             m_fmContainer->setObjectName("vfoFmDuplexContainer");
-            auto* fvb = new QVBoxLayout(m_fmContainer);
-            fvb->setContentsMargins(0, 0, 0, 0);
-            fvb->setSpacing(2);
+            m_fmLayout = new QVBoxLayout(m_fmContainer);
+            m_fmLayout->setContentsMargins(0, 0, 0, 0);
+            m_fmLayout->setSpacing(2);
 
             // Tone mode + tone value on one row
             m_fmToneContainer = new QWidget;
@@ -2317,33 +2479,95 @@ void VfoWidget::buildTabContent()
             AetherSDR::applyComboStyle(m_fmToneModeCmb);
             toneRow->addWidget(m_fmToneModeCmb, 1);
 
-            // Tone value — simplified list of common CTCSS tones
+            // Tone value — from core/CtcssTones.h, the same table the RX
+            // applet's dropdown and the automation bridge's `slice tone`
+            // validation use. This list used to be a third hand-typed copy of
+            // the same 50 doubles; the values agreed, which is exactly how a
+            // copy survives long enough to stop agreeing.
             m_fmToneValueCmb = new GuardedComboBox;
             m_fmToneValueCmb->setAccessibleName("FM tone frequency");
-            const double tones[] = {67.0,71.9,74.4,77.0,79.7,82.5,85.4,88.5,91.5,94.8,
-                97.4,100.0,103.5,107.2,110.9,114.8,118.8,123.0,127.3,131.8,
-                136.5,141.3,146.2,151.4,156.7,162.2,167.9,173.8,179.9,186.2,
-                192.8,203.5,206.5,210.7,218.1,225.7,229.1,233.6,241.8,250.3,254.1};
-            for (double f : tones)
-                m_fmToneValueCmb->addItem(QString::number(f, 'f', 1),
-                                           QString::number(f, 'f', 1));
-            AetherSDR::applyComboStyle(m_fmToneValueCmb);
+            AetherSDR::populateCtcssToneCombo(m_fmToneValueCmb);
+            AetherSDR::applyComboStyle(
+                m_fmToneValueCmb, AetherSDR::ctcssToneComboStyleRules());
             m_fmToneValueCmb->setEnabled(false);
             toneRow->addWidget(m_fmToneValueCmb, 1);
-            fvb->addWidget(m_fmToneContainer);
+
+            m_fmToneRxValueCmb = new GuardedComboBox;
+            m_fmToneRxValueCmb->setAccessibleName("Receive CTCSS tone frequency");
+            AetherSDR::populateCtcssToneCombo(m_fmToneRxValueCmb);
+            AetherSDR::applyComboStyle(
+                m_fmToneRxValueCmb, AetherSDR::ctcssToneComboStyleRules());
+            m_fmToneRxValueCmb->setVisible(false);
+            m_fmToneRxContainer = new QWidget;
+            auto* toneRxRow = new QHBoxLayout(m_fmToneRxContainer);
+            toneRxRow->setContentsMargins(0, 0, 0, 0);
+            toneRxRow->addWidget(m_fmToneRxValueCmb, 1);
+            m_fmToneRxContainer->setVisible(false);
+            m_fmLayout->addWidget(m_fmToneContainer);
+            m_fmLayout->addWidget(m_fmToneRxContainer);
 
             connect(m_fmToneModeCmb, QOverload<int>::of(&QComboBox::currentIndexChanged),
                     this, [this](int idx) {
                 if (m_fmToneModeCmb->signalsBlocked()) return;
                 const QString mode = m_fmToneModeCmb->itemData(idx).toString();
                 if (m_slice) m_slice->setFmToneMode(mode);
-                m_fmToneValueCmb->setEnabled(mode == "ctcss_tx");
+                configureFmToneControls();
             });
             connect(m_fmToneValueCmb, QOverload<int>::of(&QComboBox::currentIndexChanged),
                     this, [this](int idx) {
                 if (m_fmToneValueCmb->signalsBlocked()) return;
                 if (m_slice) m_slice->setFmToneValue(m_fmToneValueCmb->itemData(idx).toString());
             });
+            connect(m_fmToneRxValueCmb, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this](int idx) {
+                if (!m_fmToneRxValueCmb->signalsBlocked() && m_slice) {
+                    m_slice->setFmToneRxValue(m_fmToneRxValueCmb->itemData(idx).toString());
+                }
+            });
+
+            m_fmDtcsCodeCmb = new GuardedComboBox;
+            m_fmDtcsCodeCmb->setAccessibleName("DTCS code");
+            m_fmDtcsCodeCmb->setPlaceholderText("DTCS code");
+            AetherSDR::applyComboStyle(m_fmDtcsCodeCmb);
+            m_fmDtcsCodeCmb->setVisible(false);
+
+            m_fmDtcsPolarityCmb = new GuardedComboBox;
+            m_fmDtcsPolarityCmb->setAccessibleName("DTCS polarity");
+            m_fmDtcsPolarityCmb->setPlaceholderText("Polarity");
+            m_fmDtcsPolarityCmb->setCurrentIndex(-1);
+            AetherSDR::applyComboStyle(m_fmDtcsPolarityCmb);
+            m_fmDtcsPolarityCmb->setVisible(false);
+
+            // DTCS needs both a code and a polarity. Keep those controls on a
+            // dedicated row so mixed CTCSS/DTCS modes do not compress four
+            // selectors into the slice applet's narrow width.
+            m_fmDtcsContainer = new QWidget;
+            auto* dtcsRow = new QHBoxLayout(m_fmDtcsContainer);
+            dtcsRow->setContentsMargins(0, 0, 0, 0);
+            dtcsRow->setSpacing(4);
+            dtcsRow->addWidget(m_fmDtcsCodeCmb, 3);
+            dtcsRow->addWidget(m_fmDtcsPolarityCmb, 2);
+            m_fmDtcsContainer->setVisible(false);
+            m_fmLayout->addWidget(m_fmDtcsContainer);
+
+            const auto applyDtcs = [this]() {
+                if (!m_slice || m_fmDtcsCodeCmb->signalsBlocked()
+                    || m_fmDtcsPolarityCmb->signalsBlocked()
+                    || m_fmDtcsCodeCmb->currentIndex() < 0
+                    || m_fmDtcsPolarityCmb->currentIndex() < 0) {
+                    return;
+                }
+                const QString polarity = m_fmDtcsPolarityCmb->currentData().toString();
+                m_slice->setFmDtcs(m_fmDtcsCodeCmb->currentData().toInt(),
+                                   polarity.startsWith(QLatin1Char('R')),
+                                   polarity.endsWith(QLatin1Char('R')));
+            };
+            connect(m_fmDtcsCodeCmb,
+                    QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [applyDtcs](int) { applyDtcs(); });
+            connect(m_fmDtcsPolarityCmb,
+                    QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [applyDtcs](int) { applyDtcs(); });
 
             // Offset row
             auto* offRow = new QHBoxLayout;
@@ -2359,19 +2583,18 @@ void VfoWidget::buildTabContent()
             m_fmOffsetSpin->setSuffix(" MHz");
             AetherSDR::ThemeManager::instance().applyStyleSheet(m_fmOffsetSpin, "QDoubleSpinBox { background: {{color.background.0}}; border: 1px solid {{color.background.1}}; "
                 "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; padding: 1px 2px; }"
+                "QDoubleSpinBox:disabled { color: {{color.text.disabled}}; }"
                 "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0; }");
             offRow->addWidget(m_fmOffsetSpin, 1);
-            fvb->addLayout(offRow);
+            m_fmLayout->addLayout(offRow);
 
             connect(m_fmOffsetSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
                     this, [this](double val) {
-                if (m_fmOffsetSpin->signalsBlocked()) return;
+                if (m_fmOffsetSpin->signalsBlocked() || !m_fmOffsetSpin->isEnabled()) return;
                 if (!m_slice) return;
                 m_slice->setFmRepeaterOffsetFreq(val);
-                const QString& dir = m_slice->repeaterOffsetDir();
-                if (dir == "up") m_slice->setTxOffsetFreq(val);
-                else if (dir == "down") m_slice->setTxOffsetFreq(-val);
-                else m_slice->setTxOffsetFreq(0);
+                m_slice->setTxOffsetFreq(SliceModel::txOffsetForDirection(
+                    m_slice->repeaterOffsetDir(), val));
             });
 
             // Direction: − | Simplex | + | REV
@@ -2379,12 +2602,10 @@ void VfoWidget::buildTabContent()
             dirRow->setSpacing(2);
 
             auto applyDir = [this](const QString& dir) {
-                if (!m_slice) return;
+                if (!m_slice || !m_fmOffsetSpin->isEnabled()) return;
                 m_slice->setRepeaterOffsetDir(dir);
-                double offset = m_slice->fmRepeaterOffsetFreq();
-                if (dir == "up") m_slice->setTxOffsetFreq(offset);
-                else if (dir == "down") m_slice->setTxOffsetFreq(-offset);
-                else m_slice->setTxOffsetFreq(0);
+                m_slice->setTxOffsetFreq(SliceModel::txOffsetForDirection(
+                    dir, m_slice->fmRepeaterOffsetFreq()));
                 m_fmOffsetDown->setChecked(dir == "down");
                 m_fmSimplexBtn->setChecked(dir == "simplex");
                 m_fmOffsetUp->setChecked(dir == "up");
@@ -2394,6 +2615,9 @@ void VfoWidget::buildTabContent()
             m_fmOffsetDown->setAccessibleName("Repeater offset down");
             m_fmOffsetDown->setCheckable(true);
             m_fmOffsetDown->setStyleSheet(kDirBtn);
+            ThemeManager::instance().applyStyleSheet(m_fmOffsetDown, m_fmOffsetDown->styleSheet()
+                + QStringLiteral("QPushButton:disabled { color: {{color.text.disabled}}; "
+                                 "background: {{color.background.2}}; }"));
             connect(m_fmOffsetDown, &QPushButton::clicked, this, [applyDir] { applyDir("down"); });
             dirRow->addWidget(m_fmOffsetDown);
 
@@ -2402,6 +2626,9 @@ void VfoWidget::buildTabContent()
             m_fmSimplexBtn->setCheckable(true);
             m_fmSimplexBtn->setChecked(true);
             m_fmSimplexBtn->setStyleSheet(kDirBtn);
+            ThemeManager::instance().applyStyleSheet(m_fmSimplexBtn, m_fmSimplexBtn->styleSheet()
+                + QStringLiteral("QPushButton:disabled { color: {{color.text.disabled}}; "
+                                 "background: {{color.background.2}}; }"));
             connect(m_fmSimplexBtn, &QPushButton::clicked, this, [applyDir] { applyDir("simplex"); });
             dirRow->addWidget(m_fmSimplexBtn);
 
@@ -2409,23 +2636,44 @@ void VfoWidget::buildTabContent()
             m_fmOffsetUp->setAccessibleName("Repeater offset up");
             m_fmOffsetUp->setCheckable(true);
             m_fmOffsetUp->setStyleSheet(kDirBtn);
+            ThemeManager::instance().applyStyleSheet(m_fmOffsetUp, m_fmOffsetUp->styleSheet()
+                + QStringLiteral("QPushButton:disabled { color: {{color.text.disabled}}; "
+                                 "background: {{color.background.2}}; }"));
             connect(m_fmOffsetUp, &QPushButton::clicked, this, [applyDir] { applyDir("up"); });
             dirRow->addWidget(m_fmOffsetUp);
 
             m_fmRevBtn = new QPushButton("REV");
+            m_fmRevBtn->setObjectName("vfoFmReverseButton");
             m_fmRevBtn->setAccessibleName("Reverse repeater offset");
             m_fmRevBtn->setCheckable(true);
             m_fmRevBtn->setStyleSheet(kRevBtn);
+            // The same :disabled rule its three neighbours carry. Without it a
+            // gated-off REV is indistinguishable from a live one, which is the
+            // "dead control that looks live" failure the gate exists to remove.
+            ThemeManager::instance().applyStyleSheet(m_fmRevBtn, m_fmRevBtn->styleSheet()
+                + QStringLiteral("QPushButton:disabled { color: {{color.text.disabled}}; "
+                                 "background: {{color.background.2}}; }"));
             connect(m_fmRevBtn, &QPushButton::toggled, this, [this](bool on) {
-                if (m_fmRevBtn->signalsBlocked() || !m_slice) return;
+                if (m_fmRevBtn->signalsBlocked() || !m_slice
+                    || usesTransmitFrequencyCheck()) return;
                 double offset = m_slice->fmRepeaterOffsetFreq();
                 const QString& dir = m_slice->repeaterOffsetDir();
                 if (dir == "up") m_slice->setTxOffsetFreq(on ? -offset : offset);
                 else if (dir == "down") m_slice->setTxOffsetFreq(on ? offset : -offset);
             });
+            connect(m_fmRevBtn, &QPushButton::pressed, this, [this] {
+                if (usesTransmitFrequencyCheck()) {
+                    m_xfcHeldByThisControl = true;
+                    m_radioModel->setTransmitFrequencyCheck(true);
+                }
+            });
+            connect(m_fmRevBtn, &QPushButton::released, this, [this] {
+                releaseTransmitFrequencyCheck();
+            });
+            m_fmRevBtn->installEventFilter(this);
             dirRow->addWidget(m_fmRevBtn);
 
-            fvb->addLayout(dirRow);
+            m_fmLayout->addLayout(dirRow);
 
             m_fmContainer->hide();
             dspVb->addWidget(m_fmContainer);
@@ -2445,7 +2693,47 @@ void VfoWidget::buildTabContent()
             });
         };
         wireLeveledDsp(m_nrBtn,   &SliceModel::setNr,   LvlNR);
-        wireLeveledDsp(m_nbBtn,   &SliceModel::setNb,   LvlNB);
+        // NB is the one leveled DSP that is NOT a plain toggle, because WDSP has
+        // two impulse blankers and only one may run. Where this host runs them
+        // the button cycles Off -> NB -> NB2 -> Off; everywhere else it is the
+        // toggle it always was, since a radio-side blanker has no second state
+        // to offer.
+        //
+        // Wired on toggled() like its siblings, so the shared level row keeps
+        // tracking it, with the NB2 leg reached by RE-CHECKING the button inside
+        // the handler that saw it go off. The alternative — a clicked() handler
+        // driving check state itself — would have to fight Qt's own toggle on
+        // every press.
+        connect(m_nbBtn, &QPushButton::toggled, this, [this](bool on) {
+            if (m_updatingFromModel || !m_slice) {
+                if (on) pushDspLevelTarget(LvlNB);
+                else    popDspLevelTarget(LvlNB);
+                return;
+            }
+            if (on) {
+                m_slice->setNbKind(AetherSDR::NoiseBlankerKind::Impulse);
+                pushDspLevelTarget(LvlNB);
+                refreshNbControls();
+                return;
+            }
+            // Going off. On a host-blanker radio that is the middle of the
+            // cycle: NB2 next, and the button goes straight back to checked
+            // without the model ever seeing an Off it did not ask for.
+            if (m_hasHostNoiseBlanker
+                && m_slice->nbKind() == AetherSDR::NoiseBlankerKind::Impulse) {
+                m_slice->setNbKind(AetherSDR::NoiseBlankerKind::Advanced);
+                m_updatingFromModel = true;
+                QSignalBlocker sb(m_nbBtn);
+                m_nbBtn->setChecked(true);
+                m_updatingFromModel = false;
+                pushDspLevelTarget(LvlNB);
+                refreshNbControls();
+                return;
+            }
+            m_slice->setNbKind(AetherSDR::NoiseBlankerKind::Off);
+            popDspLevelTarget(LvlNB);
+            refreshNbControls();
+        });
         wireLeveledDsp(m_anfBtn,  &SliceModel::setAnf,  LvlAnf);
         wireLeveledDsp(m_nrlBtn,  &SliceModel::setNrl,  LvlNrl);
         wireLeveledDsp(m_nrsBtn,  &SliceModel::setNrs,  LvlNrs);
@@ -2956,19 +3244,8 @@ void VfoWidget::setCollapsed(bool collapsed)
         // Show collapsed frequency label and position it immediately
         if (m_collapsedFreqLabel) {
             updateFreqLabel();
-            m_collapsedFreqLabel->setText(m_freqLabel->text());
-            m_collapsedFreqLabel->adjustSize();
+            updateCollapsedFrequencyLabel();
             m_collapsedFreqLabel->show();
-
-            // Position now based on current widget location
-            const int freqGap = 2;
-            int freqH = m_collapsedFreqLabel->sizeHint().height();
-            int freqW = m_collapsedFreqLabel->sizeHint().width();
-            int freqY = pos().y() + (44 - freqH) / 2;
-            int freqX = m_lastOnLeft
-                ? pos().x() - freqW - freqGap
-                : pos().x() + COLLAPSED_W + freqGap;
-            m_collapsedFreqLabel->move(freqX, freqY);
         }
     } else {
         // Restore full width, remove fixed height constraint
@@ -3235,6 +3512,22 @@ void VfoWidget::setHasLmsNoiseFilters(bool has)
     relayoutDspGrid();
 }
 
+bool VfoWidget::acceptsFilterEdges(int low, int high) const
+{
+    if (!m_slice) {
+        return false;
+    }
+    return ModeFilters::acceptsFilterEdges(m_slice->mode(),
+        m_receiveFilterControl ? &*m_receiveFilterControl : nullptr,
+        !m_radioFilterWidths.isEmpty(), {low, high});
+}
+
+QVector<int> VfoWidget::defaultFilterWidths(const QString& mode) const
+{
+    return ModeFilters::widthsForMode(mode,
+        m_receiveFilterControl ? &*m_receiveFilterControl : nullptr);
+}
+
 void VfoWidget::setRadioFilterWidths(const QList<int>& widthsHz)
 {
     const QVector<int> wanted(widthsHz.begin(), widthsHz.end());
@@ -3244,6 +3537,25 @@ void VfoWidget::setRadioFilterWidths(const QList<int>& widthsHz)
     if (!m_slice)
         return;   // updateModeTab() reads the field when the slice arrives
     updateModeTab();
+}
+
+void VfoWidget::setRadioFilterControl(const RxFilterControl& control)
+{
+    if (control == m_radioFilterControl) {
+        return;
+    }
+    m_radioFilterControl = control;
+    if (!control.presets.isEmpty()) {
+        QVector<int> widths;
+        widths.reserve(control.presets.size());
+        for (const RxFilterPreset& preset : control.presets) {
+            widths.append(preset.widthHz);
+        }
+        m_radioFilterWidths = widths;
+    }
+    if (m_slice) {
+        updateModeTab();
+    }
 }
 
 void VfoWidget::setHasManualNotch(bool has)
@@ -3283,6 +3595,38 @@ void VfoWidget::setHasHostNoiseBlanker(bool has)
         return;
     applyRadioSideDspVisibility();
     relayoutDspGrid();
+    // A radio that does not run the blanker here cannot reach NB2, so the fill
+    // row goes away with the capability rather than lingering from the last one.
+    refreshNbControls();
+}
+
+void VfoWidget::refreshNbControls()
+{
+    if (!m_nbBtn || !m_nbFillContainer || !m_nbFillCombo)
+        return;
+    const AetherSDR::NoiseBlankerKind kind =
+        m_slice ? m_slice->nbKind() : AetherSDR::NoiseBlankerKind::Off;
+    const bool advanced = kind == AetherSDR::NoiseBlankerKind::Advanced;
+    // The label is the state readout for the cycle.
+    m_nbBtn->setText(advanced ? QStringLiteral("NB2") : QStringLiteral("NB"));
+    m_nbBtn->setAccessibleName(advanced ? QStringLiteral("Noise blanker 2")
+                                        : QStringLiteral("Noise blanker"));
+    // objectName stays fixed: the bridge addresses the button by it. The fill
+    // row also follows m_nbModeOk, since the NB button hides in FM.
+    const bool showFill = advanced && m_hasHostNoiseBlanker && m_nbModeOk;
+    // A visibility change must refit the DSP tab, whose height is pinned to its
+    // size hint; queued, as setDspLevelTarget() does, so the row is laid out first.
+    const bool visibilityChanged = m_nbFillContainer->isHidden() == showFill;
+    m_nbFillContainer->setVisible(showFill);
+    const int index = m_slice ? static_cast<int>(m_slice->nbFill())
+                              : static_cast<int>(AetherSDR::kDefaultNoiseBlankerFill);
+    if (m_nbFillCombo->currentIndex() != index) {
+        QSignalBlocker sb(m_nbFillCombo);
+        m_nbFillCombo->setCurrentIndex(index);
+    }
+    if (visibilityChanged && m_activeTab == 1 && m_tabStack && m_tabStack->isVisible()) {
+        QTimer::singleShot(0, this, [this] { relayoutToCurrentContent(); });
+    }
 }
 
 void VfoWidget::setHasExtendedDsp(bool has)
@@ -3317,23 +3661,53 @@ void VfoWidget::setAetherDspActive(bool active)
     if (!m_aetherDspBtn)
         return;
     m_aetherDspBtn->setStyleSheet(active ? kDspToggleActive : kDspToggle);
-    m_aetherDspBtn->setAccessibleName(active ? QStringLiteral("AetherDSP Settings (NR active)")
-                                             : QStringLiteral("AetherDSP Settings"));
+    m_aetherDspBtn->setAccessibleName(active ? QStringLiteral("AetherRX (NR active)")
+                                             : QStringLiteral("AetherRX"));
     updateDspTabAccent();
 }
 
-// ── Per-slice VFO marker display prefs (#1526) ───────────────────────────────
+// ── VFO marker display prefs (#1526, #5570) ─────────────────────────────────
 
-void VfoWidget::setMarkerWidth(int widthPx)
+namespace {
+int normalizedMarkerWidth(int widthPx)
+{
+    return VfoDisplayDefaults::normalizeMarkerWidth(widthPx);
+}
+} // namespace
+
+// The global defaults live in VfoDisplayDefaults (one owned config object,
+// Principle V). These thin forwarders keep the existing VfoWidget:: call sites
+// — the View menu and loadDisplayPrefs() — unchanged.
+int VfoWidget::defaultMarkerWidth()
+{
+    return VfoDisplayDefaults::markerWidth();
+}
+
+bool VfoWidget::defaultFilterEdgesHidden()
+{
+    return VfoDisplayDefaults::filterEdgesHidden();
+}
+
+void VfoWidget::setDefaultMarkerWidth(int widthPx)
+{
+    VfoDisplayDefaults::setMarkerWidth(widthPx);
+}
+
+void VfoWidget::setDefaultFilterEdgesHidden(bool hide)
+{
+    VfoDisplayDefaults::setFilterEdgesHidden(hide);
+}
+
+void VfoWidget::setMarkerWidth(int widthPx, bool persist)
 {
     // Snap to one of the supported states: 0 (off), 1, 3.
-    if (widthPx <= 0)      widthPx = 0;
-    else if (widthPx <= 1) widthPx = 1;
-    else                   widthPx = 3;
+    widthPx = normalizedMarkerWidth(widthPx);
 
     if (m_markerWidth != widthPx) {
         m_markerWidth = widthPx;
-        saveDisplayPrefs();
+        if (persist) {
+            saveMarkerWidthPref();
+        }
         emit markerStyleChanged(m_markerWidth, m_filterEdgesHidden);
     }
     if (m_markerThicknessBtn) {
@@ -3343,11 +3717,13 @@ void VfoWidget::setMarkerWidth(int widthPx)
     }
 }
 
-void VfoWidget::setFilterEdgesHidden(bool hide)
+void VfoWidget::setFilterEdgesHidden(bool hide, bool persist)
 {
     if (m_filterEdgesHidden != hide) {
         m_filterEdgesHidden = hide;
-        saveDisplayPrefs();
+        if (persist) {
+            saveFilterEdgesPref();
+        }
         emit markerStyleChanged(m_markerWidth, m_filterEdgesHidden);
     }
     if (m_edgesBtn) m_edgesBtn->setChecked(!hide);
@@ -3362,25 +3738,41 @@ void VfoWidget::loadDisplayPrefs()
     const QString keyH = QStringLiteral("Slice%1_FilterEdgesHidden").arg(m_slice->sliceId());
     if (s.contains(keyW)) {
         m_markerWidth = s.value(keyW, "1").toString().toInt();
-    } else {
+    } else if (s.contains(keyT)) {
         // Migrate from the old MarkerThin bool: True (thin) → 1, False (thick) → 3.
         m_markerWidth = (s.value(keyT, "False").toString() == "True") ? 1 : 3;
-        if (s.contains(keyT))
-            s.remove(keyT);
+        s.remove(keyT);
+    } else {
+        m_markerWidth = defaultMarkerWidth();
     }
     if (m_markerWidth != 0 && m_markerWidth != 1 && m_markerWidth != 3)
         m_markerWidth = 1;
-    m_filterEdgesHidden = s.value(keyH, "False").toString() == "True";
+    m_filterEdgesHidden = s.contains(keyH)
+        ? s.value(keyH, "False").toString() == "True"
+        : defaultFilterEdgesHidden();
 }
 
-void VfoWidget::saveDisplayPrefs()
+// Each property is written on its own. Writing both would turn a global
+// default the operator applied from View into a per-slice override for the
+// *other* property: the menu applies without persisting, so the value sits in
+// m_markerWidth / m_filterEdgesHidden until some unrelated flag button saves
+// and silently pins it. A slice must only stop following a global default for
+// the property the operator actually changed on that slice.
+void VfoWidget::saveMarkerWidthPref()
 {
     if (!m_slice) return;
     auto& s = AppSettings::instance();
-    const QString keyW = QStringLiteral("Slice%1_MarkerWidth").arg(m_slice->sliceId());
-    const QString keyH = QStringLiteral("Slice%1_FilterEdgesHidden").arg(m_slice->sliceId());
-    s.setValue(keyW, QString::number(m_markerWidth));
-    s.setValue(keyH, m_filterEdgesHidden ? "True" : "False");
+    s.setValue(QStringLiteral("Slice%1_MarkerWidth").arg(m_slice->sliceId()),
+               QString::number(m_markerWidth));
+    s.save();
+}
+
+void VfoWidget::saveFilterEdgesPref()
+{
+    if (!m_slice) return;
+    auto& s = AppSettings::instance();
+    s.setValue(QStringLiteral("Slice%1_FilterEdgesHidden").arg(m_slice->sliceId()),
+               m_filterEdgesHidden ? "True" : "False");
     s.save();
 }
 
@@ -3509,6 +3901,7 @@ void VfoWidget::showEvent(QShowEvent* event)
 
 void VfoWidget::hideEvent(QHideEvent* event)
 {
+    releaseTransmitFrequencyCheck();
     if (m_shadowWidget) {
         m_shadowWidget->hide();
     }
@@ -4303,6 +4696,7 @@ void VfoWidget::setSlice(SliceModel* slice)
     setProperty("sliceId", m_slice ? m_slice->sliceId() : -1);
     if (!m_slice) {
         updateFreqLabel();
+        updateCaptureStatus();
         return;
     }
 
@@ -4319,6 +4713,9 @@ void VfoWidget::setSlice(SliceModel* slice)
 
     // Frequency
     connect(m_slice, &SliceModel::frequencyChanged, this, [this](double) { updateFreqLabel(); });
+    connect(m_slice, &SliceModel::inCaptureChanged, this, [this](bool) {
+        updateCaptureStatus();
+    });
     // Blocked tune: cancel any in-flight direct-entry (widget-local side
     // effect), then let lockedFeedbackActiveChanged drive the LOCKED repaint.
     connect(m_slice, &SliceModel::tuneBlockedByLock, this, [this] {
@@ -4407,6 +4804,7 @@ void VfoWidget::setSlice(SliceModel* slice)
         m_digContainer->setVisible(isDig && !isFdv && mode != "NT");
         m_fmContainer->setVisible(isFm);
         m_fmToneContainer->setVisible(hasToneControls);
+        configureFmToneControls();
         if (isDig) {
             int off = (mode == "DIGL") ? m_slice->diglOffset() : m_slice->diguOffset();
             m_digOffsetLabel->setText(QString::number(off));
@@ -4418,9 +4816,14 @@ void VfoWidget::setSlice(SliceModel* slice)
         // Digital/RTTY: audio feeds external decoders via DAX, SQL not meaningful
         //   and gates weak FSK signals (#2504)
         // CW: radio locks squelch on at fixed level, rejects changes
-        bool sqlDisabled = isDig || isCw || isRtty;
+        const bool sqlDisabled = !ModeFilters::squelchAvailableInMode(mode,
+            m_exclusiveSquelch ? &*m_exclusiveSquelch : nullptr,
+            m_radioModel && m_radioModel->isConnected()
+                && m_radioModel->backendCapabilities().hasModeIndependentSquelch,
+            m_slice && m_slice->externalReceiveReplacementActive());
         m_sqlBtn->setEnabled(!sqlDisabled);
         m_sqlSlider->setEnabled(!sqlDisabled);
+        if (m_filterAvailability) { m_filterAvailability->refreshEngaged(); }
         if (sqlDisabled && m_slice) {
             // Only digital/RTTY modes get a client-side squelch-off override
             // (#2504). CW/CWL squelch is radio-managed — no client push, so no
@@ -4459,6 +4862,7 @@ void VfoWidget::setSlice(SliceModel* slice)
         // NRL is available on 6000-series too (#2177)
         m_nrlModeOk = !isFm;
         applyRadioSideDspVisibility();
+        refreshNbControls();
         // 8000-series-only firmware DSP filters — shared rule (#2177)
         updateExtendedDspVisibility();
         updateDspTabAccent();
@@ -4591,6 +4995,12 @@ void VfoWidget::setSlice(SliceModel* slice)
         });
     };
     connectLeveledDsp(&SliceModel::nbChanged,   m_nbBtn,   LvlNB);
+    // The kind on top of the bool: same button, but its label says which blanker
+    // and the fill row appears with NB2.
+    connect(m_slice, &SliceModel::nbKindChanged, this,
+            [this](AetherSDR::NoiseBlankerKind) { refreshNbControls(); });
+    connect(m_slice, &SliceModel::nbFillChanged, this,
+            [this](AetherSDR::NoiseBlankerFill) { refreshNbControls(); });
     connectLeveledDsp(&SliceModel::nrChanged,   m_nrBtn,   LvlNR);
     connectLeveledDsp(&SliceModel::anfChanged,  m_anfBtn,  LvlAnf);
     connectLeveledDsp(&SliceModel::nrlChanged,  m_nrlBtn,  LvlNrl);
@@ -4713,7 +5123,7 @@ void VfoWidget::setSlice(SliceModel* slice)
         QSignalBlocker sb(m_fmToneModeCmb);
         int idx = m_fmToneModeCmb->findData(mode);
         if (idx >= 0) m_fmToneModeCmb->setCurrentIndex(idx);
-        m_fmToneValueCmb->setEnabled(mode == "ctcss_tx");
+        configureFmToneControls();
         m_updatingFromModel = false;
     });
     connect(m_slice, &SliceModel::fmToneValueChanged, this, [this](const QString& val) {
@@ -4723,6 +5133,18 @@ void VfoWidget::setSlice(SliceModel* slice)
         if (idx >= 0) m_fmToneValueCmb->setCurrentIndex(idx);
         m_updatingFromModel = false;
     });
+    connect(m_slice, &SliceModel::fmToneRxValueChanged, this, [this](const QString& val) {
+        if (!m_fmToneRxValueCmb) {
+            return;
+        }
+        QSignalBlocker sb(m_fmToneRxValueCmb);
+        const int idx = m_fmToneRxValueCmb->findData(val);
+        if (idx >= 0) {
+            m_fmToneRxValueCmb->setCurrentIndex(idx);
+        }
+    });
+    connect(m_slice, &SliceModel::fmDtcsChanged, this,
+            [this](int, bool, bool) { configureFmToneControls(); });
     connect(m_slice, &SliceModel::repeaterOffsetDirChanged, this, [this](const QString& dir) {
         m_updatingFromModel = true;
         QSignalBlocker b1(m_fmOffsetDown), b2(m_fmSimplexBtn), b3(m_fmOffsetUp);
@@ -4922,6 +5344,7 @@ void VfoWidget::syncFromSlice()
                 "border-radius: 3px; font-weight: bold; font-size: 11px; }")
             .arg(SliceColorManager::instance().hexActive(colourIdx)));
     updateFreqLabel();
+    updateCaptureStatus();
     updateFilterLabel();
 
     // Mode tab
@@ -4978,6 +5401,7 @@ void VfoWidget::syncFromSlice()
         QSignalBlocker sb(btn); btn->setChecked(on);
     };
     syncDsp(m_nbBtn,  m_slice->nbOn());
+    refreshNbControls();
     syncDsp(m_nrBtn,  m_slice->nrOn());
     syncDsp(m_anfBtn, m_slice->anfOn());
     syncDsp(m_nrlBtn, m_slice->nrlOn());
@@ -5024,6 +5448,7 @@ void VfoWidget::syncFromSlice()
     // NRL is available on 6000-series too (#2177)
     m_nrlModeOk = !isFm;
     applyRadioSideDspVisibility();
+    refreshNbControls();
     // 8000-series-only firmware DSP filters — shared rule (#2177)
     updateExtendedDspVisibility();
     m_apfContainer->setVisible(isCw);
@@ -5031,15 +5456,40 @@ void VfoWidget::syncFromSlice()
     m_fmContainer->setVisible(isFm);
     m_fmToneContainer->setVisible(hasToneControls);
     // CW: radio locks squelch on at fixed level; Digital: not meaningful
-    m_sqlBtn->setEnabled(!isDig && !isCw);
-    m_sqlSlider->setEnabled(!isDig && !isCw);
+    const bool squelchAvailable = ModeFilters::squelchAvailableInMode(m_slice->mode(),
+        m_exclusiveSquelch ? &*m_exclusiveSquelch : nullptr,
+        m_radioModel && m_radioModel->isConnected()
+            && m_radioModel->backendCapabilities().hasModeIndependentSquelch,
+        m_slice->externalReceiveReplacementActive());
+    m_sqlBtn->setEnabled(squelchAvailable);
+    m_sqlSlider->setEnabled(squelchAvailable);
     if (isFm) {
-        QSignalBlocker b1(m_fmToneModeCmb), b2(m_fmToneValueCmb), b3(m_fmOffsetSpin);
+        QSignalBlocker b1(m_fmToneModeCmb), b2(m_fmToneValueCmb), b3(m_fmOffsetSpin),
+            toneRxBlocker(m_fmToneRxValueCmb), dtcsBlocker(m_fmDtcsCodeCmb),
+            polarityBlocker(m_fmDtcsPolarityCmb);
         int tmIdx = m_fmToneModeCmb->findData(m_slice->fmToneMode());
         if (tmIdx >= 0) m_fmToneModeCmb->setCurrentIndex(tmIdx);
-        m_fmToneValueCmb->setEnabled(m_slice->fmToneMode() == "ctcss_tx");
+        configureFmToneControls();
         int tvIdx = m_fmToneValueCmb->findData(m_slice->fmToneValue());
         if (tvIdx >= 0) m_fmToneValueCmb->setCurrentIndex(tvIdx);
+        const int rxIdx = m_fmToneRxValueCmb->findData(m_slice->fmToneRxValue());
+        if (rxIdx >= 0) {
+            m_fmToneRxValueCmb->setCurrentIndex(rxIdx);
+        }
+        const int dtcsIndex = m_fmDtcsCodeCmb->findData(m_slice->fmDtcsCode());
+        if (dtcsIndex < 0) {
+            m_fmDtcsCodeCmb->setCurrentIndex(-1);
+            m_fmDtcsPolarityCmb->setCurrentIndex(-1);
+        } else {
+            m_fmDtcsCodeCmb->setCurrentIndex(dtcsIndex);
+            const QString polarity = QStringLiteral("%1%2")
+                .arg(m_slice->fmDtcsTxReverse() ? QLatin1Char('R') : QLatin1Char('N'))
+                .arg(m_slice->fmDtcsRxReverse() ? QLatin1Char('R') : QLatin1Char('N'));
+            const int polarityIndex = m_fmDtcsPolarityCmb->findData(polarity);
+            if (polarityIndex >= 0) {
+                m_fmDtcsPolarityCmb->setCurrentIndex(polarityIndex);
+            }
+        }
         m_fmOffsetSpin->setValue(m_slice->fmRepeaterOffsetFreq());
         QSignalBlocker b4(m_fmOffsetDown), b5(m_fmSimplexBtn), b6(m_fmOffsetUp);
         const QString& dir = m_slice->repeaterOffsetDir();
@@ -5085,8 +5535,7 @@ void VfoWidget::updateFreqLabel()
             QAccessible::updateAccessibility(&lockedEvt);
         }
         if (m_collapsed && m_collapsedFreqLabel) {
-            m_collapsedFreqLabel->setText(QStringLiteral("LOCKED"));
-            m_collapsedFreqLabel->adjustSize();
+            updateCollapsedFrequencyLabel();
         }
         return;
     }
@@ -5104,8 +5553,50 @@ void VfoWidget::updateFreqLabel()
 
     // Keep collapsed frequency label in sync
     if (m_collapsed && m_collapsedFreqLabel) {
-        m_collapsedFreqLabel->setText(freqText);
+        updateCollapsedFrequencyLabel();
+    }
+}
+
+void VfoWidget::updateCollapsedFrequencyLabel()
+{
+    if (!m_collapsed || !m_collapsedFreqLabel || !m_freqLabel) { return; }
+    const bool parked = m_slice && !m_slice->inCapture();
+    const QString text = parked
+        ? m_freqLabel->text() + tr("  OUT OF CAPTURE")
+        : m_freqLabel->text();
+    if (m_collapsedFreqLabel->text() != text) {
+        m_collapsedFreqLabel->setText(text);
         m_collapsedFreqLabel->adjustSize();
+    }
+    const int gap = 2;
+    const int x = m_lastOnLeft
+        ? pos().x() - m_collapsedFreqLabel->sizeHint().width() - gap
+        : pos().x() + COLLAPSED_W + gap;
+    const int y = pos().y() + (height() - m_collapsedFreqLabel->sizeHint().height()) / 2;
+    m_collapsedFreqLabel->move(x, y);
+}
+
+void VfoWidget::updateCaptureStatus()
+{
+    if (!m_captureStatusLabel) { return; }
+    const bool parked = m_slice && !m_slice->inCapture();
+    const bool showExpanded = parked && !m_collapsed;
+    if ((!m_captureStatusLabel->isHidden()) != showExpanded) {
+        m_captureStatusLabel->setVisible(showExpanded);
+    }
+    updateCollapsedFrequencyLabel();
+    if (m_freqLabel) {
+        const QString description = parked
+            ? tr("Out of capture. This slice is parked; audio and decoders are inactive.")
+            : QString();
+        if (m_freqLabel->accessibleDescription() == description) { return; }
+        m_freqLabel->setAccessibleDescription(description);
+    }
+    if (QAccessible::isActive() && m_freqLabel) {
+        QAccessibleEvent event(m_freqLabel, QAccessible::DescriptionChanged);
+        QAccessible::updateAccessibility(&event);
+        QAccessibleEvent group(this, QAccessible::NameChanged);
+        QAccessible::updateAccessibility(&group);
     }
 }
 
@@ -5140,10 +5631,8 @@ void VfoWidget::relayoutDspGrid()
                           m_mnBtn};
     for (auto* btn : all)
         m_dspGrid->removeWidget(btn);
-    if (m_aetherDspBtn)
-        m_dspGrid->removeWidget(m_aetherDspBtn);
-    if (m_aetherVoiceBtn)
-        m_dspGrid->removeWidget(m_aetherVoiceBtn);
+    if (m_aetherLauncherRow)
+        m_dspGrid->removeWidget(m_aetherLauncherRow);
 
     // Re-add only non-hidden buttons in 4-column rows
     int col = 0, row = 0;
@@ -5153,14 +5642,14 @@ void VfoWidget::relayoutDspGrid()
             if (++col >= 4) { col = 0; ++row; }
         }
     }
-    // Client-side launchers: ADSP (1 col) + AetherVoice (2 cols spanning
-    // the rightmost 2 columns) live on the same row.  If ADSP would land
-    // beyond col 1, wrap the pair to a fresh row first so AetherVoice
-    // always occupies cols 2-3.
-    if (m_aetherDspBtn && m_aetherVoiceBtn) {
-        if (col > 1) { col = 0; ++row; }
-        m_dspGrid->addWidget(m_aetherDspBtn, row, col);
-        m_dspGrid->addWidget(m_aetherVoiceBtn, row, 2, 1, 2);
+    // Client-side launchers, AetherRX then AetherTX, side by side and always
+    // the same width. Their row container spans every column the toggles
+    // left free on this row and the pair split it evenly, so a three-cell
+    // remainder is filled edge to edge rather than leaving a cell empty. A
+    // row with fewer than two cells left wraps to a fresh one first.
+    if (m_aetherLauncherRow) {
+        if (col > 2) { col = 0; ++row; }
+        m_dspGrid->addWidget(m_aetherLauncherRow, row, col, 1, 4 - col);
     }
 }
 
@@ -5262,31 +5751,10 @@ void VfoWidget::refreshDspLevelTarget()
 }
 
 // ── Mode tab helpers ──────────────────────────────────────────────────────────
-
-struct ModeFilterPresets {
-    QVector<int> filterWidths;
-};
-
-static const ModeFilterPresets& filterPresetsFor(const QString& mode)
-{
-    // From docs/data/vfo_mode_filters.csv — 8 presets per mode, 4x2 grid
-    static const ModeFilterPresets usb{{1800, 2100, 2400, 2700, 2900, 3300, 4000, 6000}};
-    static const ModeFilterPresets am {{5600, 6000, 8000, 10000, 12000, 14000, 16000, 20000}};
-    static const ModeFilterPresets cw {{50, 100, 250, 400, 500, 600, 800, 1000}};
-    static const ModeFilterPresets dig{{100, 300, 600, 1000, 1500, 2000, 3000, 6000}};
-    static const ModeFilterPresets rtty{{250, 300, 350, 400, 500, 1000, 1500, 3000}};
-    static const ModeFilterPresets dfm{{6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000}};
-    static const ModeFilterPresets fm{{}};
-
-    if (mode == "USB" || mode == "LSB") return usb;
-    if (mode == "AM" || mode == "SAM") return am;
-    if (isCwMode(mode)) return cw;
-    if (mode == "DIGU" || mode == "DIGL" || mode == "NT") return dig;
-    if (mode == "RTTY") return rtty;
-    if (mode == "DFM") return dfm;
-    if (mode == "FM" || mode == "NFM") return fm;
-    return usb;
-}
+//
+// The ladders and the width -> edges rule live in ModeFilterPresets now: the EQ
+// offers the same widths, and two copies of a rule this fiddly would have
+// drifted the first time one of them was corrected.
 
 void VfoWidget::updateModeTab()
 {
@@ -5311,7 +5779,9 @@ void VfoWidget::updateModeTab()
     m_filterWidths.clear();
     m_filterCustomLo.clear();
     m_filterCustomHi.clear();
-    if (!saved.isEmpty()) {
+    if (m_radioFilterWidths.isEmpty() && !saved.isEmpty()
+        && ModeFilters::fmFilterAdjustable(m_slice->mode(),
+               m_receiveFilterControl ? &*m_receiveFilterControl : nullptr, false)) {
         for (const auto& s : saved.split(',', Qt::SkipEmptyParts)) {
             if (s.contains(':')) {
                 const auto parts = s.split(':');
@@ -5319,7 +5789,9 @@ void VfoWidget::updateModeTab()
                 bool okLo, okHi;
                 int lo = parts[0].toInt(&okLo);
                 int hi = parts[1].toInt(&okHi);
-                if (!okLo || !okHi || hi <= lo) continue;
+                if (!okLo || !okHi || hi <= lo || !acceptsFilterEdges(lo, hi)) {
+                    continue;
+                }
                 m_filterWidths.append(hi - lo);
                 m_filterCustomLo.append(lo);
                 m_filterCustomHi.append(hi);
@@ -5327,6 +5799,12 @@ void VfoWidget::updateModeTab()
                 bool ok;
                 int w = s.toInt(&ok);
                 if (!ok || w <= 0) continue;
+                const ModeFilters::Edges edges = ModeFilters::edgesForWidth(
+                    m_slice->mode(), w,
+                    {m_slice->diguOffset(), m_slice->diglOffset(), m_slice->rttyShift()});
+                if (!acceptsFilterEdges(edges.lo, edges.hi)) {
+                    continue;
+                }
                 m_filterWidths.append(w);
                 m_filterCustomLo.append(INT_MIN);
                 m_filterCustomHi.append(INT_MIN);
@@ -5334,7 +5812,7 @@ void VfoWidget::updateModeTab()
         }
     }
     if (m_filterWidths.isEmpty()) {
-        m_filterWidths = filterPresetsFor(cur).filterWidths;
+        m_filterWidths = defaultFilterWidths(cur);
         m_filterCustomLo.fill(INT_MIN, m_filterWidths.size());
         m_filterCustomHi.fill(INT_MIN, m_filterWidths.size());
     }
@@ -5401,6 +5879,14 @@ void VfoWidget::updateAgcSliderFromSlice()
 {
     if (!m_slice || !m_agcTSlider || !m_agcValueLbl) return;
 
+    const bool connected = m_radioModel && m_radioModel->isConnected();
+    const bool available = !connected || m_slice->externalReceiveReplacementActive()
+        || m_radioModel->backendCapabilities().hasAgcThreshold;
+    m_agcTSlider->setEnabled(available);
+    m_agcValueLbl->setEnabled(available);
+    const RadioCapabilities caps = connected && !m_slice->externalReceiveReplacementActive()
+        ? m_radioModel->backendCapabilities() : RadioCapabilities{};
+    setAgcModeAvailability(m_agcCmb, caps.agcModes);
     const bool agcOff = (m_slice->receiveAgcMode() == "off");
     const int minimum = agcOff ? 0 : agcThresholdMinimum();
     const int maximum = agcOff ? 100 : agcThresholdMaximum();
@@ -5412,8 +5898,9 @@ void VfoWidget::updateAgcSliderFromSlice()
     QSignalBlocker blocker(m_agcTSlider);
     m_agcTSlider->setRange(minimum, maximum);
     m_agcTSlider->setValue(value);
-    m_agcTSlider->setToolTip(agcOff
-        ? QString("AGC Off Level: %1 dB").arg(value)
+    m_agcTSlider->setToolTip(!available
+        ? tr("AGC threshold and off level are unavailable on this radio")
+        : agcOff ? QString("AGC Off Level: %1 dB").arg(value)
         : QString("AGC Threshold: %1 dB").arg(value));
     m_agcTSlider->setAccessibleName(agcOff ? "AGC off level" : "AGC threshold");
     m_agcValueLbl->setText(QString::number(value));
@@ -5421,8 +5908,32 @@ void VfoWidget::updateAgcSliderFromSlice()
 
 void VfoWidget::rebuildFilterButtons()
 {
+    const auto createFilterButton = [this](const QString& label) {
+        auto* button = new QPushButton(label, this);
+        button->setFixedHeight(26);
+        button->setStyleSheet(kModeBtn);
+        return button;
+    };
     for (auto* btn : m_filterBtns) delete btn;
     m_filterBtns.clear();
+    delete m_filterUnavailable;
+    m_filterUnavailable = nullptr;
+    if (m_filterAvailability) {
+        m_filterAvailability->refreshEngaged();
+    }
+    if (m_slice && m_filterWidths.isEmpty()
+        && !ModeFilters::fmFilterAdjustable(m_slice->mode(),
+               m_receiveFilterControl ? &*m_receiveFilterControl : nullptr,
+               !m_radioFilterWidths.isEmpty())) {
+        m_filterUnavailable = createFilterButton(tr("Filter unavailable"));
+        m_filterUnavailable->setAccessibleName(tr("Receive filter"));
+        m_filterGrid->addWidget(m_filterUnavailable, 0, 0, 1, 4);
+        if (m_filterAvailability) {
+            m_filterAvailability->registerWidget(m_filterUnavailable,
+                tr("This receiver does not support adjustable filters in this mode"),
+                [](bool, const RadioCapabilities&) { return false; });
+        }
+    }
     // Remove autotune row if it exists (re-added for CW). Delete the
     // container — its children ("Autotune:" label, buttons) go with it.
     if (m_autotuneContainer) {
@@ -5440,15 +5951,34 @@ void VfoWidget::rebuildFilterButtons()
 
     for (int i = 0; i < m_filterWidths.size(); ++i) {
         const int w = m_filterWidths[i];
-        auto* btn = new QPushButton(formatFilterLabel(w));
+        const bool stablePresets =
+            hasCompleteRxFilterPresets(m_radioFilterControl, m_filterWidths.size());
+        const RxFilterPreset preset = stablePresets
+            ? m_radioFilterControl.presets.at(i) : RxFilterPreset{};
+        auto* btn = createFilterButton(stablePresets ? preset.label : formatFilterLabel(w));
+        if (stablePresets) {
+            btn->setToolTip(QStringLiteral("%1: %2 receive bandwidth")
+                                .arg(preset.label, formatFilterLabel(preset.widthHz)));
+            btn->setAccessibleName(QStringLiteral("Receive filter %1")
+                                       .arg(preset.label));
+        }
         btn->setCheckable(true);
-        btn->setFixedHeight(26);
-        btn->setStyleSheet(kModeBtn);
-        connect(btn, &QPushButton::clicked, this, [this, i](bool) {
-            if (!m_slice) return;
+        connect(btn, &QPushButton::clicked, this,
+                [this, i, stablePresets, preset](bool) {
+            if (!m_slice) {
+                return;
+            }
+            if (stablePresets) {
+                if (m_radioModel) {
+                    m_radioModel->selectRadioFilterPreset(m_slice->sliceId(), preset.id);
+                }
+                return;
+            }
             if (m_filterCustomLo[i] != INT_MIN) {
                 // Custom edges from right-click → "Set Custom Edges..."
-                m_slice->setFilterWidth(m_filterCustomLo[i], m_filterCustomHi[i]);
+                if (acceptsFilterEdges(m_filterCustomLo[i], m_filterCustomHi[i])) {
+                    m_slice->setFilterWidth(m_filterCustomLo[i], m_filterCustomHi[i]);
+                }
             } else {
                 applyFilterPreset(m_filterWidths[i]);
             }
@@ -5466,10 +5996,17 @@ void VfoWidget::rebuildFilterButtons()
         }
         btn->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(btn, &QPushButton::customContextMenuRequested, this, [this, i, btn](const QPoint& pos) {
-            QMenu menu;
-            menu.addAction("Set Custom Edges...", [this, i] {
+            ScopedChildWidget<QMenu> menuOwner(this);
+            QMenu& menu = *menuOwner.get();
+            // Rebuilding presets deletes btn; old actions must not address the
+            // replacement mode's preset arrays after a nested event loop.
+            menu.addAction("Set Custom Edges...", btn,
+                           [this, i, button = QPointer<QPushButton>(btn)] {
                 if (!m_slice) return;
-                QDialog dlg(this);
+                const QPointer<VfoWidget> self(this);
+                const QPointer<SliceModel> slice(m_slice);
+                ScopedChildWidget<QDialog> dialogOwner(this);
+                QDialog& dlg = *dialogOwner.get();
                 dlg.setWindowTitle("Set Custom Filter Edges");
                 auto* form = new QFormLayout(&dlg);
                 auto* loSpin = new QSpinBox(&dlg);
@@ -5493,10 +6030,16 @@ void VfoWidget::rebuildFilterButtons()
                 QObject::connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
                 QObject::connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
                 form->addRow(btns);
-                if (dlg.exec() != QDialog::Accepted) return;
+                const int result = dlg.exec();
+                if (!self || !dialogOwner || !button || !slice
+                    || self->m_slice != slice.data() || result != QDialog::Accepted) {
+                    return;
+                }
                 int lo = loSpin->value();
                 int hi = hiSpin->value();
-                if (hi <= lo) return;
+                if (hi <= lo || !acceptsFilterEdges(lo, hi)) {
+                    return;
+                }
                 m_filterCustomLo[i] = lo;
                 m_filterCustomHi[i] = hi;
                 m_filterWidths[i] = hi - lo;
@@ -5504,9 +6047,9 @@ void VfoWidget::rebuildFilterButtons()
                 rebuildFilterButtons();
                 m_slice->setFilterWidth(lo, hi);
             });
-            menu.addAction("Reset to Default", [this, i] {
+            menu.addAction("Reset to Default", btn, [this, i] {
                 if (!m_slice) return;
-                const auto& factory = filterPresetsFor(m_slice->mode()).filterWidths;
+                const QVector<int> factory = defaultFilterWidths(m_slice->mode());
                 if (i >= factory.size()) return;
                 m_filterWidths[i] = factory[i];
                 m_filterCustomLo[i] = INT_MIN;
@@ -5621,6 +6164,9 @@ void VfoWidget::rebuildFilterButtons()
         } else {
             m_zeroBeatBtn = new QPushButton("Zero Beat");
             m_zeroBeatBtn->setFixedHeight(26);
+#ifdef HAVE_DEEPFIST
+            refreshCwDecoderControls();
+#endif
             m_zeroBeatBtn->setStyleSheet(btnStyle);
             connect(m_zeroBeatBtn, &QPushButton::clicked, this, [this]() {
                 emit zeroBeatRequested();
@@ -5638,6 +6184,19 @@ void VfoWidget::rebuildFilterButtons()
     updateFilterHighlight();
 }
 
+#ifdef HAVE_DEEPFIST
+void VfoWidget::refreshCwDecoderControls()
+{
+    if (!m_zeroBeatBtn) { return; }
+    const bool selected = CwDecodeSettings::deepFistSelected();
+    m_zeroBeatBtn->setEnabled(!selected);
+    const QString reason = selected
+        ? tr("DeepFist does not provide a pitch estimate for Zero Beat") : QString{};
+    m_zeroBeatBtn->setToolTip(reason);
+    m_zeroBeatBtn->setAccessibleDescription(reason);
+}
+#endif
+
 void VfoWidget::updateFilterHighlight()
 {
     if (!m_slice) return;
@@ -5646,7 +6205,9 @@ void VfoWidget::updateFilterHighlight()
     // Format mirrors updateModeTab(): "width" or "lo:hi" entries (#2259).
     const QString key = QStringLiteral("FilterPresets_%1").arg(m_slice->mode());
     const QString saved = AppSettings::instance().value(key, "").toString();
-    if (!saved.isEmpty()) {
+    if (m_radioFilterWidths.isEmpty() && !saved.isEmpty()
+        && ModeFilters::fmFilterAdjustable(m_slice->mode(),
+               m_receiveFilterControl ? &*m_receiveFilterControl : nullptr, false)) {
         QVector<int> loadedWidths;
         QVector<int> loadedLo;
         QVector<int> loadedHi;
@@ -5657,7 +6218,9 @@ void VfoWidget::updateFilterHighlight()
                 bool okLo, okHi;
                 int lo = parts[0].toInt(&okLo);
                 int hi = parts[1].toInt(&okHi);
-                if (!okLo || !okHi || hi <= lo) continue;
+                if (!okLo || !okHi || hi <= lo || !acceptsFilterEdges(lo, hi)) {
+                    continue;
+                }
                 loadedWidths.append(hi - lo);
                 loadedLo.append(lo);
                 loadedHi.append(hi);
@@ -5665,19 +6228,35 @@ void VfoWidget::updateFilterHighlight()
                 bool ok;
                 int w = s.toInt(&ok);
                 if (!ok || w <= 0) continue;
+                const ModeFilters::Edges edges = ModeFilters::edgesForWidth(
+                    m_slice->mode(), w,
+                    {m_slice->diguOffset(), m_slice->diglOffset(), m_slice->rttyShift()});
+                if (!acceptsFilterEdges(edges.lo, edges.hi)) {
+                    continue;
+                }
                 loadedWidths.append(w);
                 loadedLo.append(INT_MIN);
                 loadedHi.append(INT_MIN);
             }
         }
-        if (loadedWidths != m_filterWidths
+        if (!loadedWidths.isEmpty() && (loadedWidths != m_filterWidths
                 || loadedLo != m_filterCustomLo
-                || loadedHi != m_filterCustomHi) {
+                || loadedHi != m_filterCustomHi)) {
             m_filterWidths = loadedWidths;
             m_filterCustomLo = loadedLo;
             m_filterCustomHi = loadedHi;
             rebuildFilterButtons();
         }
+    }
+
+    if (hasCompleteRxFilterPresets(m_radioFilterControl, m_filterBtns.size())) {
+        for (int i = 0; i < m_filterBtns.size(); ++i) {
+            QSignalBlocker blocker(m_filterBtns[i]);
+            m_filterBtns[i]->setChecked(
+                m_radioFilterControl.presets.at(i).id
+                == m_radioFilterControl.selectedPresetId);
+        }
+        return;
     }
 
     const int width = m_slice->filterHigh() - m_slice->filterLow();
@@ -5697,85 +6276,12 @@ void VfoWidget::updateFilterHighlight()
 void VfoWidget::applyFilterPreset(int widthHz)
 {
     if (!m_slice) return;
-    int lo, hi;
-    const QString& mode = m_slice->mode();
-
-    if (mode == "DIGU") {
-        // For widths < 3000 Hz, center the filter on the stored digu_offset.
-        // SmartSDR behavior (fw v1.4.0.0): offset is the audio center frequency;
-        // filter spans [offset - width/2, offset + width/2], clamped so lo >= 95.
-        // For widths >= 3000 Hz, SmartSDR ignores the offset and runs from 95 Hz
-        // upward — preserve that behavior unchanged.
-        if (widthHz < 3000) {
-            int offset = m_slice->diguOffset();
-            lo = offset - widthHz / 2;
-            hi = offset + widthHz / 2;
-            if (lo < 95) {
-                // Clamp: don't let lo drop below 95 Hz (carrier rejection)
-                hi += (95 - lo);
-                lo = 95;
-            }
-        } else {
-            lo = 95;
-            hi = widthHz;
-        }
-    } else if (mode == "DIGL") {
-        // Mirror of DIGU: offset is negative (below carrier). For widths < 3000 Hz,
-        // center on -digl_offset, clamped so hi <= -95.
-        // For widths >= 3000 Hz, run from -95 downward.
-        if (widthHz < 3000) {
-            int offset = m_slice->diglOffset();
-            hi = -offset + widthHz / 2;
-            lo = -offset - widthHz / 2;
-            if (hi > -95) {
-                lo -= (hi + 95);
-                hi = -95;
-            }
-        } else {
-            lo = -widthHz;
-            hi = -95;
-        }
-    } else if (mode == "LSB") {
-        // SSB low cut is a fixed 100 Hz (matches SmartSDR for every SSB
-        // filter); the high cut is derived as lo + width so the effective
-        // passband equals the labeled width. Mirror of USB below the
-        // carrier: edge nearest the carrier is -100 Hz. (#3292)
-        hi = -100; lo = -100 - widthHz;
-    } else if (mode == "RTTY") {
-        // RTTY: RF_frequency = mark. Filter is relative to mark.
-        // Space is at -rttyShift. Passband should encompass both tones.
-        // Expand symmetrically around the midpoint between mark(0) and space(-shift).
-        int shift = m_slice->rttyShift();
-        int mid = -shift / 2;
-        lo = mid - widthHz / 2;
-        hi = mid + widthHz / 2;
-    } else if (mode == "CW" || mode == "CWL" || mode == "CWU") {
-        // Centered on carrier — radio's BFO handles pitch offset.
-        // CWU belongs with the other two spellings: it was falling through to
-        // the final else and getting a USB-shaped {95, width} with no carrier
-        // in it. It is reachable — NetSchedulerDialog lists it as a schedulable
-        // mode and RadioSetupDialog has it as the CWU/CWL sideband toggle — and
-        // it was wrong under the old passband convention too, just less visibly.
-        lo = -widthHz / 2;
-        hi =  widthHz / 2;
-    } else if (mode == "AM" || mode == "SAM" || mode == "DSB"
-               || mode == "FM" || mode == "NFM" || mode == "DFM") {
-        lo = -(widthHz / 2); hi = (widthHz / 2);
-    } else if (mode == "FDVL") {
-        lo = -widthHz; hi = -95;
-    } else if (mode == "USB") {
-        // SSB low cut is a fixed 100 Hz (matches SmartSDR for every SSB
-        // filter); the high cut is derived as lo + width so the effective
-        // passband equals the labeled width. Previously this sent lo=95,
-        // hi=width, which yielded an effective width of (label-95) — e.g.
-        // the 2.9k preset produced ~2805 Hz — and left the active-preset
-        // matcher comparing against off-by-95 widths. (#3292)
-        lo = 100; hi = 100 + widthHz;
-    } else {
-        // FDVU/FDV/etc: low cut at 95 Hz to reject carrier/hum
-        lo = 95; hi = widthHz;
+    const ModeFilters::Edges edges = ModeFilters::edgesForWidth(
+        m_slice->mode(), widthHz,
+        {m_slice->diguOffset(), m_slice->diglOffset(), m_slice->rttyShift()});
+    if (acceptsFilterEdges(edges.lo, edges.hi)) {
+        m_slice->setFilterWidth(edges.lo, edges.hi);
     }
-    m_slice->setFilterWidth(lo, hi);
 }
 
 void VfoWidget::saveFilterPresets()
@@ -5820,6 +6326,9 @@ void VfoWidget::setRxApplet(RxApplet* rx)
     // Refresh visuals whenever the RxApplet's mode changes, and once now
     // so the freshly-wired widget shows the current shared state.
     connect(rx, &RxApplet::sqlModeChanged, this, [this](int) {
+        syncSqlVisuals();
+    });
+    connect(rx, &RxApplet::sqlAutoAvailabilityChanged, this, [this]() {
         syncSqlVisuals();
     });
     // Auto-margin updates come from RxApplet (or any sibling VfoWidget
@@ -5926,7 +6435,25 @@ int VfoWidget::agcThresholdMaximum() const
 void VfoWidget::syncSqlVisuals()
 {
     if (!m_sqlBtn || !m_sqlSlider) return;
+    const auto describeThreshold = qScopeGuard([this] {
+        if (!m_exclusiveSquelch || !m_sqlSlider->isEnabled()
+            || (m_slice && m_slice->externalReceiveReplacementActive())) { return; }
+        const auto& sql = *m_exclusiveSquelch;
+        const bool automatic = mirrorsRxAppletSql() && m_rxApplet->sqlMode() == RxApplet::SqlMode::Auto;
+        const QString description = automatic
+            ? tr("Auto squelch: margin in dB above the measured spectrum noise floor (%1)").arg(sql.unit)
+            : tr("Squelch 0–100 maps to %1–%2 %3. A signal above this threshold opens audio.")
+                .arg(sql.offsetDb).arg(sql.offsetDb + 100 * sql.dbPerStep).arg(sql.unit);
+        m_sqlSlider->setToolTip(description);
+        m_sqlSlider->setAccessibleDescription(description);
+    });
+    // An unavailable button carries the registry's mode reason; leave it.
+    const bool sqlReasonOwned = m_filterAvailability
+        && m_filterAvailability->stateOf(m_sqlBtn) == ControlAvailability::Unavailable;
     if (!mirrorsRxAppletSql()) {
+        if (!sqlReasonOwned) {
+            m_sqlBtn->setAccessibleDescription(QString());
+        }
         QSignalBlocker b1(m_sqlBtn), b2(m_sqlSlider);
         if (m_slice && m_slice->externalReceiveReplacementActive()) {
             if (m_sqlBtn->isCheckable()) {
@@ -6026,6 +6553,9 @@ void VfoWidget::syncSqlVisuals()
     }
 
     const auto mode = m_rxApplet->sqlMode();
+    if (!sqlReasonOwned) {
+        m_sqlBtn->setAccessibleDescription(m_rxApplet->sqlButtonAccessibleDescription());
+    }
     // Match RxApplet's three button styles + label so the two surfaces
     // read identically.
     switch (mode) {
@@ -6123,14 +6653,48 @@ void VfoWidget::populateDaxCombo()
 void VfoWidget::setRadioModel(RadioModel* radioModel)
 {
     if (m_radioModel) {
+        releaseTransmitFrequencyCheck();
         disconnect(m_radioModel, &RadioModel::antennaAliasesChanged,
                    this, &VfoWidget::updateAntennaButtons);
         disconnect(m_radioModel, &RadioModel::infoChanged,
                    this, &VfoWidget::populateDaxCombo);
         disconnect(m_radioModel, &RadioModel::connectionStateChanged,
                    this, &VfoWidget::populateDaxCombo);
+        disconnect(m_radioModel, &RadioModel::capabilitiesChanged,
+                   this, nullptr);
+        disconnect(m_radioModel, &RadioModel::transmitFrequencyCheckChanged,
+                   this, nullptr);
     }
+    delete m_filterAvailability;
+    m_filterAvailability = nullptr;
     m_radioModel = radioModel;
+    m_receiveFilterControl = m_radioModel && m_radioModel->isConnected()
+        ? m_radioModel->backendCapabilities().receiveFilterControl : std::nullopt;
+    m_exclusiveSquelch = m_radioModel && m_radioModel->isConnected()
+        ? exclusiveSquelchScaleValue(m_radioModel->backendCapabilities().squelchLevelScale) : std::nullopt;
+    if (m_radioModel) {
+        m_filterAvailability = new ControlAvailabilityRegistry(*m_radioModel, this);
+        const auto supportsSquelch = [this](bool connected, const RadioCapabilities& caps) {
+            if (!m_slice) {
+                return !exclusiveSquelchScale(caps.squelchLevelScale);
+            }
+            return ModeFilters::squelchAvailableInMode(m_slice->mode(),
+                connected ? exclusiveSquelchScale(caps.squelchLevelScale) : nullptr,
+                connected && caps.hasModeIndependentSquelch,
+                m_slice->externalReceiveReplacementActive());
+        };
+        m_filterAvailability->registerWidget(m_sqlBtn,
+            tr("Squelch is unavailable in this receive mode"), supportsSquelch,
+            [this] { return m_slice && m_slice->receiveSquelchOn(); });
+        m_filterAvailability->registerWidget(m_sqlSlider,
+            tr("Enable squelch in a supported receive mode to adjust its threshold"),
+            [this, supportsSquelch](bool connected, const RadioCapabilities& caps) {
+                return supportsSquelch(connected, caps) && (mirrorsRxAppletSql()
+                    ? m_rxApplet->sqlMode() != RxApplet::SqlMode::Off
+                    : m_slice && m_slice->receiveSquelchOn());
+            },
+            [this] { return m_slice && m_slice->receiveSquelchOn(); });
+    }
     if (m_radioModel) {
         connect(m_radioModel, &RadioModel::antennaAliasesChanged,
                 this, &VfoWidget::updateAntennaButtons);
@@ -6139,9 +6703,201 @@ void VfoWidget::setRadioModel(RadioModel* radioModel)
                 this, &VfoWidget::populateDaxCombo);
         connect(m_radioModel, &RadioModel::connectionStateChanged,
                 this, &VfoWidget::populateDaxCombo);
+        connect(m_radioModel, &RadioModel::capabilitiesChanged, this,
+                [this](bool connected, const RadioCapabilities& caps) {
+            m_receiveFilterControl = connected ? caps.receiveFilterControl : std::nullopt;
+            m_exclusiveSquelch = connected ? exclusiveSquelchScaleValue(caps.squelchLevelScale) : std::nullopt;
+            configureRepeaterReverseControl();
+            configureFmToneControls();
+            updateAgcSliderFromSlice();
+            syncFromSlice();
+        });
+        connect(m_radioModel, &RadioModel::transmitFrequencyCheckChanged, this,
+                [this](bool on) {
+            if (usesTransmitFrequencyCheck() && m_fmRevBtn) {
+                m_fmRevBtn->setDown(on);
+            }
+        });
     }
     populateDaxCombo();
     updateAntennaButtons();
+    configureRepeaterReverseControl();
+    configureFmToneControls();
+    updateAgcSliderFromSlice();
+    if (m_slice) {
+        updateModeTab();
+    }
+}
+
+void VfoWidget::configureFmToneControls()
+{
+    if (!m_fmToneContainer || !m_fmToneModeCmb || !m_fmToneValueCmb
+        || !m_fmToneRxValueCmb || !m_fmDtcsCodeCmb
+        || !m_fmDtcsPolarityCmb || !m_fmToneRxContainer
+        || !m_fmDtcsContainer || !m_fmLayout) {
+        return;
+    }
+    const bool connected = m_radioModel && m_radioModel->isConnected();
+    const RadioCapabilities caps = connected
+        ? m_radioModel->backendCapabilities() : RadioCapabilities{};
+    const bool repeaterAvailable = !connected || caps.hasFmRepeaterOffset;
+    if (m_fmOffsetSpin) {
+        m_fmOffsetSpin->setEnabled(repeaterAvailable);
+    }
+    if (m_fmOffsetDown) {
+        m_fmOffsetDown->setEnabled(repeaterAvailable);
+    }
+    if (m_fmSimplexBtn) {
+        m_fmSimplexBtn->setEnabled(repeaterAvailable);
+    }
+    if (m_fmOffsetUp) {
+        m_fmOffsetUp->setEnabled(repeaterAvailable);
+    }
+    const FmTonePresentation presentation = connected
+        ? caps.fmTonePresentation : FmTonePresentation::Legacy;
+    configureCtcssToneComboLabels(
+        m_fmToneValueCmb, presentation, FmToneRole::Tx);
+    configureCtcssToneComboLabels(
+        m_fmToneRxValueCmb, presentation, FmToneRole::Rx);
+    const bool modeEligible = m_slice && hasFmToneControls(m_slice->mode());
+    const QString selected = m_slice
+        ? m_slice->fmToneMode() : m_fmToneModeCmb->currentData().toString();
+    const QStringList modes = presentation == FmTonePresentation::Ctcss
+        ? caps.fmToneModes : legacyFmToneModes();
+    {
+        QSignalBlocker blocker(m_fmToneModeCmb);
+        m_fmToneModeCmb->clear();
+        for (const QString& mode : modes) {
+            m_fmToneModeCmb->addItem(fmToneModeDisplayLabel(mode), mode);
+        }
+        int index = m_fmToneModeCmb->findData(selected);
+        if (index < 0 && presentation != FmTonePresentation::Ctcss) {
+            index = m_fmToneModeCmb->findData(QStringLiteral("off"));
+        }
+        m_fmToneModeCmb->setCurrentIndex(index);
+    }
+    m_fmToneContainer->setVisible(modeEligible
+        && presentation != FmTonePresentation::Hidden);
+    const QString mode = m_fmToneModeCmb->currentData().toString();
+    {
+        const int selectedCode = m_slice ? m_slice->fmDtcsCode()
+                                         : m_fmDtcsCodeCmb->currentData().toInt();
+        QSignalBlocker blocker(m_fmDtcsCodeCmb);
+        m_fmDtcsCodeCmb->clear();
+        const QString role = fmDtcsCodeRole(mode);
+        for (const int code : caps.fmDtcsCodes) {
+            m_fmDtcsCodeCmb->addItem(
+                QStringLiteral("%1: %2")
+                    .arg(role, QStringLiteral("%1").arg(code, 3, 10, QLatin1Char('0'))),
+                code);
+        }
+        const int index = m_fmDtcsCodeCmb->findData(selectedCode);
+        m_fmDtcsCodeCmb->setCurrentIndex(index);
+    }
+    const bool tx = fmToneUsesCtcssTx(mode);
+    const bool rx = fmToneUsesCtcssRx(mode);
+    const bool dtcs = fmToneUsesDtcs(mode);
+    const bool dtcsIsTx = fmToneUsesDtcsTx(mode);
+    m_fmLayout->removeWidget(m_fmToneRxContainer);
+    m_fmLayout->removeWidget(m_fmDtcsContainer);
+    if (dtcsIsTx) {
+        m_fmLayout->insertWidget(1, m_fmDtcsContainer);
+        m_fmLayout->insertWidget(2, m_fmToneRxContainer);
+    } else {
+        m_fmLayout->insertWidget(1, m_fmToneRxContainer);
+        m_fmLayout->insertWidget(2, m_fmDtcsContainer);
+    }
+    {
+        const bool txReverse = m_slice && m_slice->fmDtcsTxReverse();
+        const bool rxReverse = m_slice && m_slice->fmDtcsRxReverse();
+        const QString selectedPolarity = QStringLiteral("%1%2")
+            .arg(txReverse ? QLatin1Char('R') : QLatin1Char('N'))
+            .arg(rxReverse ? QLatin1Char('R') : QLatin1Char('N'));
+        QSignalBlocker blocker(m_fmDtcsPolarityCmb);
+        m_fmDtcsPolarityCmb->clear();
+        for (const FmDtcsPolarityChoice& choice
+             : fmDtcsPolarityChoices(mode, txReverse, rxReverse)) {
+            m_fmDtcsPolarityCmb->addItem(choice.label, choice.value);
+        }
+        m_fmDtcsPolarityCmb->setCurrentIndex(
+            m_fmDtcsPolarityCmb->findData(selectedPolarity));
+    }
+    m_fmToneValueCmb->setVisible(modeEligible
+        && (presentation == FmTonePresentation::Legacy || tx));
+    m_fmToneValueCmb->setEnabled(tx);
+    m_fmToneRxValueCmb->setVisible(modeEligible
+        && presentation == FmTonePresentation::Ctcss && rx);
+    m_fmToneRxValueCmb->setEnabled(rx);
+    m_fmToneRxContainer->setVisible(
+        modeEligible && presentation == FmTonePresentation::Ctcss && rx);
+    m_fmDtcsCodeCmb->setVisible(modeEligible
+        && presentation == FmTonePresentation::Ctcss && dtcs);
+    m_fmDtcsCodeCmb->setEnabled(dtcs);
+    m_fmDtcsPolarityCmb->setVisible(
+        modeEligible && presentation == FmTonePresentation::Ctcss && dtcs);
+    m_fmDtcsPolarityCmb->setEnabled(dtcs);
+    m_fmDtcsContainer->setVisible(
+        modeEligible && presentation == FmTonePresentation::Ctcss && dtcs);
+}
+
+bool VfoWidget::usesTransmitFrequencyCheck() const
+{
+    return m_radioModel && m_radioModel->isConnected()
+        && m_radioModel->backendCapabilities().hasTransmitFrequencyCheck;
+}
+
+void VfoWidget::configureRepeaterReverseControl()
+{
+    if (!m_fmRevBtn) {
+        return;
+    }
+    const bool xfc = usesTransmitFrequencyCheck();
+    if (!xfc) {
+        releaseTransmitFrequencyCheck();
+    }
+    QSignalBlocker blocker(m_fmRevBtn);
+    m_fmRevBtn->setText(xfc ? QStringLiteral("XFC") : QStringLiteral("REV"));
+    m_fmRevBtn->setAccessibleName(xfc ? QStringLiteral("Transmit frequency check")
+                                      : QStringLiteral("Reverse repeater offset"));
+    m_fmRevBtn->setCheckable(!xfc);
+    m_fmRevBtn->setChecked(false);
+    m_fmRevBtn->setDown(xfc && m_radioModel->transmitFrequencyCheck());
+    // REV is gated here, not in configureFmToneControls(), because the button is
+    // two controls: XFC when the backend has hasTransmitFrequencyCheck (momentary,
+    // drives RadioModel::setTransmitFrequencyCheck), otherwise REV (writes
+    // SliceModel::setTxOffsetFreq). The capabilities are independent (IC-7300MK2:
+    // XFC without duplex), so gate on the personality currently shown.
+    const bool connected = m_radioModel && m_radioModel->isConnected();
+    const bool repeaterAvailable = !connected
+        || m_radioModel->backendCapabilities().hasFmRepeaterOffset;
+    m_fmRevBtn->setEnabled(xfc || repeaterAvailable);
+    // AGENTS.md: "unavailable (the radio lacks it, dimmed WITH A STATED
+    // REASON)", and the reason "must reach a screen reader via
+    // accessibleDescription ... because a tooltip is a mouse affordance that is
+    // never announced". Cleared when the control is live so a stale reason
+    // cannot be read out over a working button.
+    m_fmRevBtn->setAccessibleDescription((xfc || repeaterAvailable)
+        ? QString()
+        : QStringLiteral("Unavailable: this radio declares no repeater duplex "
+                         "offset, so there is nothing for REV to reverse."));
+    if (!xfc) {
+        m_xfcHeldByThisControl = false;
+    }
+}
+
+void VfoWidget::releaseTransmitFrequencyCheck()
+{
+    if (!m_xfcHeldByThisControl) {
+        m_xfcHeldByThisControl = false;
+        return;
+    }
+    m_xfcHeldByThisControl = false;
+    if (m_fmRevBtn) {
+        m_fmRevBtn->setDown(false);
+    }
+    if (m_radioModel) {
+        m_radioModel->setTransmitFrequencyCheck(false);
+    }
 }
 
 void VfoWidget::setKiwiSdrManager(KiwiSdrManager* manager)
@@ -6289,6 +7045,13 @@ void VfoWidget::updateAntennaButtons()
 
 bool VfoWidget::eventFilter(QObject* obj, QEvent* event)
 {
+    if (obj == m_fmRevBtn
+        && (event->type() == QEvent::Hide
+            || event->type() == QEvent::HideToParent
+            || event->type() == QEvent::UngrabMouse
+            || event->type() == QEvent::WindowDeactivate)) {
+        releaseTransmitFrequencyCheck();
+    }
     if (obj == m_freqEdit
         && (event->type() == QEvent::ShortcutOverride
             || event->type() == QEvent::KeyPress)) {
@@ -6323,14 +7086,25 @@ bool VfoWidget::eventFilter(QObject* obj, QEvent* event)
     // deliberately not mirrored here: m_freqStack (which holds the edit
     // box) is hidden/mouse-transparent while collapsed and would need
     // real repositioning work to become usable — left as a follow-up.
-    if ((obj == m_freqLabel || obj == m_collapsedFreqLabel) && event->type() == QEvent::MouseButtonPress) {
+    // Event type FIRST: comparing against the QPointer<QLabel> downcasts
+    // through it, which is undefined for the collapsed label's own teardown
+    // events once it is only a QWidget. A parent can destroy that sibling
+    // before this VFO (e.g. after beginDirectEntry() raise()s us), so the
+    // destructor's removeEventFilter() alone does not cover it (#6154).
+    if (event->type() == QEvent::MouseButtonPress
+        && (obj == m_freqLabel || obj == m_collapsedFreqLabel)) {
         auto* me = static_cast<QMouseEvent*>(event);
         if (me->button() == Qt::RightButton && m_slice) {
-            QMenu menu(this);
+            ScopedChildWidget<QMenu> menuOwner(this);
+            QMenu& menu = *menuOwner.get();
             AetherSDR::ThemeManager::instance().applyStyleSheet(&menu, "QMenu { background: {{color.background.0}}; color: {{color.text.primary}}; border: 1px solid #304060; }"
                 "QMenu::item:selected { background: {{color.accent}}; color: {{color.background.0}}; }");
-            menu.addAction("Add Spot", this, [this] {
-                emit addSpotRequested(m_slice->frequency());
+            const QPointer<SliceModel> slice(m_slice);
+            menu.addAction("Add Spot", this, [this, slice] {
+                if (!slice || m_slice != slice.data()) {
+                    return;
+                }
+                emit addSpotRequested(slice->frequency());
             });
             menu.exec(me->globalPosition().toPoint());
             return true;

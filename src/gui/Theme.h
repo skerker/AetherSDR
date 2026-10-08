@@ -1,38 +1,53 @@
 #pragma once
 
-// Application-wide base stylesheet template (RFC #3076 Phase 2).
-//
-// Applied to MainWindow and every top-level floating window so pop-out
-// panels inherit the complete theme instead of falling back to the
-// system palette.  Returned as a {{token.name}} template — caller wraps
-// it in ThemeManager::applyStyleSheet(widget, ...) so the widget gets
-// free live re-theme on theme changes.
-//
-// The 4 call sites are MainWindow, PanFloatingWindow,
-// FloatingContainerWindow, and the applet float window; each owns its
-// own QWidget-derived top-level container.
+// App-wide base stylesheet template (RFC #3076), applied via applyAppTheme() to
+// MainWindow and every top-level floating window so pop-outs inherit the full
+// theme instead of the system palette, with live re-theme.
 
 #include "core/ThemeManager.h"
 
+#include <QEvent>
+#include <QObject>
 #include <QString>
 #include <QWidget>
 
 namespace AetherSDR {
 
+namespace detail {
+
+// Swallows slider HoverEnter/Move/Leave so QSliderPrivate::updateHoverControl()
+// never repaints (#4869). Filters events rather than clearing WA_Hover because
+// QFusionStyle::polish() sets WA_Hover on every QAbstractSlider by type, including
+// via direct style()->polish() calls that emit no Polish/StyleChange event.
+// One process-wide instance; installEventFilter() de-duplicates registrations.
+class SliderHoverSuppressor : public QObject {
+public:
+    static SliderHoverSuppressor& instance()
+    {
+        static SliderHoverSuppressor s;
+        return s;
+    }
+
+protected:
+    bool eventFilter(QObject*, QEvent* event) override
+    {
+        switch (event->type()) {
+        case QEvent::HoverEnter:
+        case QEvent::HoverMove:
+        case QEvent::HoverLeave:
+            return true;
+        default:
+            return false;
+        }
+    }
+};
+
+} // namespace detail
+
 inline QString appStylesheetTemplate()
 {
-    // Token map (post-canonicalisation per docs/theming/canonical-tokens.md):
-    //   #0f0f1a / #111120 / #0a0a14   →  color.background.0
-    //   #1a2a3a / #161626             →  color.background.1
-    //   #203040                       →  color.background.1 (when used as bg)
-    //                                    color.border.strong (when used as border)
-    //   #c8d8e8                       →  color.text.primary
-    //   #00b4d8                       →  color.accent
-    //   #000 (text on accent)         →  hardcoded for now; follow-up to add
-    //                                    color.text.onAccent for proper contrast
-    //                                    tuning in the Phase 4 Light theme.
-    //
-    // Font: 13px hardcoded; Phase 2 follow-up should canonicalise font sizes.
+    // Tokens per docs/theming/canonical-tokens.md. Text on accent (#000) and the
+    // 13px font size are still literals.
     return QStringLiteral(R"(
         QWidget {
             background-color: {{color.background.0}};
@@ -181,18 +196,11 @@ inline QString darkThemeStylesheet()
     return ThemeManager::instance().resolve(appStylesheetTemplate());
 }
 
-// Canonical primary slider style — sub-page fill (Wave-style value
-// indicator) + plain light handle (Vfo-style, no border, no hover).
-// Pre-consolidation the codebase had eight near-duplicate stylesheet
-// constants; this helper is the single source of truth.
-//
-// The `accentToken` parameter controls the sub-page fill colour.
-// Default is `color.slider.foreground` (the canonical slider fill —
-// carved out of `color.accent` so retinting sliders no longer ripples
-// into buttons / borders / focus rings).  Call sites that need a per-
-// slice colour (slicePrimarySliderStyle) or a TX-warning amber pass
-// their own token here — those overrides still work since the helper
-// just substitutes whatever token name is provided.
+// Canonical primary slider style (sub-page fill + plain handle, no hover).
+// `accentToken` sets the fill; default `color.slider.foreground` (separate from
+// `color.accent` so retinting sliders doesn't touch buttons). Per-slice or
+// TX-amber callers pass their own token. Don't add a :hover rule without first
+// removing the hover-event suppression in applyPrimarySliderStyle() (#4869).
 inline QString primarySliderStyleTemplate(const QString& accentToken = QStringLiteral("color.slider.foreground"))
 {
     return QStringLiteral(
@@ -217,39 +225,29 @@ inline QString primarySliderStyleTemplate(const QString& accentToken = QStringLi
     ).arg(accentToken);
 }
 
-// Apply the canonical primary slider style to `slider` and register it
-// for free live re-theme on theme changes.  Use this in place of every
-// previous `slider->setStyleSheet(kSliderStyle)` call.
-//
-// Default `accentToken` is `color.slider.foreground` — the canonical
-// slider fill token, carved out of `color.accent`.  Callers that
-// hard-code a specific token (e.g. `color.accent.warning` for
-// TX-adjacent panels, or `color.slice.a` for per-slice colour) still
-// work — that token name is what gets substituted.  Resolution is
-// widget-aware (walks the slider's container chain), so the applet's
-// scope override naturally reaches the rendered output without any
-// per-call-site change.
+// Apply the primary slider style with live re-theme; `accentToken` as above,
+// resolved widget-aware so applet scope overrides apply. Also suppresses hover
+// repaints (#4869): Fusion sets WA_Hover on every slider, and at a fractional
+// DPR (e.g. 125%/150% UI scale) the no-op hover repaint leaves stale pixels.
+// Consequence: a :hover rule in primarySliderStyleTemplate() would never render.
 inline void applyPrimarySliderStyle(QWidget* slider,
                                     const QString& accentToken = QStringLiteral("color.slider.foreground"))
 {
     if (!slider) return;
     ThemeManager::instance().applyStyleSheet(slider, primarySliderStyleTemplate(accentToken));
+    // One shared filter instance serves every themed slider (and, via
+    // GuardedSlider's own constructor, every GuardedSlider regardless of
+    // styling path — see GuardedSlider.h). installEventFilter() de-dups
+    // internally, so installing it twice on the same widget is harmless.
+    slider->installEventFilter(&detail::SliderHoverSuppressor::instance());
 }
 
-// Toggle button tribes — three semantic colour families that a checkable
-// QPushButton can opt into.  Each tribe resolves to its own triple of
-// {background.checked, foreground.checked, border.checked} tokens at the
-// `color.toggle.<tribe>.*` paths; unchecked + disabled state styling is
-// shared across tribes.  The Accent tribe additionally picks up
-// per-applet background overrides (TX red / RX green / comp amber) via
-// the scope tree — sliders + knobs already follow the same pattern from
-// PR #3188.
-//
-// Convention: pick a tribe based on what the toggled state *means*
-// semantically, not what colour it should be in any particular applet:
-//   - Accent  — generic on/off, mode selectors, surface-tinted by applet
-//   - Success — enable / activate / connect actions (green family)
-//   - Warning — caution / armed / high-stakes actions (amber family)
+// Toggle button tribes: each resolves its checked {background, foreground,
+// border} from `color.toggle.<tribe>.*`; Accent also follows per-applet scope
+// overrides. Choose by what the checked state means:
+//   - Accent  - generic on/off, mode selectors
+//   - Success - enable / activate / connect (green)
+//   - Warning - caution / armed / high-stakes (amber)
 enum class ToggleTribe { Accent, Success, Warning };
 
 inline QLatin1String toggleTribePrefix(ToggleTribe tribe)
@@ -262,17 +260,10 @@ inline QLatin1String toggleTribePrefix(ToggleTribe tribe)
     }
 }
 
-// Canonical primary toggle-button style — single source of truth for
-// checkable QPushButton appearance across the codebase.  The `tribe`
-// parameter picks one of the three checked-state colour families; the
-// unchecked + disabled state come from the shared `color.toggle.*` base
-// tokens regardless of tribe.
-//
-// Resolution is widget-aware (via applyStyleSheet's eventual
-// ThemeManager hook), so call sites inside an applet pick up the
-// per-applet override of `color.toggle.accent.background.checked`
-// automatically — a button in TxApplet renders red, in RxApplet green,
-// in ClientCompApplet amber, just like sliders + knobs.
+// Canonical checkable QPushButton style. `tribe` picks the checked-state colour
+// family; unchecked and disabled come from the shared `color.toggle.*` tokens.
+// Resolution is widget-aware, so the Accent tribe follows per-applet overrides
+// (TxApplet red, RxApplet green, ClientCompApplet amber).
 inline QString primaryToggleButtonStyleTemplate(ToggleTribe tribe = ToggleTribe::Accent)
 {
     const QString prefix(toggleTribePrefix(tribe));

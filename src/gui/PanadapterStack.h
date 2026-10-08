@@ -41,7 +41,15 @@ public:
     SpectrumWidget* spectrum(const QString& panId) const;
     int count() const { return m_pans.size(); }
     QList<PanadapterApplet*> allApplets() const { return m_pans.values(); }
+    // Every pane the stack holds, docked or not, in pan-id order (QMap keys).
+    // NOT the order the panes appear on screen -- for that, see below.
     QStringList panIds() const { return m_pans.keys(); }
+    // The panes in this window's splitter, in the order the layout shows
+    // them: row by row, left to right, top to bottom. Floating panes and
+    // panes lent to the workspace canvas are not in the splitter and are not
+    // listed. (#5750: the span-control fallback wants a pane in the main
+    // window, and the first one the operator sees.)
+    QStringList dockedPanIdsInLayoutOrder() const;
 
     // Active pan (determines which pan the applet column shows controls for)
     QString activePanId() const { return m_activePanId; }
@@ -57,6 +65,24 @@ public:
     void reclaimBandStackPanel();
     void equalizeSizes();
     void rearrangeLayout(const QString& layoutId);
+
+    // Re-assert every panadapter's GPU surface after the stack has been MOVED
+    // within its own window — the applet-panel dock-side flip, which slides
+    // the stack sideways without resizing it.
+    //
+    // The spectrum widgets are native children (WA_NativeWindow) with their
+    // own swapchains.  A sideways move lays out through a transient geometry,
+    // and the swapchain can end up sized for that transient rather than the
+    // final width; the widget then keeps presenting a too-narrow drawable and
+    // the strip it moved into is never painted by anyone.  Continuous
+    // rendering does NOT heal it — the pan redraws every frame into the same
+    // stale drawable.  The native re-realize is macOS (Metal) only, where the
+    // fault was measured; elsewhere this is just the repaint sweep.
+    //
+    // This is the same hazard prepareForTopLevelChange()/refreshAfterReparent()
+    // handle for reparenting between windows, minus the native-window
+    // teardown, which a same-window move does not need.
+    void refreshAfterLayoutShift();
 
     // Automation bridge hook: drive rearrangeLayout directly (or, with an empty
     // id, just report) so tests can exercise the splitter reparent path without
@@ -78,16 +104,11 @@ public:
     Q_INVOKABLE QVariantMap automationFloatDock(const QString& action,
                                                 const QString& panId);
 
-    // Workspace-canvas seam (RFC #4887 phase 4).  The stack stays the pans'
-    // OWNER — creation, wiring, render scheduling, float/dock — and lends
-    // applets to the canvas.  detachForCanvas() only decides WHETHER (a
-    // floating pan stays out; pop-out is its own state and dockPanadapter()
-    // is its way back); the canvas reparents the applet itself, a plain
-    // same-top-level move exactly like applyLayout()'s splitter shuffles —
-    // no GPU dance, which is reserved for real top-level changes (#2495).
-    // returnFromCanvas() re-homes ONE applet into the docked splitter
-    // (addWidget's one-step reparent — never through nullptr, #1344);
-    // callers rebuild the arrangement afterwards via rearrangeLayout().
+    // Workspace-canvas seam (RFC #4887). The stack stays the pans' owner and
+    // lends applets. detachForCanvas() decides WHETHER (floating pans stay
+    // out); the canvas reparents same-top-level, no GPU dance (#2495).
+    // returnFromCanvas() re-homes one applet into the docked splitter (never
+    // via nullptr, #1344); callers then rearrangeLayout().
     PanadapterApplet* detachForCanvas(const QString& panId);
     void returnFromCanvas(const QString& panId, PanadapterApplet* applet);
 
@@ -130,6 +151,10 @@ signals:
     void activePanChanged(const QString& panId);
     void panFloated(const QString& panId);
     void panDocked(const QString& panId);
+    // The set or order of docked panes changed without a pane being added,
+    // removed, floated or docked: a layout rearrange, or a pane lent to or
+    // returned from the workspace canvas. (#5750)
+    void dockedArrangementChanged();
     // Pan lifecycle, for the workspace controller (RFC #4887 phase 4).
     // panAdded fires once per applet however it was created (addPanadapter
     // or an applyLayout branch); panRemoved fires after the applet is
@@ -160,17 +185,10 @@ private:
     QMap<QString, PanFloatingWindow*> m_floatingWindows;
     // Preserve floating state for restored pans that were unavailable this run.
     QSet<QString> m_seenPanIds;
-    // Applets currently ON LOAN to the workspace canvas (RFC #4887 phase 4).
-    // THE INVARIANT EVERY REBUILD PATH MUST HONOR: an applet in this set is
-    // not the stack's to arrange.  rebuildDockedSplitter() and
-    // rearrangeLayout() both enumerate m_pans and reparent what they find —
-    // five call sites reach them (float, dock, the connect-time layout
-    // restore, pan close, the layout dialog), and before this set existed
-    // every one of them silently reclaimed canvas-hosted applets into the
-    // hidden stack: the canvas kept a healthy model while the widget on
-    // screen answered to a splitter, which surfaced as "the pan won't snap,
-    // won't stack, won't restore" (the 8600 field report).  detachForCanvas
-    // lends, returnFromCanvas/floatPanadapter/removePanadapter collect.
+    // Applets on loan to the workspace canvas. Invariant: every rebuild path
+    // (rebuildDockedSplitter(), rearrangeLayout()) must skip these, or it
+    // reclaims canvas-hosted applets into the hidden stack. detachForCanvas
+    // lends; returnFromCanvas/floatPanadapter/removePanadapter collect.
     QSet<QString> m_lentToCanvas;
     QString m_activePanId;
     bool m_shutdownPrepared{false};

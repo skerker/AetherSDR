@@ -3,6 +3,9 @@
 #include <QElapsedTimer>
 #include <QWidget>
 
+class QHideEvent;
+class QShowEvent;
+
 #include "MeterSmoother.h"
 
 class QLabel;
@@ -14,22 +17,10 @@ namespace AetherSDR {
 class AudioEngine;
 class ClientCompKnob;
 
-// "Aetherial Output — RX" — RX-side counterpart of the TX
-// `StripFinalOutputPanel`.  Sits at the very end of the RX panel grid,
-// directly mirroring the TX final-output placement (#2425).
-//
-// The RX path has no brickwall limiter / test-tone / Quindar machinery
-// (that's TX-only), so this panel is intentionally lighter than its
-// TX twin — it shows what the operator can actually see and act on at
-// the RX output stage:
-//
-//   - Live peak / RMS meter computed from the engine's RX scope tap
-//     (post-Pudu, exactly what hits the local audio sink).
-//   - MUTE toggle (master local audio mute).
-//   - BOOST toggle (#1445 soft-knee tanh boost, RX-only).
-//
-// Same visual chrome (frameless title bar) as the rest of the strip
-// panels.
+// "Aetherial Output - RX": RX counterpart of StripFinalOutputPanel at the end of
+// the RX grid (#2425). No limiter/test-tone/Quindar (TX-only). Shows a peak/RMS
+// meter from the RX scope tap (post-Pudu, what reaches the local sink), MUTE
+// (master local mute) and BOOST (#1445 soft-knee tanh, RX-only).
 class StripRxOutputPanel : public QWidget {
     Q_OBJECT
 
@@ -43,6 +34,11 @@ public:
     // engine-driven knobs here, but the strip iterates every panel
     // uniformly when applying a preset.
     void syncControlsFromEngine();
+
+protected:
+    // The animation tick stops while the page is hidden — see PanelTick.h.
+    void showEvent(QShowEvent* ev) override;
+    void hideEvent(QHideEvent* ev) override;
 
 private:
     void onScopeSamples(const QByteArray& monoFloat32, int sampleRate, bool tx);

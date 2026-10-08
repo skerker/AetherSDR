@@ -14,6 +14,30 @@ facing condensation.
 
 ---
 
+## Shared issue workflows
+
+Two shared issue workflows live in `.claude/skills/`, alongside the
+maintainer-facing review skills:
+
+- [`/papercuts`](../.claude/skills/papercuts/SKILL.md) ranks open issues by
+  what can be fixed and demonstrated with the agent automation bridge. It is
+  read-only: start with `/papercuts 15`.
+- [`/fb`](../.claude/skills/fb/SKILL.md) takes a selected issue through root
+  cause, an isolated worktree, implementation, validation, and a draft PR:
+  `/fb ISSUE_NUMBER`.
+
+Use them from Claude Code in this checkout. Other agents can read the linked
+`SKILL.md` files and their bundled resources directly. Each of the two also
+carries an `agents/openai.yaml` manifest, read by the OpenAI Codex CLI to
+expose the skill as a named agent; Claude Code ignores it and reads `SKILL.md`.
+The maintainer-facing `pr-review` and `pr-land` skills have no manifest — they
+are not exposed that way. GitHub access uses the
+contributor's existing `gh` authentication; the papercuts helper also requires
+Bash and `jq` (Git Bash on Windows). Build and live-radio prerequisites apply
+when a chosen fix needs them; neither skill grants permission to transmit.
+
+---
+
 ## Project Architecture
 
 The full architecture is documented in [`AGENTS.md`](../AGENTS.md) including
@@ -34,7 +58,7 @@ changes.
   Booleans are `"True"` / `"False"` strings. The store is SQLite
   (`AetherSDR.db`, RFC #4603) — never include `sqlite3.h` outside
   `SettingsDatabase.cpp`, and **never put a credential in the settings
-  store**: QtKeychain only (see AGENTS.md "Settings Persistence").
+  store**: QtKeychain only (see [`docs/agents/settings.md`](agents/settings.md) "Settings Persistence").
 - **Settings authority is capability-shaped** (RFC #4603): on a radio that
   persists its own state (Flex), never persist or override radio-managed
   settings client-side (frequency, mode, filter, AGC, TX power, per-pan
@@ -43,11 +67,11 @@ changes.
   NOTHING (HL2), the client is its memory — but only for the domains the
   backend declares in `RadioCapabilities::clientSettingsDomains`, and only
   through `RadioStateMemory`'s document, never flat `AppSettings` keys or
-  ad-hoc paths. See AGENTS.md "Settings Authority Policy" for the full rules.
+  ad-hoc paths. See [`docs/agents/settings.md`](agents/settings.md) "Settings Authority Policy" for the full rules.
 - **Radio-scoped config** goes in `radio_settings` feature documents via
   `RadioModel::settingsScope()` — one versioned JSON document per feature
   (Principle V), atomic whole-document writes, write failures surfaced. See
-  AGENTS.md "Radio-Scoped Feature Documents".
+  [`docs/agents/settings.md`](agents/settings.md) "Radio-Scoped Feature Documents".
 
 ### Working in MainWindow
 
@@ -129,8 +153,13 @@ Key files: `Slice.cs`, `Radio.cs`, `Panadapter.cs`, `Transmit.cs`,
 
 ### Widget Guidelines
 
-- All GUI follows the dark theme: `#0f0f1a` background, `#c8d8e8` text,
-  `#00b4d8` accent, `#203040` borders.
+- Every colour resolves through a `ThemeManager` token; never hard-code a
+  colour literal. Read
+  [`docs/style/theme-style-guide.md`](style/theme-style-guide.md) first —
+  CI's hardcoded-colour ratchet fails a PR that raises the count above its
+  base branch. New or reworked surfaces follow the visual canon in
+  [`docs/style/aethersdr-style-guide.md`](style/aethersdr-style-guide.md).
+  The full rule set is in [`docs/agents/gui.md`](agents/gui.md).
 - Use `GuardedSlider` (from `GuardedSlider.h`) instead of `QSlider` — it
   prevents wheel events from leaking to parent widgets.
 - Use `GuardedComboBox` for combo boxes in scrollable areas.
@@ -138,21 +167,13 @@ Key files: `Slice.cs`, `Radio.cs`, `Panadapter.cs`, `Transmit.cs`,
 
 ### Optional Dependencies
 
-Features gated behind compile-time flags:
+See [BUILD-OPTIONS.md](../BUILD-OPTIONS.md) for the CMake switches, defaults,
+platform requirements and dependency detection that control optional features.
 
-| Flag | Package | Feature |
-|------|---------|---------|
-| `HAVE_SERIALPORT` | `Qt6::SerialPort` | FlexControl, serial PTT/CW |
-| `HAVE_WEBSOCKETS` | `Qt6::WebSockets` | FreeDV Reporter, TCI server |
-| `HAVE_KEYCHAIN` | `Qt6Keychain` | SmartLink credential persistence |
-| `HAVE_MIDI` | Bundled RtMidi | MIDI controller mapping |
-| `HAVE_RADE` | Bundled RADE/Opus | FreeDV digital voice |
-| `HAVE_SPECBLEACH` | libspecbleach (clang-cl on Win) | NR4 spectral noise reduction |
-| `HAVE_DFNR` | Bundled DeepFilterNet3 | DFNR neural noise reduction |
-| `HAVE_BNR` | NVIDIA NIM container | GPU noise removal |
-| `HAVE_MQTT` | Bundled libmosquitto | MQTT applet |
-
-Use `#ifdef HAVE_*` guards. Features must degrade gracefully when unavailable.
+CMake generates compiler definitions such as `HAVE_SERIALPORT`,
+`HAVE_WEBSOCKETS` and `HAVE_DEEPFIST` from the resulting configuration; they are
+not user-facing CMake switches. Use the corresponding `#ifdef` guards in code.
+Features must degrade gracefully when unavailable.
 
 ### Commit Messages
 

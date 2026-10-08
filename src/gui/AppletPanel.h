@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/AudioEngine.h"
+#include "core/backends/RadioCapabilities.h"
 
 #include <QWidget>
 #include <QMap>
@@ -35,12 +36,17 @@ class DemoApplet;
 class AcomApplet;
 class SpeApplet;
 class VkampApplet;
+class Kpa1500Applet;
+class LpMeterApplet;
+class Ctr2ProxyApplet;
 class TxApplet;
 class PhoneCwApplet;
+enum class MicMeterSessionState;
 class PhoneApplet;
 class EqApplet;
 class WaveApplet;
 class AetherClockApplet;
+class WfmApplet;
 class MiniPanApplet;
 class ClientEqApplet;
 class ClientCompApplet;
@@ -58,6 +64,7 @@ class TciApplet;
 class DaxIqApplet;
 class AntennaGeniusApplet;
 class ShackSwitchApplet;
+class GreenHeronApplet;
 class MeterApplet;
 class ProfileSwitcherApplet;
 class HealthApplet;
@@ -104,12 +111,16 @@ public:
     AcomApplet*   acomApplet()    { return m_acomApplet; }
     SpeApplet*    speApplet()     { return m_speApplet; }
     VkampApplet*  vkampApplet()   { return m_vkampApplet; }
+    Kpa1500Applet* kpa1500Applet() { return m_kpa1500Applet; }
+    LpMeterApplet* lpMeterApplet() { return m_lpMeterApplet; }
+    Ctr2ProxyApplet* ctr2ProxyApplet() { return m_ctr2ProxyApplet; }
     TxApplet*       txApplet()       { return m_txApplet; }
     PhoneCwApplet*  phoneCwApplet()  { return m_phoneCwApplet; }
     PhoneApplet*    phoneApplet()    { return m_phoneApplet; }
     EqApplet*       eqApplet()       { return m_eqApplet; }
     WaveApplet*     waveApplet() const { return m_waveApplet; }
     AetherClockApplet* aetherClockApplet() const { return m_aetherClockApplet; }
+    WfmApplet* wfmApplet() const { return m_wfmApplet; }
     MiniPanApplet*  miniPanApplet() const { return m_miniPanApplet; }
     // Phase 7.1: each side has its own CEQ applet — clientEqTxApplet()
     // is the original "ceq" tile bound to TX, clientEqRxApplet() is
@@ -150,6 +161,9 @@ public:
     DaxIqApplet*    daxIqApplet()    { return m_daxIqApplet; }
     AntennaGeniusApplet* agApplet()  { return m_agApplet; }
     ShackSwitchApplet*   ssApplet()  { return m_ssApplet; }
+    // The GHE tile owns its own GreenHeronModel — see GreenHeronApplet.h for
+    // why this one is not handed a model by MainWindow.
+    GreenHeronApplet*    greenHeronApplet() const { return m_greenHeronApplet; }
     MeterApplet*  meterApplet()  { return m_meterApplet; }
     ProfileSwitcherApplet* profileSwitcherApplet() { return m_profApplet; }
     HealthApplet* healthApplet() { return m_healthApplet; }
@@ -183,6 +197,18 @@ public:
     // VK3AMP all present at once, each fully independent hardware.
     void setVkampVisible(bool visible);
 
+    // Show/hide the KPA1500 button and applet based on a direct Elecraft
+    // KPA1500 connection (#4097). Independent of every other amplifier
+    // applet for the same reason setVkampVisible is: these are separate,
+    // simultaneously-present pieces of hardware, not alternatives.
+    void setKpa1500Visible(bool visible);
+
+    // Show/hide the LP100 button and applet from the direct LP-100A connection,
+    // independent of any amplifier applet. Gated on the connection like
+    // ACOM/SPE/VKAMP; LpMeterConnection keeps the link when the meter stops
+    // answering (the tile shows NO DATA), so only an absent transport hides it.
+    void setLpMeterVisible(bool visible);
+
     // Show/hide the AG button and applet based on Antenna Genius presence.
     void setAgVisible(bool visible);
 
@@ -203,8 +229,9 @@ public:
     void setProfilesVisible(bool visible);
     // Capability passthrough to the Phone/CW applet — same shape as above.
     void setSelectableMicInputs(bool selectable);
-    void setMicLevelMeterAvailable(bool available);
+    void setMicLevelMeterState(MicMeterSessionState session, bool available);
     void setRadioFilterWidths(const QList<int>& widthsHz);
+    void setRadioFilterControl(const RxFilterControl& control);
 
     // Show/hide the DAX and DAX-IQ buttons and applets based on whether the
     // connected radio produces per-slice audio / per-pan IQ streams
@@ -241,6 +268,7 @@ public:
     // hide entirely on RX.
     enum class PooDooSide { Tx, Rx };
     void setPooDooActiveSide(PooDooSide side);
+    void setTxAudioPathBlocked(bool blocked);
 
     // Reorder the TX DSP sub-containers inside the "tx_dsp" parent to
     // mirror the CHAIN's current stage order.  Call whenever the user
@@ -318,17 +346,12 @@ private:
     int dropIndexFromY(int localY) const;
     void setScrollHandleActive(bool active);
 
-    // ── Button-bar (active + drawer + hidden) ────────────────────────────────
-    //
-    // Bar model — three buckets, all driven by m_buttonOrder + m_hiddenButtons:
-    //
-    //   * Active (top kFavoriteCount entries of m_buttonOrder that aren't in
-    //     m_hiddenButtons) → favorites row
-    //   * Drawer (remaining shown entries, in m_buttonOrder order) → grid below
-    //   * Hidden (m_hiddenButtons) → not in the bar at all; their applets
-    //     are forced off (Applet_<id>=False) when first moved here
-    //
-    // Reordering in the picker updates m_buttonOrder; the drawer follows.
+    // Button bar buckets, driven by m_buttonOrder + m_hiddenButtons:
+    //   * Active: first kFavoriteCount shown entries → favourites row
+    //   * Drawer: remaining shown entries, in order → grid below
+    //   * Hidden: not in the bar; applets forced off (Applet_<id>=False) when
+    //     first moved here
+    // Picker reordering updates m_buttonOrder; the drawer follows.
     struct BarButton {
         QString      id;     // canonical persistence id (e.g. "P/CW")
         QString      label;  // bar label (e.g. "P/CW", "VUDU")
@@ -366,6 +389,7 @@ private:
                                    const QString& appletKey,
                                    bool available);
     void markHardwareConditional(const QString& id);
+    void setWfmAvailable(bool available);
     void persistVuMeterSettings() const;
     void showStandardMeterContextMenu(QWidget* source, const QPoint& position);
     static const int kFavoriteCount = 5;
@@ -395,6 +419,10 @@ private:
     SpeApplet*   m_speApplet{nullptr};
     QPushButton* m_speBtn{nullptr};
     VkampApplet* m_vkampApplet{nullptr};
+    Kpa1500Applet* m_kpa1500Applet{nullptr};
+    QPushButton* m_kpa1500Btn{nullptr};
+    LpMeterApplet* m_lpMeterApplet{nullptr};
+    Ctr2ProxyApplet* m_ctr2ProxyApplet{nullptr};
     QPushButton* m_vkampBtn{nullptr};
     TxApplet*      m_txApplet{nullptr};
     PhoneCwApplet* m_phoneCwApplet{nullptr};
@@ -402,6 +430,7 @@ private:
     EqApplet*      m_eqApplet{nullptr};
     WaveApplet*    m_waveApplet{nullptr};
     AetherClockApplet* m_aetherClockApplet{nullptr};
+    WfmApplet* m_wfmApplet{nullptr};
     MiniPanApplet* m_miniPanApplet{nullptr};
     ClientEqApplet* m_clientEqTxApplet{nullptr};
     ClientEqApplet* m_clientEqRxApplet{nullptr};
@@ -417,6 +446,7 @@ private:
     ClientReverbApplet* m_clientReverbApplet{nullptr};
     ClientRxDspApplet*  m_clientRxDspApplet{nullptr};
     ClientChainApplet* m_clientChainApplet{nullptr};
+    bool m_txAudioPathBlocked{false};
     CatControlApplet* m_catControlApplet{nullptr};
     DaxApplet*     m_daxApplet{nullptr};
     CwNeuralApplet* m_cwNeuralApplet{nullptr};
@@ -424,6 +454,7 @@ private:
     DaxIqApplet*   m_daxIqApplet{nullptr};
     AntennaGeniusApplet* m_agApplet{nullptr};
     ShackSwitchApplet*   m_ssApplet{nullptr};
+    GreenHeronApplet*    m_greenHeronApplet{nullptr};
     MeterApplet* m_meterApplet{nullptr};
     ProfileSwitcherApplet* m_profApplet{nullptr};
     HealthApplet* m_healthApplet{nullptr};

@@ -136,10 +136,31 @@ void ContainerWidget::setContainerVisible(bool visible)
     emit visibilityChanged(visible);
 }
 
+void ContainerWidget::setVisible(bool visible)
+{
+    m_requestedVisible = visible;
+    QWidget::setVisible(visible && (!m_presentationManaged || m_visible)
+        && (m_presentationAvailable || isFloating()));
+}
+
+void ContainerWidget::setPresentationAvailable(bool available)
+{
+    if (m_presentationManaged && available == m_presentationAvailable) { return; }
+    m_presentationManaged = true;
+    m_presentationAvailable = available;
+    // Bypass the override: suppressing presentation must not become a new
+    // explicit hide request. Ancestor hide/show similarly leaves intent alone.
+    QWidget::setVisible(m_visible && m_requestedVisible && (available || isFloating()));
+    emit presentationAvailabilityChanged(available);
+}
+
 void ContainerWidget::setDockMode(DockMode mode)
 {
     if (mode == m_dockMode) return;
     m_dockMode = mode;
+    if (!m_presentationAvailable) {
+        QWidget::setVisible(m_visible && m_requestedVisible && isFloating());
+    }
     if (m_titleBar) {
         // Order matters: setFloatingState() repaints the docked/floating
         // visuals, and setCanvasState() overrides them only when the new
@@ -163,16 +184,9 @@ void ContainerWidget::applyWidthPolicyTo(QWidget* child)
 {
     if (!child) return;
     if (m_dockMode == DockMode::Floating || m_dockMode == DockMode::Canvas) {
-        // Remember the docked cap once, then lift it so width-capped
-        // applets fill the floating window instead of hugging the left
-        // edge.  Uncapped content (maximumWidth == QWIDGETSIZE_MAX) is a
-        // no-op here. (#3451)
-        //
-        // Canvas takes the same branch for the same reason: a canvas item is
-        // sized by the operator's rect, not by the panel's fixed column
-        // width, so a container that kept its docked cap would leave dead
-        // space to the right of its own content inside the rect the operator
-        // drew — the exact #3451 symptom, one placement mode over.
+        // Floating and canvas: remember the docked width cap once, then lift it so
+        // width-capped applets fill the window / operator-drawn rect instead of leaving
+        // dead space (#3451). No-op for uncapped content.
         if (!m_savedMaxWidths.contains(child))
             m_savedMaxWidths.insert(child, child->maximumWidth());
         child->setMaximumWidth(QWIDGETSIZE_MAX);

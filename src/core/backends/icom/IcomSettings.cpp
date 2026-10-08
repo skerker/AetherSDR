@@ -67,6 +67,18 @@ void IcomSettings::writeObj(const QJsonObject& obj)
     s.save();
 }
 
+bool IcomSettings::wakeOnConnect()
+{
+    return readObj().value(QStringLiteral("wakeOnConnect")).toBool(false);
+}
+
+void IcomSettings::setWakeOnConnect(bool enabled)
+{
+    QJsonObject object = readObj();
+    object.insert(QStringLiteral("wakeOnConnect"), enabled);
+    writeObj(object);
+}
+
 QString IcomSettings::username()
 {
     const QString stored = readObj().value(QLatin1String(kFieldUsername)).toString();
@@ -124,6 +136,35 @@ void IcomSettings::setPorts(quint16 control, quint16 serial, quint16 audio)
     writeObj(obj);
 }
 
+quint16 IcomSettings::defaultBasePort()
+{
+    return icom::kControlPort;
+}
+
+quint16 IcomSettings::maximumBasePort()
+{
+    return 65533;
+}
+
+bool IcomSettings::usesDefaultPorts()
+{
+    return controlPort() == icom::kControlPort
+        && serialPort() == icom::kSerialPort
+        && audioPort() == icom::kAudioPort;
+}
+
+void IcomSettings::setBasePort(quint16 basePort)
+{
+    if (basePort == 0 || basePort > maximumBasePort()) {
+        setPorts(icom::kControlPort, icom::kSerialPort, icom::kAudioPort);
+        return;
+    }
+
+    setPorts(basePort,
+             static_cast<quint16>(basePort + 1),
+             static_cast<quint16>(basePort + 2));
+}
+
 std::uint8_t IcomSettings::civAddress()
 {
     const int v = readObj().value(QLatin1String(kFieldCivAddress)).toInt(IcomSettings::kDefaultCivAddress);
@@ -143,21 +184,10 @@ IcomSettings::CivSelection IcomSettings::civSelection()
     if (sel == QLatin1String(kSelCustom))
         return CivSelection::Custom;
 
-    // MIGRATION — a settings file written before this field existed.
-    //
-    // Back then the connect panel had one free-text hex box, and it wrote
-    // kDefaultCivAddress whenever that box was left BLANK. So a stored 0xA4 is
-    // very nearly always "the operator never touched this", not "the operator
-    // deliberately chose the IC-705": choosing it required typing A4 into a
-    // field whose placeholder already said the default was A4.
-    //
-    // Reading it as Auto is also the safe direction of the two. On an actual
-    // IC-705 auto-detect resolves to 0xA4 and nothing changes; on any other
-    // radio it repairs the exact silent-dead-session this feature exists to
-    // cure. Reading it as a pin would carry that dead session forward.
-    //
-    // Anything OTHER than the default had to be typed, so it migrates to Custom
-    // and keeps pinning the destination.
+    // Migration for files written before this field existed: the old free-text box
+    // stored kDefaultCivAddress when left blank, so a stored 0xA4 almost always
+    // means "untouched" and migrates to Auto (on a real IC-705 auto-detect still
+    // resolves 0xA4). Any other value was typed, so it migrates to Custom.
     if (!obj.contains(QLatin1String(kFieldCivAddress)))
         return CivSelection::Auto;
     return civAddress() == kDefaultCivAddress ? CivSelection::Auto : CivSelection::Custom;

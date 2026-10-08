@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tnc/Ax25.h"
+#include "core/TxCoordinator.h"
 #include "core/tnc/Ax25LinkTiming.h"
 
 #include <QByteArray>
@@ -14,24 +15,15 @@ namespace AetherSDR {
 class Ax25Connection;
 class HeardList;
 
-// A simple, reliable connected-mode AX.25 *client* terminal — the calling-side
-// counterpart of the PmsMailbox (which is the answering side). It drives an
-// Ax25Connection in the outbound role so an operator can CONNECT to a 1200-baud
-// VHF packet BBS, converse with it, and disconnect, with the same retransmit /
-// error-correction / T1 timer machinery the mailbox uses.
-//
-// Two input modes, exactly like a classic hardware TNC:
-//   * Command mode  — typed lines are interpreted as terminal commands
-//                     (CONNECT, BYE, MYCALL, HELP, ...). This is the prompt.
-//   * Converse mode — entered once a link is up; typed lines are sent to the
-//                     peer as I-frame data (CR-terminated, with local echo).
-// An escape character (default '~' on a line by itself) drops from converse
-// back to command mode WITHOUT disconnecting, so the operator can issue another
-// command (e.g. BYE, or CONNECT to a different station).
-//
-// It is RF-agnostic and Qt::Network-free, exactly like PmsMailbox: feed it every
-// decoded frame via onAirFrame() and key whatever it emits on transmitFrame().
-// Deliberately no ANSI/VT100 handling — line in, line out, kept simple.
+// Connected-mode AX.25 client terminal, the calling-side counterpart of
+// PmsMailbox, driving an Ax25Connection outbound to a 1200-baud packet BBS.
+//   * Command mode  — typed lines are terminal commands (CONNECT, BYE, MYCALL,
+//                     HELP, ...).
+//   * Converse mode — once linked, lines go to the peer as I-frames
+//                     (CR-terminated, local echo).
+// An escape ('~' alone on a line by default) returns to command mode without
+// disconnecting. RF-agnostic like PmsMailbox (onAirFrame()/transmitFrame());
+// no ANSI handling.
 class TncTerminal : public QObject {
     Q_OBJECT
 
@@ -39,6 +31,7 @@ public:
     enum class Mode { Command, Converse };
 
     explicit TncTerminal(QObject* parent = nullptr);
+    void setTransmitProgram(const TxCoordinator::Request& input) { m_txProgram = input; }
     ~TncTerminal() override;
 
     // Our station callsign-SSID (the address outbound connects originate from).
@@ -131,7 +124,8 @@ public slots:
 
 signals:
     // A raw AX.25 frame (address..info, no FCS) to key on the air.
-    void transmitFrame(const QByteArray& rawNoFcs);
+    void transmitFrame(const QByteArray& rawNoFcs,
+                       const AetherSDR::TxCoordinator::Request& input);
 
     // Text to append to the terminal transcript pane. Already newline-normalised
     // (peer CR / CRLF collapsed to '\n'); never carries a trailing prompt.
@@ -149,6 +143,7 @@ signals:
     void connectRequested(const QString& peer);
 
 private:
+    TxCoordinator::Request m_txProgram;
     void onLinkConnected(const ax25::Address& peer);
     void onLinkDisconnected(const ax25::Address& peer, bool byPeer);
     void onLinkConnectFailed(const ax25::Address& peer, const QString& reason);

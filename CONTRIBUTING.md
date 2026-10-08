@@ -26,15 +26,22 @@ the RFC process for significant changes.
 
 ## Reporting Bugs
 
-- Use the **lightbulb button** in AetherSDR's title bar for AI-assisted bug
-  reports, or open a [GitHub issue](https://github.com/aethersdr/AetherSDR/issues/new) directly.
+- Use **Help → File an Issue...** or **Help → Submit your Idea... 💡** in
+  AetherSDR for AI-assisted bug reports, or open a
+  [GitHub issue](https://github.com/aethersdr/AetherSDR/issues/new) directly.
 - Include: OS/distro, AetherSDR version, radio model, firmware version.
-- Attach logs (`~/.config/AetherSDR/aethersdr.log`) or use Help → Support → Send to Support.
+- Attach the log. Logs live in `AetherSDR/logs/` under the config directory
+  (`~/.config/AetherSDR/logs/` on Linux, `~/Library/Preferences/AetherSDR/logs/`
+  on macOS, `%LOCALAPPDATA%\AetherSDR\logs\` on Windows): one timestamped
+  `aethersdr-YYYYMMDD-HHMMSS.log` per launch. Attach the newest one; on Linux
+  and macOS `aethersdr.log` is a link to it. **Help → Support & Diagnostics...** turns on extra logging per
+  module and opens the log folder; **Help → File an Issue...** packages the logs
+  and settings into a support bundle you can drag into the issue.
 - Check existing issues first to avoid duplicates.
 
 ## Suggesting Features
 
-- Open a GitHub issue or use the lightbulb button for an AI-assisted feature request.
+- Open a GitHub issue or use **Help → Submit your Idea... 💡** for an AI-assisted feature request.
 - Describe the problem you're solving, not just the solution.
 - Reference SmartSDR behavior where applicable — screenshots help.
 - One feature per issue.
@@ -52,12 +59,11 @@ that matches our conventions.
 2. **Read the [AetherSDR Constitution](CONSTITUTION.md).** (Canonical
    source: [`.specify/memory/constitution.md`](.specify/memory/constitution.md);
    the root [`CONSTITUTION.md`](CONSTITUTION.md) is a byte-identical
-   mirror.) **14 principles total** (constitution v2.0.0): 7
-   AetherSDR-specific (FlexLib authority, radio-authoritative live
-   state, radio-persistable settings, clean-room contributions,
-   per-feature config ownership, transmit-on-intent, boundary input
-   validation) + 7 defensive engineering principles adopted from
-   Cisco's
+   mirror.) Its principles are AetherSDR-specific (FlexLib authority,
+   radio-authoritative live state, radio-persistable settings,
+   clean-room contributions, per-feature config ownership,
+   transmit-on-intent, boundary input validation) plus defensive
+   engineering principles adopted from Cisco's
    [Foundry Constitution](https://github.com/CiscoDevNet/foundry-security-spec/blob/main/constitution.md)
    (Evidence Over Assertion, Surface Only What Survives, Atomic Claims,
    Demonstrated Fixes, Infra Sandbox, Operator Outranks Agents, Atomic
@@ -96,9 +102,9 @@ GitHub on every tier — your own PR always needs review from someone else.
 
 | Tier | Paths | Who can approve |
 |---|---|---|
-| **Source, tests & documentation (Tier 3)** | Everything not listed below — all of `src/`, **including the whole of `MainWindow`** — plus `tests/`, `docs/`, and `resources/`, **markdown included** (so `docs/DEVELOPER-GUIDE.md` and the in-app help text under `resources/help/` are both here). Two files under `docs/` are carved back to Tier 1 below | `@aethersdr/reviewers` (@ten9876, @jensenpat, @NF0T, @rfoust, @chibondking) |
-| **Infrastructure (Tier 2)** | `*.md` *outside* `docs/`, `resources/`, and `tests/` (`README.md`, `CHANGELOG.md`, `ROADMAP.md`, `plugins/*/README.md`, and the AI-instruction files `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md`), `.claude/commands/`, `CMakeLists.txt`, `THIRD_PARTY_LICENSES`, the routine `.github/workflows/`, `.github/dependabot.yml`, `.github/docker/`, `.github/ISSUE_TEMPLATE/` | `@aethersdr/infrastructure` (@ten9876, @jensenpat, @rfoust) |
-| **Maintainer-only (Tier 1)** | Governance docs (`CONSTITUTION.md` **and its canonical copy `.specify/memory/constitution.md`**, `GOVERNANCE.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`), security/compliance (`SECURITY*`, `.github/CODEOWNERS`, `.github/codeql/`, `docs/RELEASE-SIGNING-KEY.pub.asc` and the `docs/VERIFYING-RELEASES.md` that publishes its fingerprint), and the workflows that hold release secrets, feed bytes into a signed artifact, or form part of the CodeQL scanner's trust chain (`sign-release.yml`, `codeql.yml`, `macos-dmg.yml`, `windows-installer.yml`, `appimage.yml`, `docker-ci-image.yml`, `streamdeck-plugins.yml`) | `@aethersdr/maintainers` (@ten9876) |
+| **Source, tests & documentation (Tier 3)** | Everything not listed below — all of `src/`, **including the whole of `MainWindow`** — plus `tests/`, `docs/`, and `resources/`, **markdown included** (so `docs/DEVELOPER-GUIDE.md` and the in-app help text under `resources/help/` are both here). `docs/agents/` is carved out to Tier 2, and two files under `docs/` are carved back to Tier 1 below | `@aethersdr/reviewers` (@ten9876, @jensenpat, @NF0T, @rfoust, @chibondking, @Ozy311, @K5PTB, @nigelfenton) |
+| **Infrastructure (Tier 2)** | `*.md` *outside* `docs/`, `resources/`, and `tests/` (`README.md`, `CHANGELOG.md`, `ROADMAP.md`, and the AI-instruction files `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md`), the agent guide's sub-docs under `docs/agents/`, `.claude/commands/`, `CMakeLists.txt`, `THIRD_PARTY_LICENSES`, the routine `.github/workflows/`, `.github/dependabot.yml`, `.github/docker/`, `.github/ISSUE_TEMPLATE/` | `@aethersdr/infrastructure` (@ten9876, @jensenpat, @rfoust) |
+| **Maintainer-only (Tier 1)** | Governance docs (`CONSTITUTION.md` **and its canonical copy `.specify/memory/constitution.md`**, `GOVERNANCE.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`), security/compliance (`SECURITY*`, `.github/CODEOWNERS`, `.github/codeql/`, `docs/RELEASE-SIGNING-KEY.pub.asc` and the `docs/VERIFYING-RELEASES.md` that publishes its fingerprint), and the workflows that hold release secrets, feed bytes into a signed artifact, or form part of the CodeQL scanner's trust chain (`sign-release.yml`, `codeql.yml`, `macos-dmg.yml`, `windows-installer.yml`, `appimage.yml`, `docker-ci-image.yml`) | `@aethersdr/maintainers` (@ten9876) |
 
 The maintainer-only tier is deliberately narrow: it covers the rules of the
 project and the paths that can compromise a signed release. Everything that
@@ -169,8 +175,8 @@ policy, and how to recover a red `main` — see
 
 ## AI-Assisted Feature Requests
 
-**You don't need to be a developer to contribute.** Click the lightbulb
-button in AetherSDR's title bar — it copies a structured prompt to your
+**You don't need to be a developer to contribute.** Choose **Help → Submit
+your Idea... 💡** in AetherSDR — it copies a structured prompt to your
 clipboard and opens your choice of AI assistant. Describe your idea in
 plain English, and the AI generates a well-structured GitHub issue.
 

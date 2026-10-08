@@ -15,11 +15,15 @@
 #include "AcomApplet.h"
 #include "SpeApplet.h"
 #include "VkampApplet.h"
+#include "Kpa1500Applet.h"
+#include "LpMeterApplet.h"
+#include "Ctr2ProxyApplet.h"
 #include "TxApplet.h"
 #include "PhoneCwApplet.h"
 #include "PhoneApplet.h"
 #include "EqApplet.h"
 #include "AetherClockApplet.h"
+#include "WfmApplet.h"
 #include "MiniPanApplet.h"
 #include "WaveApplet.h"
 #include "ClientEqApplet.h"
@@ -38,6 +42,7 @@
 #include "DaxIqApplet.h"
 #include "AntennaGeniusApplet.h"
 #include "ShackSwitchApplet.h"
+#include "GreenHeronApplet.h"
 #include "MeterApplet.h"
 #include "ProfileSwitcherApplet.h"
 #include "HealthApplet.h"
@@ -152,10 +157,16 @@ MeterSettings::Snapshot loadVuMeterSettings()
     return settings;
 }
 
+// Padding at the bottom of the scroll range so the last docked tile never rests
+// flush against the viewport edge. Belongs to the scroll area because overflow
+// depends on which tiles are open; when content is shorter, addStretch(1)
+// below absorbs the slack.
+constexpr int kStackBottomMargin = 8;
+
 } // namespace
 
 const QStringList AppletPanel::kDefaultOrder = {
-    "PWR", "RX", "TUN", "AMP", "TX", "PHNE", "P/CW", "EQ", "WAVE", "TXDSP", "CAT", "DAX", "TCI", "IQ", "MTR", "PROF", "KSDR", "HLTH", "AG", "SS", "CLOCK"
+    "PWR", "RX", "WFM", "TUN", "AMP", "TX", "PHNE", "P/CW", "EQ", "WAVE", "TXDSP", "CAT", "DAX", "TCI", "IQ", "MTR", "PROF", "KSDR", "HLTH", "AG", "SS", "GHE", "CLOCK"
 };
 
 // ── Drop-aware scroll area ──────────────────────────────────────────────────
@@ -272,26 +283,35 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
     // an applet inherit applet.<name> → applet → root.
     theme::setContainer(this, QStringLiteral("applet"));
 
+    // The docked panel paints its own background, and must.  MainWindow's
+    // paintEvent is the only other thing filling a region the widget tree
+    // leaves bare, and Qt excludes native children (the QRhi panadapter) from
+    // that backdrop entirely — so during a dock flip the strip a panel slides
+    // over can be left unpainted.  The window is opaque now (WindowChrome
+    // clears WA_TranslucentBackground), so that strip shows stale pixels
+    // rather than the desktop, but it is the same hole.  The FLOATING panel
+    // has always been opaque (its window sets WA_StyledBackground); this
+    // gives the docked panel the same guarantee instead of leaving it
+    // dependent on whatever happens to be painted underneath.
+    setObjectName(QStringLiteral("appletPanel"));
+    setAttribute(Qt::WA_StyledBackground, true);
+    // Scoped to this widget by object name so the rule cannot cascade into
+    // the applets, which own their own surfaces.
+    ThemeManager::instance().applyStyleSheet(
+        this,
+        QStringLiteral("QWidget#appletPanel { background: {{color.background.app}}; }"));
+
     setFixedWidth(260);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
 
-    // ── Top button bar: single favorites row + push-down drawer ────────────
-    //
-    // The bar shows kFavoriteCount (5) user-chosen "favorite" buttons in a
-    // single row, with a 6th slot acting as the drawer toggle (▾/▴).
-    // Toggling the drawer reveals/hides a grid containing every other
-    // bar button.  Right-click any bar button to open the picker dialog.
-    //
-    // Construction: every bar button (LCK, VU, RX, …) is created with the
-    // drawer's widget+layout as its rowParent/rowLayout.  Once all are
-    // registered, applyBarLayout() lifts the favorites out of the drawer
-    // into m_favRow.  See registerBarButton() / applyBarLayout().
-    //
-    // All colour values resolved through ThemeManager so the bar
-    // re-themes live alongside the rest of the UI.
+    // Top button bar: kFavoriteCount (5) favourite buttons in one row plus a
+    // drawer toggle (▾/▴) revealing every other button; right-click opens the
+    // picker. Every button is created in the drawer; applyBarLayout() then lifts
+    // the favourites into m_favRow (see registerBarButton()). Colours resolve
+    // through ThemeManager so the bar re-themes live.
     const QString kBarContainerStyle =
         QStringLiteral("QWidget#barContainer { background: {{color.background.0}}; }");
     const QString kBarBtnStyle =
@@ -470,7 +490,7 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
     };
     auto* container = new FlexContainer;
     m_stack = new QVBoxLayout(container);
-    m_stack->setContentsMargins(0, 0, 0, 0);
+    m_stack->setContentsMargins(0, 0, 0, kStackBottomMargin);
     m_stack->setSpacing(0);
     // Stretch factor 1 (not the default 0) so all surplus vertical space is
     // routed to this trailing spacer.  With a factor-0 spacer, Qt distributes
@@ -609,6 +629,9 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
                 // lowering = hide it.  The manager owns the window
                 // so we just toggle the container's visibility.
                 if (c->isFloating()) {
+                    if (c->isPresentationManaged()) {
+                        c->setContainerVisible(checked);
+                    }
                     if (auto* w = c->window())
                         w->setVisible(checked);
                     return;
@@ -736,6 +759,16 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
     m_rxApplet = new RxApplet;
     m_appletOrder.append(makeEntry("RX", "RX Controls", m_rxApplet, true, m_drawer, m_drawerLayout));
 
+    // A cohesive broadcast receiver tile follows the selected slice. The
+    // container owns docking, floating, layout and the operator's open/closed
+    // choice; temporary mode/capability loss must not overwrite that choice.
+    m_wfmApplet = new WfmApplet;
+    m_appletOrder.append(makeEntry("WFM", "WFM", m_wfmApplet, true,
+                                   m_drawer, m_drawerLayout));
+    markHardwareConditional("WFM");
+    connect(m_wfmApplet, &WfmApplet::availabilityChanged,
+            this, &AppletPanel::setWfmAvailable);
+
     // Tuner / Amp entries use makeEntry like everything else;
     // MainWindow toggles tray-button visibility via setTunerVisible /
     // setAmpVisible once the hardware reports its presence.  Until
@@ -747,6 +780,24 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
                                m_drawer, m_drawerLayout);
         m_tuneBtn = entry.btn;
         markHardwareConditional("TUN");
+        // Popped out or on the canvas, the applet switches to the tuner's
+        // own front-panel layout — port strips, relay dials and discrete
+        // keys — same pattern as PWR and SPE above.
+        if (ContainerWidget* container =
+                qobject_cast<ContainerWidget*>(entry.widget)) {
+            // The expanded layout asks for 361x242; this rounds that up to a
+            // comfortable strip — wide enough that the source and frequency
+            // on a port row are never the thing that gets elided. Saved user
+            // geometry takes over after the first resize.
+            container->setDefaultFloatingSize(QSize(520, 275));
+            connect(container, &ContainerWidget::dockModeChanged,
+                    m_tunerApplet,
+                    [this](ContainerWidget::DockMode mode) {
+                        // Canvas is a floating presentation too (see PWR).
+                        m_tunerApplet->setFloating(
+                            mode != ContainerWidget::DockMode::PanelDocked);
+                    });
+        }
         m_appletOrder.append(entry);
     }
 
@@ -756,6 +807,23 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
                                m_drawer, m_drawerLayout);
         m_ampBtn = entry.btn;
         markHardwareConditional("AMP");
+        // Popped out or on the canvas, the applet switches to the amplifier's
+        // own front-panel layout — port strips and a discrete standby key —
+        // same pattern as TUN above.
+        if (ContainerWidget* container =
+                qobject_cast<ContainerWidget*>(entry.widget)) {
+            // Wide enough that a port strip's source name is never the thing
+            // that gets elided. Saved user geometry takes over after the first
+            // resize.
+            container->setDefaultFloatingSize(QSize(540, 380));
+            connect(container, &ContainerWidget::dockModeChanged,
+                    m_ampApplet,
+                    [this](ContainerWidget::DockMode mode) {
+                        // Canvas is a floating presentation too (see PWR).
+                        m_ampApplet->setFloating(
+                            mode != ContainerWidget::DockMode::PanelDocked);
+                    });
+        }
         m_appletOrder.append(entry);
     }
 
@@ -790,6 +858,20 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
                                m_drawer, m_drawerLayout);
         m_speBtn = entry.btn;
         markHardwareConditional("SPE");
+        // Popped out, the applet switches to its roomier presentation and
+        // reveals the FRONT PANEL key group (SpeApplet::setFloating) — same
+        // pattern as the PWR cross-needle above.
+        if (ContainerWidget* container =
+                qobject_cast<ContainerWidget*>(entry.widget)) {
+            // Wide enough for the LCD mirror's 2x glass (480px + bezel).
+            container->setDefaultFloatingSize(QSize(540, 760));
+            connect(container, &ContainerWidget::dockModeChanged,
+                    m_speApplet,
+                    [this](ContainerWidget::DockMode mode) {
+                        m_speApplet->setFloating(
+                            mode != ContainerWidget::DockMode::PanelDocked);
+                    });
+        }
         m_appletOrder.append(entry);
     }
 
@@ -803,6 +885,34 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
                                m_drawer, m_drawerLayout);
         m_vkampBtn = entry.btn;
         markHardwareConditional("VKAMP");
+        m_appletOrder.append(entry);
+    }
+
+    // Elecraft KPA1500 — independent of AMP (PGXL), ACOM, SPE and VKAMP
+    // for the same reason they are independent of each other: a station can
+    // have any combination of them connected at once. Deliberately NOT in
+    // kDefaultOrder: the KPA1500 has no discovery path, so the stored
+    // Peripherals configuration is the only thing that can ever reveal it.
+    // See docs/architecture/kpa1500-amplifier-design.md.
+    m_kpa1500Applet = new Kpa1500Applet;
+    {
+        auto entry = makeEntry("KPA1500", "Elecraft KPA1500", m_kpa1500Applet, false,
+                               m_drawer, m_drawerLayout);
+        m_kpa1500Btn = entry.btn;
+        markHardwareConditional("KPA1500");
+        m_appletOrder.append(entry);
+    }
+
+    // LP-100A wattmeter — an instrument rather than an amplifier, so it is
+    // independent of every amplifier applet above and lives in the Metering
+    // category. Deliberately NOT in kDefaultOrder: it has no discovery path,
+    // so the stored Peripherals configuration is the only thing that can ever
+    // reveal it. See docs/architecture/lp-100a-wattmeter-design.md.
+    m_lpMeterApplet = new LpMeterApplet;
+    {
+        auto entry = makeEntry("LP100", "LP-100A Meter", m_lpMeterApplet, false,
+                               m_drawer, m_drawerLayout);
+        markHardwareConditional("LP100");
         m_appletOrder.append(entry);
     }
 
@@ -821,6 +931,13 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
     m_waveApplet = new WaveApplet;
     m_appletOrder.append(makeEntry("WAVE", "Waveform", m_waveApplet, true, m_drawer, m_drawerLayout, "WAV"));
 
+    // CTR2 Proxy — prototype opaque TCP relay for a CTR2 controller; off by
+    // default and outside kDefaultOrder. The proxy itself is off on every
+    // launch regardless of this tile's visibility.
+    m_ctr2ProxyApplet = new Ctr2ProxyApplet;
+    m_appletOrder.append(makeEntry("CTR2", "CTR2 Proxy", m_ctr2ProxyApplet, false,
+                                   m_drawer, m_drawerLayout));
+
     m_aetherClockApplet = new AetherClockApplet;
     m_appletOrder.append(makeEntry("CLOCK", "AetherClock", m_aetherClockApplet, false, m_drawer, m_drawerLayout, "CLK"));
 
@@ -834,19 +951,11 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
     m_miniPanApplet = new MiniPanApplet;
     m_appletOrder.append(makeEntry("MPAN", "Mini-Pan", m_miniPanApplet, false, m_drawer, m_drawerLayout, "MINI"));
 
-    // CEQ and CMP intentionally have no toggle button in the tray —
-    // their visibility follows DSP bypass state, driven externally
-    // from the CHAIN widget and the respective floating editors.
-    // TX DSP applets — instead of three independent AppletEntries,
-    // we wrap them inside a single nested container (#1713 Phase 5).
-    // Each applet becomes the content of its own sub-ContainerWidget
-    // with a ContainerTitleBar offering per-section float / close;
-    // the three sub-containers live inside a parent "tx_dsp"
-    // container whose own titlebar is hidden (the outer AppletEntry
-    // wrapper provides the group's drag-handle + tray-toggle).
-    // Phase 7.1: CEQ split — one Tx-bound copy + one Rx-bound copy.
-    // No internal Rx/Tx tab anymore; each tile owns one path for its
-    // entire lifetime.
+    // CEQ and CMP have no tray toggle; their visibility follows DSP bypass state
+    // from the CHAIN widget and floating editors. The TX DSP applets live in one
+    // "tx_dsp" container (#1713) whose titlebar is hidden (the AppletEntry wrapper
+    // supplies drag handle and toggle); each applet is a sub-container with its own
+    // float/close. CEQ has separate Tx- and Rx-bound instances.
     m_clientEqTxApplet  = new ClientEqApplet(ClientEqApplet::Path::Tx);
     m_clientEqRxApplet  = new ClientEqApplet(ClientEqApplet::Path::Rx);
     m_clientCompApplet   = new ClientCompApplet(ClientCompApplet::Side::Tx);
@@ -1003,6 +1112,36 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
         m_appletOrder.append(entry);
     }
 
+    // Green Heron Everyware antenna switch.  NOT markHardwareConditional()
+    // like AG/SS: the Everyware server has no discovery path, so there is
+    // nothing to detect and nothing to condition the button on — the operator
+    // types the server's address into the tile itself, which they cannot do
+    // if the tile is hidden until the device is found.  Same shape as KSDR:
+    // always in the bar, closed until opened.
+    m_greenHeronApplet = new GreenHeronApplet;
+    {
+        AppletEntry gheEntry = makeEntry("GHE", "Green Heron", m_greenHeronApplet,
+                                         false, m_drawer, m_drawerLayout);
+        if (auto* c = qobject_cast<ContainerWidget*>(gheEntry.widget)) {
+            // Deliberately NO setDefaultFloatingSize(). The compass is inside
+            // the rotor section, so it enters and leaves the layout with the
+            // rotator itself, and the floating window follows: measured on a
+            // real RT-21, the window went 346 -> 538 px the moment the section
+            // appeared, saved geometry notwithstanding. A fixed default would
+            // only bind in the other case — a first float with no rotator
+            // reporting — where it would open a tall window mostly empty of
+            // the dial it was reserving room for.
+            connect(c, &ContainerWidget::dockModeChanged, m_greenHeronApplet,
+                    [this](ContainerWidget::DockMode mode) {
+                        // Canvas counts as floating: like the CAT tile above,
+                        // the operator sized that rect themselves.
+                        m_greenHeronApplet->setFloating(
+                            mode != ContainerWidget::DockMode::PanelDocked);
+                    });
+        }
+        m_appletOrder.append(gheEntry);
+    }
+
 #ifdef HAVE_MQTT
     m_mqttApplet = new MqttApplet;
     m_appletOrder.append(makeEntry("MQTT", "MQTT", m_mqttApplet, false, m_drawer, m_drawerLayout));
@@ -1011,6 +1150,7 @@ AppletPanel::AppletPanel(QWidget* parent) : QWidget(parent)
     // Place the drawer toggle into the favorites row, then apply the
     // saved (or default) favorites layout to populate both strips.
     loadButtonLayout();
+    setWfmAvailable(m_wfmApplet->isAvailable());
     applyBarLayout();
 
     // Restore drawer open/closed state (default closed).  Signals blocked
@@ -1284,6 +1424,7 @@ QList<AppletPanel::AppletCatalogEntry> AppletPanel::appletCatalog() const
     // a category keep panel order.
     static const QMap<QString, QString> kCategory = {
         {QStringLiteral("RX"),    QStringLiteral("Receive")},
+        {QStringLiteral("WFM"),   QStringLiteral("Receive")},
         {QStringLiteral("MPAN"),  QStringLiteral("Receive")},
         {QStringLiteral("KSDR"),  QStringLiteral("Receive")},
         {QStringLiteral("DEMO"),  QStringLiteral("Receive")},
@@ -1294,20 +1435,25 @@ QList<AppletPanel::AppletCatalogEntry> AppletPanel::appletCatalog() const
         {QStringLiteral("AMP"),   QStringLiteral("Amplifiers")},
         {QStringLiteral("ACOM"),  QStringLiteral("Amplifiers")},
         {QStringLiteral("SPE"),   QStringLiteral("Amplifiers")},
+        {QStringLiteral("VKAMP"), QStringLiteral("Amplifiers")},
+        {QStringLiteral("KPA1500"), QStringLiteral("Amplifiers")},
         {QStringLiteral("EQ"),    QStringLiteral("Audio & DSP")},
         {QStringLiteral("TXDSP"), QStringLiteral("Audio & DSP")},
         {QStringLiteral("WAVE"),  QStringLiteral("Audio & DSP")},
         {QStringLiteral("PWR"),   QStringLiteral("Metering")},
         {QStringLiteral("MTR"),   QStringLiteral("Metering")},
+        {QStringLiteral("LP100"), QStringLiteral("Metering")},
         {QStringLiteral("HLTH"),  QStringLiteral("Antennas & Switching")},
         {QStringLiteral("AG"),    QStringLiteral("Antennas & Switching")},
         {QStringLiteral("SS"),    QStringLiteral("Antennas & Switching")},
+        {QStringLiteral("GHE"),   QStringLiteral("Antennas & Switching")},
         {QStringLiteral("CAT"),   QStringLiteral("Integration")},
         {QStringLiteral("DAX"),   QStringLiteral("Integration")},
         {QStringLiteral("IQ"),    QStringLiteral("Integration")},
         {QStringLiteral("TCI"),   QStringLiteral("Integration")},
         {QStringLiteral("MQTT"),  QStringLiteral("Integration")},
         {QStringLiteral("RADE"),  QStringLiteral("Integration")},
+        {QStringLiteral("CTR2"),  QStringLiteral("Integration")},
         {QStringLiteral("CLOCK"), QStringLiteral("Station")},
         {QStringLiteral("PROF"),  QStringLiteral("Station")},
     };
@@ -1381,22 +1527,15 @@ void AppletPanel::setAppletVisible(const QString& id, bool visible)
     for (const auto& entry : m_appletOrder) {
         if (entry.id != id) continue;
         if (auto* c = qobject_cast<ContainerWidget*>(entry.widget)) {
-            // A POPPED-OUT TILE HIDES ITS WINDOW, NOT ITS CONTENT.
-            //
-            // The bar-button toggled handler already special-cases this; this
-            // path did not, and the asymmetry left a floating applet broken for
-            // good. Hiding via setContainerVisible(false) hid the ContainerWidget
-            // INSIDE a still-open FloatingContainerWindow, and the re-enable path
-            // goes back through the toggled handler, which takes its floating
-            // branch and calls window()->setVisible(true) — never
-            // setContainerVisible(true). So the window came back empty and stayed
-            // that way. (#4508 review.)
+            // A popped-out tile hides its window, not its content: the re-enable path
+            // (the toggled handler) only shows window(), so hiding the container inside
+            // the floating window would leave it empty for good (#4508).
             if (c->isFloating()) {
                 if (auto* w = c->window())
                     w->setVisible(visible);
                 // Keep the container itself shown: it is the window's content,
                 // and the window is what visibility means for a floating tile.
-                c->setContainerVisible(true);
+                c->setContainerVisible(c->isPresentationManaged() ? visible : true);
                 if (entry.btn) {
                     QSignalBlocker b(entry.btn);
                     entry.btn->setChecked(visible);
@@ -1467,7 +1606,7 @@ void AppletPanel::setPooDooActiveSide(PooDooSide side)
             }
         }
     };
-    applyVisibility(kTxOnly, txActive);
+    applyVisibility(kTxOnly, txActive && !m_txAudioPathBlocked);
     applyVisibility(kRxOnly, !txActive);
 
     // If the parent tx_dsp container is currently floating, the set of
@@ -1485,6 +1624,15 @@ void AppletPanel::setPooDooActiveSide(PooDooSide side)
             }
         }
     }
+}
+
+void AppletPanel::setTxAudioPathBlocked(bool blocked)
+{
+    if (m_txAudioPathBlocked == blocked) return;
+    m_txAudioPathBlocked = blocked;
+    if (!m_clientChainApplet) return;
+    setPooDooActiveSide(m_clientChainApplet->activeTab() == ClientChainApplet::ChainMode::Tx
+        ? PooDooSide::Tx : PooDooSide::Rx);
 }
 
 void AppletPanel::setScrollBarOnLeft(bool onLeft)
@@ -1562,17 +1710,9 @@ void AppletPanel::updateHardwareAvailability(const QString& id,
                 m_buttonOrder.append(id);
                 saveButtonLayout();
             }
-            // Default to THIS applet's own default when Applet_<id> is unset,
-            // not to a blanket "True".
-            //
-            // Applet construction reads the key with the right per-applet
-            // default but never WRITES it — only the toggle handlers do — so for
-            // an operator who has never opened PROF, DAX or IQ the key is
-            // absent. Defaulting that to on, and then calling setChecked(true)
-            // UNBLOCKED (unlike the else branch below, which blocks), fired
-            // toggled, opened all three tiles on the first connect, and
-            // persisted "True". EQ escaped only because its default is already
-            // on, which is why this went unnoticed. (#4508 review.)
+            // Default to this applet's own default when Applet_<id> is unset, not "True":
+            // the key is only written by toggle handlers, and the unblocked setChecked
+            // below would otherwise open and persist every never-opened tile (#4508).
             const bool savedOn =
                 AppSettings::instance()
                     .value(appletKey, bb.defaultOn ? "True" : "False")
@@ -1595,19 +1735,10 @@ void AppletPanel::applyCapabilityVisibility(const QString& id,
                                             const QString& appletKey,
                                             bool available)
 {
-    // updateHardwareAvailability() alone is not enough for a capability-driven
-    // applet. It unchecks the bar button with the signal BLOCKED — deliberately,
-    // so Applet_<id> keeps the operator's preference for the next reconnect —
-    // and the blocked signal means the toggled handler never runs and the
-    // container the button owns is never hidden. For TUN/AMP that gap is
-    // invisible because those applets default closed and their hardware rarely
-    // disappears mid-session. For PROF and DAX, which the operator routinely has
-    // open, the tile would stay on screen after its button vanished.
-    //
-    // So hide the container explicitly. That fires
-    // ContainerWidget::visibilityChanged, whose handler persists
-    // Applet_<id>=False — which would erase the very preference the blocked
-    // signal exists to protect. Capture the stored value first and put it back.
+    // updateHardwareAvailability() unchecks the button with signals blocked (to
+    // keep Applet_<id> for reconnect), so the container is never hidden; hide it
+    // explicitly. That persists Applet_<id>=False via visibilityChanged, so
+    // capture the stored value first and restore it.
     auto& s = AppSettings::instance();
     const bool hadKey = s.contains(appletKey);
     const QVariant saved = hadKey ? s.value(appletKey) : QVariant{};
@@ -1628,16 +1759,48 @@ void AppletPanel::applyCapabilityVisibility(const QString& id,
     applyBarLayout();
 }
 
+void AppletPanel::setWfmAvailable(bool available)
+{
+    // Availability suppresses presentation, never workspace membership or the
+    // requested open state. Generic capability hiding emits visibilityChanged
+    // and would incorrectly mark this temporarily unavailable tile as closed
+    // in the active workspace. The container/window gate also survives recall.
+    for (BarButton& button : m_barButtons) {
+        if (button.id != QLatin1String("WFM")) {
+            continue;
+        }
+        button.hardwareAvailable = available;
+        if (available && !m_buttonOrder.contains(button.id)
+            && !m_hiddenButtons.contains(button.id)) {
+            m_buttonOrder.append(button.id);
+            saveButtonLayout();
+        }
+        break;
+    }
+    if (ContainerWidget* container = m_containerMgr->container(QStringLiteral("WFM"))) {
+        container->setPresentationAvailable(available);
+    }
+    applyBarLayout();
+}
+
 void AppletPanel::setRadioFilterWidths(const QList<int>& widthsHz)
 {
     if (m_rxApplet)
         m_rxApplet->setRadioFilterWidths(widthsHz);
 }
 
-void AppletPanel::setMicLevelMeterAvailable(bool available)
+void AppletPanel::setRadioFilterControl(const RxFilterControl& control)
+{
+    if (m_rxApplet) {
+        m_rxApplet->setRadioFilterControl(control);
+    }
+}
+
+void AppletPanel::setMicLevelMeterState(MicMeterSessionState session,
+                                        bool available)
 {
     if (m_phoneCwApplet)
-        m_phoneCwApplet->setMicLevelMeterAvailable(available);
+        m_phoneCwApplet->setMicLevelMeterState(session, available);
 }
 
 void AppletPanel::setSelectableMicInputs(bool selectable)
@@ -1712,6 +1875,18 @@ void AppletPanel::setVkampVisible(bool visible)
     applyBarLayout();
 }
 
+void AppletPanel::setKpa1500Visible(bool visible)
+{
+    updateHardwareAvailability("KPA1500", "Applet_KPA1500", visible);
+    applyBarLayout();
+}
+
+void AppletPanel::setLpMeterVisible(bool visible)
+{
+    updateHardwareAvailability("LP100", "Applet_LP100", visible);
+    applyBarLayout();
+}
+
 void AppletPanel::setAgVisible(bool visible)
 {
     updateHardwareAvailability("AG", "Applet_AG", visible);
@@ -1755,14 +1930,18 @@ void AppletPanel::setControlsLocked(bool locked)
 void AppletPanel::setSlice(SliceModel* slice)
 {
     m_rxApplet->setSlice(slice);
+    if (m_wfmApplet) {
+        m_wfmApplet->setSlice(slice);
+    }
     if (m_aetherClockApplet)
         m_aetherClockApplet->setSlice(slice);
 
-    if (slice) {
-        connect(slice, &SliceModel::modeChanged,
-                m_phoneCwApplet, &PhoneCwApplet::setMode);
-        m_phoneCwApplet->setMode(slice->mode());
-    }
+    // The mode connection used to be made here with no prior disconnect, and
+    // MainWindow calls setSlice on every active-slice change — so returning to
+    // a slice already visited stacked another handler and setMode fired N
+    // times per mode change.  PhoneCwApplet::setSlice now owns both edges of
+    // the binding and disconnects the outgoing slice first (#4879).
+    m_phoneCwApplet->setSlice(slice);
 }
 
 void AppletPanel::setAntennaList(const QStringList& ants)
@@ -1799,7 +1978,6 @@ void AppletPanel::setRxDspChainOrder(
             case AudioEngine::RxChainStage::Comp:  return "cmp-rx";
             case AudioEngine::RxChainStage::Tube:  return "tube-rx";
             case AudioEngine::RxChainStage::Pudu:  return "pudu-rx";
-            case AudioEngine::RxChainStage::DeEss: return {};  // no RX applet yet
             case AudioEngine::RxChainStage::None:  return {};
         }
         return {};
@@ -1903,17 +2081,11 @@ void AppletPanel::registerBarButton(const QString& id, const QString& label,
 
 QStringList AppletPanel::defaultButtonOrder() const
 {
-    // Top kFavoriteCount entries become the bar favourites.  Remaining
-    // ids are in canonical registration order so a fresh install matches
-    // the old fixed two-row bar.  IDs are the canonical persistence
-    // keys, which differ from a few labels (WAVE→"WAV", PHNE→"PHN",
-    // TXDSP→"VUDU").
-    //
-    // TUN/AMP/AG are intentionally omitted — these are hardware-
-    // conditional and should not clutter the picker's Active column
-    // until the matching device is detected.  updateHardwareAvailability()
-    // auto-adds them when MainWindow reports the hardware as present,
-    // and the user's explicit Hidden choice is respected from then on.
+    // First kFavoriteCount entries are the bar favourites; the rest follow
+    // canonical registration order. IDs are persistence keys and differ from some
+    // labels (WAVE→"WAV", PHNE→"PHN", TXDSP→"VUDU"). TUN/AMP/AG are omitted:
+    // updateHardwareAvailability() adds them when the hardware appears, and the
+    // user's Hidden choice is respected after that.
     QStringList out = {"VU", "PWR", "RX", "TX", "P/CW"};
     const QStringList rest = {
         "LCK", "PHNE", "EQ", "WAVE", "TXDSP",

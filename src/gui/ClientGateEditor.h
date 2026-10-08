@@ -13,24 +13,11 @@ class AudioEngine;
 class ClientCompKnob;    // reused — generic rotary knob
 class ClientGateLevelView;
 
-// Floating editor for the client-side TX gate / expander — layout
-// modelled on Ableton Live's Gate device.  One instance lives on
-// MainWindow; calling showForTx() raises the window and binds it to
-// AudioEngine::clientGateTx().  Geometry persists via AppSettings
-// (`ClientGateEditorGeometry` key).
-//
-// Layout:
-//   ┌─ bypass ──────────────────── × ┐
-//   │ ┌──────┐  ┌──────────────────┐ │
-//   │ │ THR  │  │                  │ │
-//   │ │      │  │   level view     │ │
-//   │ │ RET  │  │   (Ableton-style)│ │
-//   │ │      │  │                  │ │
-//   │ │ Flip │  │                  │ │
-//   │ │ Look │  │                  │ │
-//   │ └──────┘  └──────────────────┘ │
-//   │   [ATK] [HLD] [REL] [FLR]      │
-//   └────────────────────────────────┘
+// Floating editor for the client-side TX gate / expander, laid out like
+// Ableton's Gate: THR/RET/Flip/Lookahead column on the left, level view on the
+// right, ATK/HLD/REL/FLR knobs below. One instance on MainWindow; showForTx()
+// binds it to AudioEngine::clientGateTx(). Geometry persists in AppSettings
+// (`ClientGateEditorGeometry`).
 class ClientGateEditor : public QWidget {
     Q_OBJECT
 
@@ -42,6 +29,7 @@ public:
 
     void showForTx();
     void showForRx();
+    bool isShowingTx() const { return isVisible() && m_side == Side::Tx; }
 
 signals:
     // Fired when bypass toggles.  Docked applet subscribes to keep
@@ -66,7 +54,6 @@ private:
     void applyThreshold(float db);
     void applyReturn(float db);
     void applyRatio(float ratio);
-    void applyAttack(float ms);
     void applyHold(float ms);
     void applyRelease(float ms);
     void applyFloor(float db);
@@ -84,7 +71,6 @@ private:
     ClientCompKnob*       m_threshold{nullptr};
     ClientCompKnob*       m_returnKnob{nullptr};
     ClientCompKnob*       m_ratio{nullptr};
-    ClientCompKnob*       m_attack{nullptr};
     ClientCompKnob*       m_hold{nullptr};
     ClientCompKnob*       m_release{nullptr};
     ClientCompKnob*       m_floor{nullptr};

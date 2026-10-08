@@ -20,6 +20,19 @@
 
 namespace AetherSDR {
 
+namespace {
+
+// The level the operator hears, which a control surface's AF dial mirrors;
+// RadioModel holds the one rule. Without a model, the PC sink's saved level.
+int activeOutputVolumePercent(const RadioModel* model)
+{
+    return model ? model->activeOutputVolumePercent()
+                 : AppSettings::instance()
+                       .value(QStringLiteral("MasterVolume"), QStringLiteral("100")).toInt();
+}
+
+}  // namespace
+
 int TciProtocol::tciTrxForSlice(RadioModel* model, const SliceModel* slice)
 {
     if (!model || !slice)
@@ -103,39 +116,12 @@ QString TciProtocol::tciToSmartSDR(const QString& mode, bool* ok)
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-// Argument parsing, in one place (#4867).
-//
-// QString::toInt() returns 0 on a parse failure, so an unchecked conversion
-// does not fail — it turns malformed client input into a valid-looking 0 and
-// the command proceeds as if the client had asked for it. That is the hard
-// part of this defect class: it does not fail quietly, it *succeeds
-// convincingly*. The command applies, a well-formed notification goes out,
-// and neither the sender nor a second client watching the wire can tell
-// anything went wrong. No crash, no log line, no assertion anywhere in the
-// tree that moves. Three separate defects shipped that way and each was
-// found by a human noticing odd radio behaviour: a DRIVE read applied as a
-// power SET (#4345), `volume:` applied as 100% and `tx_gain:` as a mute
-// (#4523).
-//
-// The trx index is the sharpest case. sliceForTrx() resolves positionally, so
-// a malformed trx does not fail to resolve — it resolves to slice 0 and the
-// command lands on the wrong slice while broadcasting a notification that
-// names slice 0 as though the client had asked for it.
-//
-// Contract: `out` is left untouched when the argument is missing or
-// unparseable, so a caller that pre-seeds a default keeps it. Callers drop
-// the command on false — the "ignore silently per TCI spec" posture the
-// parser already takes for unrecognised commands, and the remedy #4345 and
-// #4523 both settled on. This rejects *unparseable* input only: range clamps
-// and the deliberately lenient forms (cmdVolume's non-spec percent branch,
-// which three bundled plugins depend on) are the caller's business and are
-// unchanged.
-//
-// Base 10 only, and it must stay that way. QString::toInt()'s base argument
-// defaults to 10, which is the only reason "0x1" is rejected rather than
-// resolving to slice 1 — pass 0 here for "helpful" auto-base detection and
-// `mute:0x1,false` silently starts landing on a slice the client never named.
-// The test asserts the hex case; this sentence is why the assertion holds.
+// Parse an int argument (#4867). QString::toInt() returns 0 on failure, which
+// turns malformed input into a valid-looking command (#4345, #4523); a bad trx
+// would land on slice 0. `out` is untouched on a missing/unparseable arg, and
+// callers drop the command on false (the TCI "ignore silently" posture). Range
+// clamps and lenient forms remain the caller's. Base 10 only: auto-base would
+// make `mute:0x1,false` address slice 1 (tested).
 static bool argToInt(const QStringList& args, int idx, int& out)
 {
     if (idx < 0 || idx >= args.size()) return false;
@@ -146,23 +132,10 @@ static bool argToInt(const QStringList& args, int idx, int& out)
     return true;
 }
 
-// Booleans are the same defect with a different literal, and there are 20 of
-// them: `args[1].toLower() == "true"` turns *everything that is not the word
-// "true"* into false, so `mute:0,yes` UNMUTED slice 0 and broadcast a
-// well-formed "mute:0,false;" — #4867's signature exactly, with no number
-// involved. TCI spells booleans "true"/"false"; this accepts those two
-// (case-insensitively, as the old expression did) and reports failure for
-// anything else so the caller can drop the command. Every bundled plugin
-// sends Python's `str(bool).lower()` or JS's `${bool}`, i.e. exactly these
-// two spellings, so nothing shipped is affected.
-//
-// DELIBERATELY NOT used by the two verbs that key the transmitter. `cmdTune`
-// and `cmdKeyer` must fail CLOSED rather than fail silent: dropping an
-// unparseable `tune:0,<junk>` would leave a tuning carrier up, and dropping
-// `keyer:0,<junk>` would leave the key down. For those two, "not the word
-// true" continuing to mean *stop* is the safe reading, and Constitution VI
-// makes it the required one. They keep the bare comparison, with a comment
-// at each site saying so.
+// TCI booleans are exactly "true"/"false" (case-insensitive); anything else
+// returns false so the caller drops the command (#4867), rather than
+// `mute:0,yes` unmuting. Not used by cmdTune/cmdKeyer: those must fail closed,
+// so any non-"true" there means stop, keeping the bare comparison.
 static bool argToBool(const QStringList& args, int idx, bool& out)
 {
     if (idx < 0 || idx >= args.size()) return false;
@@ -250,20 +223,11 @@ SliceModel* TciProtocol::sliceForVfo(int trx, int channel) const
     return rxSlice;
 }
 
-// TRX index of the TX slice for the request/response path — the init burst and
-// the DRIVE/TUNE_DRIVE replies. Falls back to 0 when no slice is marked TX,
-// because the wire needs a concrete index and 0 is what the burst has always
-// used.
-//
-// TciServer has a near-twin, txTrxIndex(), which returns -1 for "none" and
-// resolves that against a cached last-known TX trx. The difference is
-// deliberate and worth understanding before merging them: that one serves the
-// async broadcast, which is driven by the radio's own power restore during a
-// band change — i.e. it fires *inside* the window where the recreated slice has
-// not yet regained its TX flag, so without the cache it would reliably mislabel
-// (#4161). This path is driven by a client command arriving at an arbitrary
-// moment, so it only ever meets that window by coincidence, and a transiently
-// 0-labelled reply is the same fallback the burst has always emitted.
+// TRX of the TX slice for the request/response path (init burst, DRIVE /
+// TUNE_DRIVE replies); 0 when none is TX, because the wire needs an index.
+// TciServer::txTrxIndex() differs on purpose: it serves async broadcasts fired
+// during a band-change slice recreate, before the TX flag returns, so it falls
+// back to a cached last TX trx (#4161).
 int TciProtocol::txSliceTrxOrNone(RadioModel* model)
 {
     if (!model) {
@@ -311,18 +275,10 @@ QString TciProtocol::generateInitBurst()
 {
     QString burst;
 
-    // ── Phase 1: Initialization commands (spec section 4.1) ───────────
-    // Sent in spec order.  READY is NOT sent here: real ExpertSDR3
-    // transmits its complete initial state (including the audio/IQ
-    // stream parameters) and only then sends READY, and clients written
-    // against it (SDC / CW Skimmer, reported by UT4LW) latch their
-    // cached settings when READY arrives — an early READY makes them
-    // initialize from defaults (notably a wrong iq_samplerate).  The
-    // earlier early-READY rationale from #2597 ("strict clients reject
-    // non-init commands before READY") does not match the reference
-    // parser it cited: eesdr-tci aborts only on *unrecognized* command
-    // names, anywhere in the stream, and imposes no pre-READY grammar;
-    // the RF2K-S engagement fix was split_enable, not READY placement.
+    // Init commands (spec 4.1), in spec order. READY is sent last, after the full
+    // state including stream parameters, as ExpertSDR3 does: SDC / CW Skimmer
+    // latch settings on READY, so an early READY gives them defaults (notably a
+    // wrong iq_samplerate). eesdr-tci imposes no pre-READY grammar.
     burst += QStringLiteral("vfo_limits:1000,75000000;");
     burst += QStringLiteral("if_limits:-48000,48000;");
 
@@ -342,24 +298,12 @@ QString TciProtocol::generateInitBurst()
     // over the PDF.
     burst += QStringLiteral("channels_count:2;");
 
-    // Identity chosen to bypass WSJT-X's TCI gain-reduction code path.
-    // WSJT-X's TCITransceiver halves TX sample amplitude (K2 = 0.499/0x7FFF
-    // vs K1 = 0.999/0x7FFF, ~-6 dB) when BOTH conditions hold:
-    //   device  == "SunSDR2DX" or "SunSDR2PRO"
-    //   protocol != starts-with "ExpertSDR3"
-    // Either branch alone keeps the K1 (full-amplitude) path; both branches
-    // satisfied makes it doubly safe.
-    //   - device: literal "AetherSDR" avoids the SunSDR-specific gain trap
-    //     AND avoids the leading-space bug in the older "<name> <model>"
-    //     form when the radio's nickname is empty.
-    //   - protocol: "ExpertSDR3,1.5" sets WSJT-X's ESDR3 flag, which both
-    //     gates the gain reduction off and selects WSJT-X command formats
-    //     that AetherSDR already handles correctly (proven in v26.5.1).
-    // RF2K-S amp whitelist (which keyed on SunSDR2DX + ExpertSDR2) is
-    // regressed by this change; a configurable / adaptive identity is
-    // tracked in #2806.  Everything else from #2597 (init-burst order,
-    // vfo_limits, if_limits, channels_count, split_enable) is preserved
-    // and is what the RF2K-S TCI parser actually needs to engage.
+    // Identity chosen so WSJT-X's TCITransceiver keeps full TX amplitude: it
+    // halves samples (K2 = 0.499/0x7FFF vs K1 = 0.999/0x7FFF) only when device is
+    // "SunSDR2DX"/"SunSDR2PRO" AND protocol doesn't start with "ExpertSDR3"; we fail
+    // both. "ExpertSDR3,1.5" also selects WSJT-X's ESDR3 command formats. The
+    // RF2K-S whitelist (SunSDR2DX + ExpertSDR2) is not matched; a configurable
+    // identity is #2806.
     burst += QStringLiteral("device:AetherSDR;");
     burst += QStringLiteral("receive_only:false;");
     burst += QStringLiteral("modulations_list:usb,lsb,cw,cwr,am,sam,fm,nfm,digu,digl,rtty;");
@@ -465,6 +409,7 @@ QString TciProtocol::generateInitBurst()
         burst += QStringLiteral("tune_drive:%1,%2;").arg(txTrxIndex).arg(tx.tunePower());
         burst += QStringLiteral("mic_level:%1;").arg(tx.micLevel());
         burst += QStringLiteral("trx:%1,%2;").arg(txTrxIndex).arg(isTx ? "true" : "false");
+        burst += QStringLiteral("tune:%1,%2;").arg(txTrxIndex).arg(tx.isTuning() ? "true" : "false");
 
         // Master AF volume — whole-radio (no trx prefix), same saved value
         // cmdVolume's GET returns, reported in dB per the TCI spec
@@ -474,8 +419,7 @@ QString TciProtocol::generateInitBurst()
         // instead of the radio's real level (Ulanzi/Elgato/StreamController
         // gain steppers).
         burst += QStringLiteral("volume:%1;")
-                     .arg(volumeDbFromPercent(
-                         AppSettings::instance().value("MasterVolume", "100").toInt()));
+                     .arg(volumeDbFromPercent(activeOutputVolumePercent(m_model)));
 
         // Which slice holds GUI focus (#4160) — AetherSDR extension. Without
         // it a control surface learns focus only from the next change event,
@@ -498,22 +442,20 @@ QString TciProtocol::generateInitBurst()
     burst += QStringLiteral("audio_stream_channels:2;");
     burst += QStringLiteral("audio_stream_samples:2048;");
     burst += QStringLiteral("tx_stream_audio_buffering:50;");
-    burst += QStringLiteral("iq_samplerate:48000;");
+    burst += QStringLiteral("iq_samplerate:%1;").arg(m_iqSampleRate);
+
+    // START belongs in the state dump before READY: WSJT-X gates its
+    // frequency/PTT path on the "switched on" flag that only START sets, and checks
+    // it at READY (#5007). Stream lifecycle commands (audio_start/iq_start) are
+    // still never emitted here (#3913).
+    burst += QStringLiteral("start;");
 
     // READY terminates the settings dump — it must follow EVERY setting
-    // (in particular iq_samplerate), because SDC / CW Skimmer reads its
-    // cached settings the moment READY arrives.  Matches real
+    // (in particular iq_samplerate and start), because SDC / CW Skimmer
+    // reads its cached settings the moment READY arrives.  Matches real
     // ExpertSDR3 behavior and the spec's READY definition ("sent after
     // the initialization commands").  Reported by Yuri UT4LW.
     burst += QStringLiteral("ready;");
-
-    // START is a bidirectional device-state notification. Stream lifecycle
-    // commands are client-owned: AUDIO_START and IQ_START require a receiver
-    // argument and are sent by the client after READY. Emitting the old
-    // argument-less audio_start primer here wedged SDC before it processed
-    // START, so its TCI connection never became active and it never requested
-    // the IQ stream used by the CW skimmer (#3913 test-build finding).
-    burst += QStringLiteral("start;");
 
     return burst;
 }
@@ -562,9 +504,12 @@ QString TciProtocol::handleCommand(const QString& cmd)
     if (name == "spot")             return cmdSpot(args);
     if (name == "spot_delete")      return cmdSpotDelete(args);
     if (name == "spot_clear")       return cmdSpotClear();
-    if (name == "iq_start")         return cmdIqStart(args);
-    if (name == "iq_stop")          return cmdIqStop(args);
-    if (name == "iq_samplerate")    return cmdIqSampleRate(args, args.size() >= 1 && !args[0].isEmpty());
+    // iq_start / iq_stop / iq_samplerate are handled entirely in
+    // TciServer::onTextMessage, which owns the shared DAX IQ stream lifecycle
+    // (per-receiver subscription sets, pan↔channel binding, refcounting across
+    // clients). The single-stream implementations that used to live here were
+    // removed rather than left unreachable: two implementations of one
+    // lifecycle, one of them wrong, is how the wrong one comes back.
     if (name == "keyer")            return cmdKeyer(args);
     if (name == "cw_keyer_speed")   return cmdCwKeyerSpeed(args, isSet);
     if (name == "cw_macros_delay")  return cmdCwMacrosDelay(args, isSet);
@@ -657,18 +602,25 @@ std::optional<TciProtocol::TrxRequest> TciProtocol::takeTrxRequest()
     return request;
 }
 
+std::optional<TciProtocol::TuneRequest> TciProtocol::takeTuneRequest()
+{
+    std::optional<TuneRequest> request = std::move(m_tuneRequest);
+    m_tuneRequest.reset();
+    return request;
+}
+
 // ── Command implementations ────────────────────────────────────────────────
 
 QString TciProtocol::cmdStart()
 {
     m_started = true;
-    return {};
+    return QStringLiteral("start;");
 }
 
 QString TciProtocol::cmdStop()
 {
     m_started = false;
-    return {};
+    return QStringLiteral("stop;");
 }
 
 // ── VFO: get/set frequency ─────────────────────────────────────────────────
@@ -755,14 +707,18 @@ QString TciProtocol::cmdTrx(const QStringList& args, bool isSet)
         return QStringLiteral("trx:%1,%2;").arg(trx).arg(tx ? "true" : "false");
     }
 
-    if (args.size() < 2) return {};
-    const QString state = args[1].trimmed().toLower();
-    if (state != QStringLiteral("true") && state != QStringLiteral("false")) {
-        return {};
-    }
-    const QString source = args.size() >= 3 ? args[2].trimmed().toLower() : QString();
-    m_trxRequest = TrxRequest { trx, state == QStringLiteral("true"), source };
+    m_trxRequest = parseTrxRequest(args);
     return {};
+}
+
+std::optional<TciProtocol::TrxRequest> TciProtocol::parseTrxRequest(const QStringList& args)
+{
+    int trx = 0;
+    if (args.size() < 2 || !argToInt(args, 0, trx) || trx < 0) { return {}; }
+    const QString state = args[1].trimmed().toLower();
+    if (state != QStringLiteral("true") && state != QStringLiteral("false")) { return {}; }
+    const QString source = args.size() >= 3 ? args[2].trimmed().toLower() : QString();
+    return TrxRequest{trx, state == QStringLiteral("true"), source};
 }
 
 // ── TX_ENABLE: output-only TX assignment state ─────────────────────────────
@@ -794,13 +750,17 @@ QString TciProtocol::cmdTune(const QStringList& args, bool isSet)
     // so "anything that is not the word true" has to keep meaning STOP.
     // Fail closed, not silent — Constitution VI. (#4867 review)
     const bool tune = (args[1].trimmed().toLower() == QLatin1String("true"));
-    QMetaObject::invokeMethod(m_model, [model = m_model, tune]() {
-        if (tune)
-            model->transmitModel().startTune(TransmitModel::PttSource::Dax);
-        else
-            model->transmitModel().stopTune();
-    }, Qt::QueuedConnection);
-
+    if (trx < 0 && tune) {
+        // A malformed start keys nothing; it is answered with the real state.
+        const bool tuning = m_model && m_model->transmitModel().isTuning();
+        return QStringLiteral("tune:%1,%2;").arg(txTrx()).arg(tuning ? "true" : "false");
+    }
+    if (trx < 0) {
+        trx = txTrx();
+    }
+    // TciServer applies it, so the requester is answered with the state the
+    // model reached — a refused start included.
+    m_tuneRequest = TuneRequest{trx, tune};
     return {};
 }
 
@@ -866,16 +826,8 @@ QString TciProtocol::cmdTuneDrive(const QStringList& args, bool /*isSet*/)
 
 // ── MIC_LEVEL: get/set mic input gain ─────────────────────────────────────
 
-// mic_level bridges TransmitModel::setMicLevel() (the existing radio-side
-// setter wired into FlexLib via commandReady) to TCI clients.  Single arg
-// 0-100 (percent), global — mic is whole-radio, not per-trx. Accepts the
-// legacy TRX-prefixed form
-// `mic_level:0,N;` for forward compatibility with strict-spec clients (the
-// trx index is ignored since mic is global).
-//
-// Added 2026-05-27 to unblock the aethersdr-ulanzi-plugin Mic Gain ▲▼ keys,
-// which already send the verb but currently land on a missing dispatcher
-// entry → silently ignored.
+// mic_level: global 0-100 % via TransmitModel::setMicLevel() (mic is
+// whole-radio). Also accepts `mic_level:0,N;`, ignoring the trx.
 QString TciProtocol::cmdMicLevel(const QStringList& args, bool /*isSet*/)
 {
     if (args.isEmpty()) {
@@ -1097,16 +1049,11 @@ QString TciProtocol::cmdRxFilterBand(const QStringList& args, bool isSet)
 
 // ── CW ─────────────────────────────────────────────────────────────────────
 
-// GLOBAL commands (no trx) re-derive GET/SET from the argument list rather
-// than trusting the dispatcher's `isSet`, and read the value from the last
-// argument. handleCommand() computes `isSet = (args.size() >= 2)` from the
-// trx-prefixed shape every per-slice verb uses, which is wrong for a global
-// one: it makes the spec form `cw_macros_speed:25;` a READ that silently
-// discards the value, and leaves the 2-arg form reading the trx position as
-// the value (`cw_macros_speed:0,25;` set the speed to 0). cmdVolume,
-// cmdMicLevel and cmdTxGain already do it this way — these four verbs were
-// simply missed. Found while adding #4867's tests; no bundled plugin sends
-// any of them, so nothing shipped depended on the broken shape.
+// Global commands (no trx) derive GET/SET from the argument count and read
+// the value from the last argument, rather than trusting handleCommand()'s
+// `isSet = args.size() >= 2` (per-slice shape): spec `cw_macros_speed:25;` is
+// a SET, and `cw_macros_speed:0,25;` sets 25, not 0. Same as cmdVolume,
+// cmdMicLevel and cmdTxGain.
 QString TciProtocol::cmdCwMacrosSpeed(const QStringList& args, bool /*isSet*/)
 {
     if (args.isEmpty()) {
@@ -1117,10 +1064,11 @@ QString TciProtocol::cmdCwMacrosSpeed(const QStringList& args, bool /*isSet*/)
     if (!m_model) return {};
     int wpm = 0;
     if (!argToInt(args, args.size() == 1 ? 0 : 1, wpm)) return {};
-    if (wpm < 5 || wpm > 100) return {};
-    QString cmd = QStringLiteral("cw wpm %1").arg(wpm);
-    QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
-        model->sendCmdPublic(cmd, nullptr);
+    if (wpm < m_model->cwTextMinWpm() || wpm > m_model->cwTextMaxWpm()) {
+        return {};
+    }
+    QMetaObject::invokeMethod(m_model, [model = m_model, wpm]() {
+        model->transmitModel().setCwSpeed(wpm);
     }, Qt::QueuedConnection);
 
     m_pendingNotification = QStringLiteral("cw_macros_speed:%1;").arg(wpm);
@@ -1133,8 +1081,7 @@ QString TciProtocol::cmdCwMsg(const QStringList& args)
     // cw_msg:text — send CW macro text
     QString text = args.join(',');  // rejoin in case text had commas
     if (text.isEmpty()) return {};
-    QString cmd = QStringLiteral("cwx send \"%1\"").arg(text);
-    QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
+    QMetaObject::invokeMethod(m_model, [model = m_model, text]() {
         // Capability check runs HERE, on the model's thread, not in the caller:
         // this method is driven by the TCI client socket and RadioModel state is
         // not ours to read from it.
@@ -1143,7 +1090,12 @@ QString TciProtocol::cmdCwMsg(const QStringList& args)
                                 "CW keyer";
             return;
         }
-        model->sendCmdPublic(cmd, nullptr);
+        const QString rejection = model->cwTextValidationError(text);
+        if (!rejection.isEmpty()) {
+            qCWarning(lcCat) << "TCI: cw_msg ignored:" << rejection;
+            return;
+        }
+        model->cwxModel().send(text);
     }, Qt::QueuedConnection);
     return {};
 }
@@ -1229,37 +1181,15 @@ QString TciProtocol::cmdSqlLevel(const QStringList& args, bool isSet)
 
 // ── Volume / Mute ──────────────────────────────────────────────────────────
 
-// VOLUME is a GLOBAL command per TCI v2.0 spec — it controls the master
-// output level the operator hears, not a per-slice audio gain. This
-// matches the title bar's master volume slider in the GUI. Per-receiver
-// volume goes through the separate `rx_volume` command (cmdRxVolume).
-//
-// Spec form:  GET = `volume;`  (no args)
-//             SET = `volume:N;` (1 arg, dB, -60..0; -60 = silence)
-//
-// Wire scale is dB per TCI Protocol v2.0 ("The range of values is from
-// -60 to 0 dB, at a value of -60 dB there is no sound") — real
-// ExpertSDR3 sends e.g. `VOLUME:-12;`.  Internally AetherSDR's master
-// volume is a 0-100 percent amplitude (title bar slider /
-// applyMasterVolume), so the dB<->percent conversion happens here at
-// the wire and everything inboard stays percent.
-//
-// Legacy compat: values >= 1 cannot be dB (the spec range is
-// non-positive), so they are accepted as the old AetherSDR percent
-// scale — existing percent senders keep working.  `volume:0` is 0 dB =
-// full volume per spec (mute belongs to the `mute:` command).
-//
-// We also accept the legacy TRX-prefixed form `volume:trx,N;` for
-// backward compatibility — the trx is ignored since master volume is
-// global. Old clients that previously sent this form to set per-slice
-// gain were silently broken (the SET path mixed up vol and trx
-// indices) — those clients should migrate to `rx_volume:trx,N;`.
-//
-// For SET, we don't directly call AudioEngine here — TciProtocol owns
-// only the RadioModel, not AudioEngine. Instead we stash the requested
-// level in m_pendingMasterVolume; TciServer reads it after handleCommand
-// and forwards the request to MainWindow via signal, mirroring the path
-// taken by the title bar's masterVolumeChanged signal.
+// VOLUME is GLOBAL per TCI v2.0: the master output level (title bar slider);
+// per-receiver volume is `rx_volume` (cmdRxVolume).
+//   GET = `volume;`   SET = `volume:N;` (dB, -60..0; -60 = silence)
+// Internally master volume is 0-100 % amplitude, so dB<->percent converts at
+// the wire. Values >= 1 can't be dB and are taken as legacy percent;
+// `volume:0` is 0 dB = full volume (muting is `mute:`). `volume:trx,N;` is
+// accepted with the trx ignored. SET is stashed in m_pendingMasterVolume
+// (TciProtocol doesn't own AudioEngine); TciServer forwards it to MainWindow
+// like masterVolumeChanged.
 
 int TciProtocol::volumeDbFromPercent(int pct)
 {
@@ -1282,29 +1212,15 @@ int TciProtocol::volumePercentFromDb(double db)
 QString TciProtocol::cmdVolume(const QStringList& args, bool /*isSet*/)
 {
     if (args.isEmpty()) {
-        // GET — current master volume from saved settings (the same value
-        // the title bar slider reads on startup), reported in dB.
-        int pct = AppSettings::instance()
-                      .value("MasterVolume", "100").toInt();
+        // GET — the level of the output the operator hears, in dB.
+        const int pct = activeOutputVolumePercent(m_model);
         return QStringLiteral("volume:%1;").arg(volumeDbFromPercent(pct));
     }
 
-    // SET — accept either spec form (1 arg) or legacy trx-prefixed (2+ args).
-    // "volume:" (colon, nothing after it) splits to a single empty string,
-    // not an empty arg list, so it reaches here rather than the GET branch
-    // above — but neither spec form (VOLUME; / VOLUME:arg1;) is "colon with
-    // nothing after it", so it's malformed input. It used to parse via
-    // toDouble() (empty string → 0.0, silently) and apply that as 100% (0 dB
-    // is the top of the range) — the malformed input landing on the loudest
-    // value the command can express (#4523). Checked and dropped instead,
-    // matching the "ignore silently" posture already used for unrecognised
-    // commands; this also catches the same shape for the legacy 2-arg form
-    // (e.g. "volume:0,").
-    //
-    // argToDouble rejects the empty string AND the non-finite literals
-    // ("inf"/"nan", which Qt parses and reports ok for) — see its definition
-    // for why the second half is not optional. The percent branch below is
-    // deliberately NOT tightened: it is what three bundled plugins send.
+    // SET: spec form (1 arg) or legacy trx-prefixed (2+). An empty value
+    // ("volume:" or "volume:0,") is malformed and dropped rather than read as 0 dB
+    // = loudest (#4523). argToDouble also rejects "inf"/"nan". The percent branch
+    // below stays lenient: bundled plugins send it.
     double val = 0.0;
     if (!argToDouble(args, args.size() == 1 ? 0 : 1, val)) {
         return {};
@@ -1441,6 +1357,12 @@ QString TciProtocol::cmdRxNrEnable(const QStringList& args, bool isSet)
     if (args.size() < 2) return {};
     bool on = false;
     if (!argToBool(args, 1, on)) return {};
+    // A radio with no radio-side NR (HL2, ANAN) cannot turn it on. TCI has no
+    // error reply, so the refusal is the truth broadcast back: NR is off.
+    if (on && m_model && !m_model->radioSideNoiseReductionAvailable()) {
+        m_pendingNotification = QStringLiteral("rx_nr_enable:%1,false;").arg(trx);
+        return {};
+    }
     QMetaObject::invokeMethod(s, [s, on]() { s->setNr(on); },
                               Qt::QueuedConnection);
 
@@ -1465,6 +1387,11 @@ QString TciProtocol::cmdRxAnfEnable(const QStringList& args, bool isSet)
     if (args.size() < 2) return {};
     bool on = false;
     if (!argToBool(args, 1, on)) return {};
+    // Same refusal as rx_nr_enable, where the radio has no auto notch.
+    if (on && m_model && !m_model->radioSideAutoNotchAvailable()) {
+        m_pendingNotification = QStringLiteral("rx_anf_enable:%1,false;").arg(trx);
+        return {};
+    }
     QMetaObject::invokeMethod(s, [s, on]() { s->setAnf(on); },
                               Qt::QueuedConnection);
 
@@ -1497,7 +1424,7 @@ QString TciProtocol::cmdRxApfEnable(const QStringList& args, bool isSet)
     return {};
 }
 
-// ── AetherSDR extensions (DVK record/play) ─────────────────────────────────
+// ── AetherSDR extensions (slice quick-record record/play) ──────────────────
 
 QString TciProtocol::cmdRxRecord(const QStringList& args, bool isSet)
 {
@@ -1612,19 +1539,65 @@ QString TciProtocol::cmdSpotClear()
 
 // ── CW macros ──────────────────────────────────────────────────────────────
 
+// See the contract on cwMacrosTextFromArgs() in TciProtocol.h for why numeric
+// first arguments fail closed while non-numeric ones retain compatibility.
+QString TciProtocol::cwMacrosTextFromArgs(const QStringList& args, int trxCount)
+{
+    if (args.isEmpty()) {
+        return {};
+    }
+    if (trxCount < 1) {
+        trxCount = 1;
+    }
+
+    // A base-10 integer in the receiver slot is always an address. If it no
+    // longer names a live advertised receiver, fail closed rather than
+    // reinterpreting it as text and putting the stale index on the air.
+    //
+    // args.join(',') on the TAIL, not on everything: the join is what lets a
+    // message legitimately CONTAIN commas (`cw_macros:0,CQ,CQ` keys "CQ,CQ"),
+    // which is why the original code joined at all. Only the index was wrong.
+    int trx = 0;
+    if (argToInt(args, 0, trx)) {
+        if (trx < 0 || trx >= trxCount) {
+            return {};
+        }
+        return args.mid(1).join(',');
+    }
+    return args.join(',');
+}
+
 QString TciProtocol::cmdCwMacros(const QStringList& args)
 {
-    if (!m_model || args.isEmpty()) return {};
-    QString text = args.join(',');
-    if (text.isEmpty()) return {};
-    QString cmd = QStringLiteral("cwx send \"%1\"").arg(text);
-    QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
+    if (!m_model || args.isEmpty()) {
+        return {};
+    }
+
+    // TciServer and RadioModel share the GUI thread. Resolve against the
+    // receiver map now, while handling the command, so slice churn cannot
+    // change how the same wire message is interpreted one event-loop turn
+    // later. Only validated text crosses the queued boundary.
+    const int trxCount = m_trxMap ? m_trxMap->trxCount(m_model)
+                                  : static_cast<int>(m_model->slices().size());
+    const QString text = cwMacrosTextFromArgs(args, trxCount);
+    if (text.isEmpty()) {
+        qCWarning(lcCat) << "TCI: cw_macros ignored \u2014 empty text or "
+                            "invalid receiver index";
+        return {};
+    }
+
+    QMetaObject::invokeMethod(m_model, [model = m_model, text]() {
         if (!model->hasRadioSideCwKeyer()) {
             qCWarning(lcCat) << "TCI: cw_macros ignored \u2014 radio has no "
                                 "radio-side CW keyer";
             return;
         }
-        model->sendCmdPublic(cmd, nullptr);
+        const QString rejection = model->cwTextValidationError(text);
+        if (!rejection.isEmpty()) {
+            qCWarning(lcCat) << "TCI: cw_macros ignored:" << rejection;
+            return;
+        }
+        model->cwxModel().send(text);
     }, Qt::QueuedConnection);
     return {};
 }
@@ -1633,107 +1606,12 @@ QString TciProtocol::cmdCwMacrosStop()
 {
     if (!m_model) return {};
     QMetaObject::invokeMethod(m_model, [model = m_model]() {
-        if (!model->hasRadioSideCwKeyer()) return;
-        model->sendCmdPublic("cwx clear", nullptr);
-    }, Qt::QueuedConnection);
-    return {};
-}
-
-// ── IQ streaming ───────────────────────────────────────────────────────────
-
-QString TciProtocol::cmdIqStart(const QStringList& args)
-{
-    if (!m_model || args.isEmpty()) return {};
-    // Bound the index BEFORE the arithmetic: argToInt accepts INT_MAX (it
-    // parses cleanly — it is "99999999999" that clears ok), and `trx + 1`
-    // would then be signed overflow, i.e. UB reachable from any TCI client on
-    // the one PR whose whole subject is boundary validation. Checking the
-    // index rather than the result also subsumes the old channel range test.
-    //
-    // No observable behaviour changes: DaxIqModel::createStream() already
-    // rejects an out-of-range channel, so this is strictly about keeping the
-    // arithmetic defined for the weekly UBSan job. There is deliberately no
-    // test asserting the rejection — there would be nothing to observe — only
-    // a positive control that an in-range index still creates its stream.
-    int trx = 0;
-    if (!argToInt(args, 0, trx)) return {};
-    if (trx < 0 || trx > 3) return {};       // DAX IQ channels are 1-4
-    const int channel = trx + 1;  // TRX 0 → DAX IQ channel 1
-    // Creating the dax_iq stream is not enough to make IQ flow: on FlexRadio
-    // `daxiq_channel` is a Panadapter property, so the radio streams nothing
-    // (or a stale pan's IQ) until a panadapter is routed to this channel with
-    // `display pan set <panId> daxiq_channel=N`. The GUI does this from the
-    // spectrum overlay menu, but a TCI skimmer client (SDC / CW Skimmer) has no
-    // such hook — so bind the requested TRX's pan here. Mirrors the only other
-    // non-GUI IQ consumer, WfmDemodulator, and centers the stream on the same
-    // pan whose center is reported to the client via dds: (#3910/#3913).
-    const SliceModel* s = sliceForTrx(trx);
-    const QString panId = s ? s->panId() : QString();
-    QMetaObject::invokeMethod(m_model, [model = m_model, channel, panId]() {
-        model->daxIqModel().createStream(channel);
-        if (!panId.isEmpty())
-            model->sendCommand(QStringLiteral("display pan set %1 daxiq_channel=%2")
-                                   .arg(panId).arg(channel));
-    }, Qt::QueuedConnection);
-    return {};
-}
-
-QString TciProtocol::cmdIqStop(const QStringList& args)
-{
-    if (!m_model || args.isEmpty()) return {};
-    // Bounded before the addition, same as cmdIqStart above.
-    int trx = 0;
-    if (!argToInt(args, 0, trx)) return {};
-    if (trx < 0 || trx > 3) return {};       // DAX IQ channels are 1-4
-    const int channel = trx + 1;
-    QMetaObject::invokeMethod(m_model, [model = m_model, channel]() {
-        model->daxIqModel().removeStream(channel);
-    }, Qt::QueuedConnection);
-    return {};
-}
-
-QString TciProtocol::cmdIqSampleRate(const QStringList& args, bool isSet)
-{
-    if (!isSet) {
-        if (m_model) {
-            int rate = m_model->daxIqModel().stream(1).sampleRate;
-            return QStringLiteral("iq_samplerate:%1;").arg(rate);
+        if (!model->hasRadioSideCwKeyer()) {
+            return;
         }
-        return QStringLiteral("iq_samplerate:48000;");
-    }
-
-    if (args.isEmpty()) return {};
-    // Deliberately NOT the drop-on-unparseable posture the rest of this file
-    // uses: an unparseable rate joins the unsupported-rate branch below rather
-    // than returning {}. #3913 made this command reply to a rejection on
-    // purpose, because a skimmer (CW Skimmer / SDC) blocks waiting for the
-    // confirmation and silence would hang it. Rejecting is still rejecting —
-    // it just says so out loud, which is strictly better than dropping here.
-    int rate = 0;
-    const bool rateParsed = argToInt(args, 0, rate);
-    if (!rateParsed
-        || (rate != 24000 && rate != 48000 && rate != 96000 && rate != 192000)) {
-        // Reject without hanging the requester: report the rate that remains
-        // in force. No pending notification is set because other clients saw
-        // no state change (#3913 review).
-        const int currentRate = m_model
-            ? m_model->daxIqModel().stream(1).sampleRate
-            : 48000;
-        return QStringLiteral("iq_samplerate:%1;").arg(currentRate);
-    }
-    if (m_model) {
-        QMetaObject::invokeMethod(m_model, [model = m_model, rate]() {
-            model->daxIqModel().setSampleRate(1, rate);
-        }, Qt::QueuedConnection);
-    }
-    // Echo the achieved rate to BOTH the requester and other clients. The
-    // server is authoritative for the rate (it clamps/rejects above), so a
-    // skimmer (CW Skimmer / SDC) blocks waiting for this confirmation. The
-    // dispatcher sends the return value to the requesting socket and the
-    // pendingNotification to all *other* sockets, so each client gets exactly
-    // one copy — without the return, the requester got no reply at all. (#3910)
-    m_pendingNotification = QStringLiteral("iq_samplerate:%1;").arg(rate);
-    return QStringLiteral("iq_samplerate:%1;").arg(rate);
+        model->cwxModel().clearBuffer();
+    }, Qt::QueuedConnection);
+    return {};
 }
 
 // ── CW keyer (straight key via TCI) ────────────────────────────────────────
@@ -1762,10 +1640,9 @@ QString TciProtocol::cmdCwKeyerSpeed(const QStringList& args, bool /*isSet*/)
     if (!m_model) return {};
     int wpm = 0;
     if (!argToInt(args, args.size() == 1 ? 0 : 1, wpm)) return {};
-    if (wpm < 5 || wpm > 100) return {};
-    QString cmd = QStringLiteral("cw wpm %1").arg(wpm);
-    QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
-        model->sendCmdPublic(cmd, nullptr);
+    if (wpm < m_model->cwTextMinWpm() || wpm > m_model->cwTextMaxWpm()) return {};
+    QMetaObject::invokeMethod(m_model, [model = m_model, wpm]() {
+        model->transmitModel().setCwSpeed(wpm);
     }, Qt::QueuedConnection);
     m_pendingNotification = QStringLiteral("cw_keyer_speed:%1;").arg(wpm);
     return {};
@@ -2106,25 +1983,11 @@ QString TciProtocol::cmdDiguOffset(const QStringList& args, bool /*isSet*/)
 
 // ── Focus / TX frequency ───────────────────────────────────────────────────
 
-// `active_slice:<trx>;` — AetherSDR extension (#4160). Read-only: reports
-// which slice holds GUI focus so a control surface can follow the operator
-// instead of hardcoding trx 0.
-//
-// Not to be confused with `set_in_focus` below — that is the inverse
-// direction (a client asking us to raise our window).
-//
-// SET is deliberately ignored. Focus is GUI-owned; letting a remote client
-// steal it would change default UX for every connected surface, which is
-// RFC territory (GOVERNANCE.md, "What requires an RFC"). Silent ignore
-// matches the TCI convention for commands the server does not honor.
-//
-// GET/SET follows the same split handleCommand() documents for every other
-// command: 0-1 args = GET, 2+ = SET. active_slice has no per-TRX form, so the
-// lone argument in `active_slice:0;` is redundant — but that is the shape a
-// client written against the rest of this protocol (`rx_volume:0;`,
-// `rx_mute:0;`) will send, and answering it is strictly more useful than
-// silence. Replying to a would-be setter with the unchanged focus also tells
-// them the SET did not take, which silence cannot.
+// `active_slice:<trx>;` — AetherSDR extension (#4160), read-only: reports the
+// GUI-focused slice so control surfaces can follow it. (`set_in_focus` is the
+// opposite direction.) SET (2+ args) is ignored: focus is GUI-owned and
+// remote focus-steal would need an RFC. A 1-arg form is answered as a GET,
+// since that's what clients shaped like `rx_mute:0;` send.
 QString TciProtocol::cmdActiveSlice(const QStringList& args)
 {
     if (args.size() >= 2) return {};   // SET — ignored, see above

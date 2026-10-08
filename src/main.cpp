@@ -3,6 +3,7 @@
 #include "gui/FramelessMessageBox.h"
 #include "gui/SliceColorManager.h"
 #include "core/AppSettings.h"
+#include "core/SystemInfo.h"
 #include "core/SettingsBootstrap.h"
 #include "core/SettingsCredentialPolicy.h"
 #include "core/SettingsDatabase.h"
@@ -12,8 +13,10 @@
 #include "core/AutomationBridgeSettings.h"
 #include "core/DisplayPresence.h"
 #include "core/GpuSelector.h"
+#include "core/QtAudioBackendGuard.h"
 #include "core/LogManager.h"
 #include "core/ShutdownTrace.h"
+#include "core/SystemInventory.h"
 #include "core/MacMicPermission.h"
 #include "core/AutomationServer.h"
 
@@ -270,55 +273,20 @@ int main(int argc, char* argv[])
     // applyAtStartup() is otherwise independent (pure sysfs reads + PRIME-var
     // qputenv, no Qt/GL dependency), so nothing here needs it to go first.
 
-    // Prefer native Wayland when running under a Wayland session (#1233).
-    // Without this, Qt may fall back to XWayland (xcb platform) where GLX
-    // context switching between the main window and child dialogs triggers
-    // a BadAccess crash (X_GLXMakeCurrent) on some compositors.
-    // Only set when QT_QPA_PLATFORM isn't already configured by the user.
-    //
-    // "wayland;xcb", not "wayland": Qt reads the value as an ordered list and
-    // moves to the next entry when a plugin cannot be loaded, so a build or
-    // host without the Wayland plugin lands on xcb instead of aborting with
-    // "no Qt platform plugin could be initialized".
-    //
-    // That abort is precisely what #1389 was. The AppImage forced plain
-    // "wayland" while shipping no Wayland platform plugin inside the AppDir.
-    // The plugin was never missing from the Qt build — qtwayland rides in the
-    // base aqt package — but linuxdeploy-plugin-qt deploys platforms/libqxcb.so
-    // and nothing else unless EXTRA_PLATFORM_PLUGINS names more, so every
-    // Wayland-session user got a binary that would not start. The carve-out
-    // added then — skip this block under APPIMAGE — treated the symptom, and
-    // its stated reason (a bundled plugin mismatching the compositor's protocol
-    // version) described something that never happened: there was no bundled
-    // plugin to mismatch.
-    //
-    // The carve-out is gone because both of its causes are: appimage.yml now
-    // deploys the Wayland platform plugin and asserts it reached the AppDir,
-    // and this fallback turns a missing plugin into a downgrade to XWayland
-    // rather than a failure to start. Removing it also closes a real gap —
-    // AppImage users were the only Linux users not receiving the #1233
-    // XWayland GLX fix that this block exists to deliver.
-    //
-    // QT_QPA_PLATFORM=xcb remains the escape hatch if a compositor renders
-    // badly under native Wayland (documented in README next to AETHER_NO_GPU).
+    // Prefer native Wayland in a Wayland session (#1233): under XWayland, GLX
+    // context switching between windows crashes with BadAccess on some compositors.
+    // "wayland;xcb" is an ordered fallback list, so a host without the Wayland
+    // plugin lands on xcb instead of failing to start (#1389); appimage.yml deploys
+    // the Wayland plugin. Skipped when the user sets QT_QPA_PLATFORM (xcb is the
+    // documented escape hatch, README next to AETHER_NO_GPU).
     if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
         const QByteArray session = qgetenv("XDG_SESSION_TYPE");
         if (session == "wayland" && qEnvironmentVariableIsSet("WAYLAND_DISPLAY")) {
-            // Only override to xcb when we AFFIRMATIVELY detect a headless
-            // session — DRM connectors present, at least one "disconnected",
-            // none connected (e.g. a Pi 5 reached over wayvnc). Native-Wayland
-            // hardware GL cannot allocate a window surface with no DRM scanout,
-            // so the panadapter renders black under an EGL_BAD_MATCH storm
-            // (QT_OPENGL=software does NOT help — the failure is the wayland-egl
-            // surface, not the renderer). XWayland renders fine; "xcb;wayland"
-            // still falls back to wayland if the xcb plugin is absent. If we
-            // cannot tell (no DRM connectors, or every connector reports
-            // "unknown"), keep the native-Wayland default rather than assume
-            // headless. A physical display restores it too.
-            //
-            // Detect on Linux only; a bool with an #else arm keeps the branch
-            // below preprocessor-safe (an added branch can't silently rebind
-            // the non-Linux case).
+            // Override to xcb only when the session is affirmatively headless (DRM
+            // connectors present, none connected, e.g. a Pi 5 over wayvnc): native-Wayland
+            // EGL cannot allocate a window surface without DRM scanout and the panadapter
+            // renders black (QT_OPENGL=software doesn't help). Unknown -> keep Wayland.
+            // Linux-only detection; the bool with an #else arm keeps the branch below safe.
 #ifdef __linux__
             const AetherSDR::DisplayPresence presence =
                 AetherSDR::detectDisplayPresence();
@@ -340,6 +308,13 @@ int main(int argc, char* argv[])
     // Runs AFTER the QT_QPA_PLATFORM block above so GpuSelector::willUseWayland()
     // reads the platform we actually chose (see the ORDER note above).
     AetherSDR::GpuSelector::applyAtStartup();
+
+    // Qt 6.12's QtMultimedia defaults to its PipeWire audio backend and
+    // segfaults enumerating devices when it cannot create a PipeWire context
+    // (libpipewire installed, client configuration missing). Must run before
+    // anything touches QMediaDevices; QApplication is the safe bound. Never
+    // overrides a QT_AUDIO_BACKEND the user set.
+    AetherSDR::QtAudioBackendGuard::applyAtStartup();
 
 #ifdef __linux__
     // Install a tolerant X11 error handler before QApplication and before any
@@ -401,6 +376,17 @@ int main(int argc, char* argv[])
 #endif
     QApplication app(argc, argv);
 
+    // Name the GUI thread. Qt names the threads it starts, propagating
+    // QThread::objectName() in QThreadPrivate::start(), but the main thread was
+    // never started that way — so it is the one thread with no name, in the
+    // System Info table (#2554) and in Instruments, perf and ps alike. It is
+    // also usually the busiest, which made "busiest: (unnamed)" the first thing
+    // the Threads tab reported. On Linux only the Qt half applies: there the
+    // main thread is the thread-group leader, whose kernel name is the process
+    // name, so it was never unnamed and renaming it would rename the process
+    // for ps and pgrep (ThreadName.cpp).
+    AetherSDR::SystemInfo::setCurrentThreadName("AetherSDR-GUI");
+
 #ifdef Q_OS_MAC
     if (!startupAbortGuard.disarm()) {
         std::fputs("AetherSDR startup error: could not restore the SIGABRT "
@@ -410,18 +396,11 @@ int main(int argc, char* argv[])
     }
 #endif
 
-    // Release the Hermes-Lite 2 if this process is killed or crashes.
-    //
-    // A signal tears down nothing — Hl2Backend's destructor never runs — and an
-    // HL2 that is never told to stop keeps streaming at a host that is gone,
-    // then stops answering discovery until it is physically power-cycled.
-    // Reproduced three times with a plain `kill` on a connected session.
-    //
-    // Installed HERE, after the macOS startup guard has restored SIGABRT: doing
-    // it earlier would have the guard overwrite the handler for that signal.
-    // No-op until a radio is actually connected, so it costs a disconnected run
-    // nothing. See Hl2EmergencyStop.h for why it acts inside the handler rather
-    // than deferring to the event loop.
+    // Release the Hermes-Lite 2 if this process is killed or crashes: a signal
+    // skips Hl2Backend's destructor, and an HL2 never told to stop keeps streaming,
+    // then ignores discovery until power-cycled. Installed after the macOS startup
+    // guard restores SIGABRT so the guard can't overwrite it. No-op while
+    // disconnected; see Hl2EmergencyStop.h for why it acts inside the handler.
     AetherSDR::hl2::installEmergencyStopSignalHandlers();
 
     app.setApplicationName("AetherSDR");
@@ -481,16 +460,10 @@ int main(int argc, char* argv[])
         }
     }
 
-    // ── Bundled Inter UI font (SIL OFL 1.1) ───────────────────────────────
-    // The theme's `font.family.ui` token resolves to "Inter" (ThemeManager),
-    // with the QSS fallback chain "Inter", "Segoe UI", sans-serif.  Inter
-    // ships with nothing by default, so on a stock box the chain fell through
-    // to Segoe UI on Windows and SF/Helvetica on macOS — every px-tuned QSS
-    // (paddings, fixed heights, the flag header row) was implicitly tuned
-    // against one family and rendered against another per platform (#4036).
-    // Register the static Regular + Bold instances so "Inter" resolves the
-    // same everywhere.  Static weights, not the variable font: variable-axis
-    // support needs Qt 6.7+ and Linux CI is pre-6.5.
+    // Bundled Inter UI font (SIL OFL 1.1). The theme's `font.family.ui` resolves to
+    // "Inter", and px-tuned QSS assumes it, so register it rather than fall through
+    // to a per-platform family (#4036). Static Regular + Bold, not the variable
+    // font: variable-axis support needs Qt 6.7+.
     {
         static constexpr const char* kInterFonts[] = {
             ":/fonts/Inter-Regular.ttf",
@@ -507,20 +480,10 @@ int main(int argc, char* argv[])
     // Shows the system prompt on first launch so it's ready before PTT.
     requestMicrophonePermission();
 
-    // One-shot config-dir migration: the older releases wrote some user data
-    // (FFTW wisdom, ChannelStrip presets, firmware files, user themes, the
-    // ONNX signal-classifier model) under QStandardPaths::AppConfigLocation,
-    // which resolves to a double-nested ~/.config/AetherSDR/AetherSDR/ (or
-    // %LOCALAPPDATA%/AetherSDR/AetherSDR/ on Windows, or the equivalent on
-    // macOS) because both organizationName and applicationName are
-    // "AetherSDR".  The new release uses GenericConfigLocation + "/AetherSDR"
-    // everywhere — a single ~/.config/AetherSDR/ matching the AppSettings
-    // file's location.  This block migrates any data the operator already
-    // has at the old path up to the new path.
-    //
-    // Idempotent: skips items whose target already exists, then removes the
-    // old dir if it ends up empty.  Subsequent launches early-return because
-    // the old dir no longer exists.
+    // One-shot migration from the double-nested AppConfigLocation
+    // (~/.config/AetherSDR/AetherSDR/, because org and app name are both
+    // "AetherSDR") to GenericConfigLocation + "/AetherSDR", where AppSettings lives.
+    // Idempotent: skips existing targets and removes the old dir once empty.
     {
         const QString newDir = QStandardPaths::writableLocation(
                                    QStandardPaths::GenericConfigLocation)
@@ -620,9 +583,17 @@ int main(int argc, char* argv[])
     static_cast<void>(AetherSDR::Nr2SettingsModel::instance());
     AetherSDR::AppSettings::instance().initializeGuiClientIdentity();
     {
+        // Retired keys nothing reads any more. AboutDialogGeometry went when
+        // About moved to CanonWindow, which opens centred (RFC #6226).
         auto& s = AetherSDR::AppSettings::instance();
-        if (s.contains("SHistorySoftEdgeDb")) {
-            s.remove("SHistorySoftEdgeDb");
+        bool removed = false;
+        for (const char* key : {"SHistorySoftEdgeDb", "AboutDialogGeometry"}) {
+            if (s.contains(key)) {
+                s.remove(key);
+                removed = true;
+            }
+        }
+        if (removed) {
             s.save();
         }
     }
@@ -647,6 +618,8 @@ int main(int argc, char* argv[])
         // (GpuSelector::applyAtStartup() ran before logging was available).
         qInfo().noquote() << "GpuSelector: render GPU ->"
                           << AetherSDR::GpuSelector::appliedSummary();
+        qInfo().noquote() << "QtAudioBackendGuard:"
+                          << AetherSDR::QtAudioBackendGuard::appliedSummary();
 
         // Likewise the Wayland platform choice (decided before logging existed).
         if (g_qpaPlatformChoice) {
@@ -694,6 +667,16 @@ int main(int argc, char* argv[])
     // Load per-module logging toggles (must be after AppSettings::load)
     AetherSDR::LogManager::instance().loadSettings();
 
+    // Hardware/capability inventory (#4986): after loadSettings() so the
+    // aether.sysinfo filter rules are live, and before the main window exists
+    // so no ggml code can have run yet (Copy Assist is built lazily on first
+    // panel open — on a CPU below the speech engine's ISA baseline, entering
+    // ggml is the crash this block diagnoses). Flushed explicitly so the block
+    // is on disk before anything else in startup runs, rather than on the
+    // async writer's next periodic flush.
+    AetherSDR::SystemInventory::logSystemInventory();
+    AetherSDR::LogManager::instance().flushLog();
+
     qDebug() << "Starting AetherSDR" << app.applicationVersion();
 
     int exitCode = 0;
@@ -716,19 +699,11 @@ int main(int argc, char* argv[])
             }
         }
 
-        // Agent-drivable automation bridge (#3646, Phase 0). Off in production;
-        // starts only when AETHER_AUTOMATION is set. AETHER_AUTOMATION_SOCKET
-        // overrides the QLocalServer name verbatim (explicit, for a driver that
-        // wants a known endpoint). Otherwise the default name is PID-suffixed so
-        // two concurrent automation instances don't steal each other's socket
-        // (QLocalServer::removeServer() unlinks a sibling's live socket on a
-        // shared name); drivers find the right one via the discovery file/dir.
-        // Agent automation bridge (#3646). Construction + handler wiring now
-        // lives in MainWindow::startAutomationBridge() so the same path serves
-        // both triggers. Start it when the operator persisted the toggle in
-        // Radio Setup → Network, OR when AETHER_AUTOMATION is set (the launch-
-        // time override that headless drivers/CI rely on — always wins). The
-        // window owns the server for its lifetime.
+        // Agent automation bridge (#3646), built in MainWindow::startAutomationBridge().
+        // Starts when the Radio Setup -> Network toggle is persisted or AETHER_AUTOMATION
+        // is set (the headless/CI override). AETHER_AUTOMATION_SOCKET names the socket
+        // verbatim; otherwise it is PID-suffixed so concurrent instances don't unlink
+        // each other's socket. The window owns the server.
         const bool bridgePersisted = AetherSDR::AutomationBridgeSettings::enabled();
         if (qEnvironmentVariableIsSet("AETHER_AUTOMATION") || bridgePersisted)
             window.startAutomationBridge();

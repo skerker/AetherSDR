@@ -17,6 +17,12 @@
 
 namespace AetherSDR {
 
+// Radios at or below this declared output get an arc scaled to their own limit
+// instead of the 120 W one. Deliberately the SAME threshold the cross-needle
+// already uses (CrossNeedleMeterGeometry::rangeMultiplierFor), so a QRP radio
+// cannot end up with one gauge on a QRP scale and the other on a 120 W scale.
+constexpr int kQrpMaxWatts = 20;
+
 SMeterWidgetAccessible::SMeterWidgetAccessible(QWidget* widget)
     : QAccessibleWidget(widget, QAccessible::Indicator)
 {
@@ -1134,6 +1140,13 @@ void SMeterWidget::setPowerScale(int maxWatts, bool hasAmplifier)
     } else if (maxWatts > 100) {
         m_powerScaleMax = 600.0f;
         m_powerRedStart = 500.0f;
+    } else if (maxWatts > 0 && maxWatts <= kQrpMaxWatts) {
+        // QRP arc, scaled to the radio's declared limit (QRP spans 1-20 W, so no
+        // single constant fits). Same threshold as
+        // CrossNeedleMeterGeometry::rangeMultiplierFor so both gauges agree, and the
+        // same 1.2x headroom / red-at-rated relationship as the 100 W case.
+        m_powerScaleMax = static_cast<float>(maxWatts) * 1.2f;
+        m_powerRedStart = static_cast<float>(maxWatts);
     } else {
         m_powerScaleMax = 120.0f;
         m_powerRedStart = 100.0f;

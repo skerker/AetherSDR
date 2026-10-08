@@ -1,4 +1,5 @@
 #include "ClientGateLevelView.h"
+#include "PanelTick.h"
 #include "core/ClientGate.h"
 
 #include <QPainter>
@@ -13,8 +14,8 @@ namespace AetherSDR {
 
 namespace {
 
-constexpr int kHistoryCount = 120;      // ~4 s at 30 Hz
-constexpr int kPollMs       = 33;
+constexpr int kHistoryCount = 240;      // ~4 s at kPanelTickMs
+constexpr int kPollMs       = kPanelTickMs;
 
 inline QColor kBgColor() { return AetherSDR::ThemeManager::instance().color("color.background.0"); }
 inline QColor kFrameColor() { return AetherSDR::ThemeManager::instance().color("color.background.1"); }
@@ -50,8 +51,11 @@ ClientGateLevelView::ClientGateLevelView(QWidget* parent) : QWidget(parent)
 void ClientGateLevelView::setGate(ClientGate* gate)
 {
     m_gate = gate;
-    if (m_gate) m_timer->start();
-    else        m_timer->stop();
+    // Only while on screen: see PanelTick.h. Binding a model to a widget
+    // that is not visible used to start a poll nothing would ever stop,
+    // because a never-shown widget gets no hideEvent.
+    if (m_gate && isVisible()) m_timer->start();
+    else                         m_timer->stop();
     update();
 }
 
@@ -105,17 +109,9 @@ void ClientGateLevelView::paintEvent(QPaintEvent*)
         p.drawText(QPointF(full.left() + 2.0f, y + 3.0f), s);
     }
 
-    // History plot — newest sample at the right edge, older scrolling
-    // left.  Draw order (bottom to top visually so later strokes
-    // paint over earlier ones cleanly):
-    //   1. Audible band — from plot.bottom up to (input + grDb),
-    //      filled amber.  Represents the portion of the signal that
-    //      actually makes it through the gate.
-    //   2. Gated band — from (input + grDb) up to input level,
-    //      filled dark gray.  Represents the gain being "taken away"
-    //      from the input.
-    //   3. Input top-edge outline in bright white so the original
-    //      signal envelope stays legible on top of the fills.
+    // Newest sample at the right edge. Draw order: (1) audible band, bottom to
+    // input+grDb, amber; (2) gated band, input+grDb to input, dark gray;
+    // (3) input envelope outline in white on top.
     p.save();
     p.setClipRect(plot);
 
@@ -214,6 +210,19 @@ void ClientGateLevelView::paintEvent(QPaintEvent*)
             p.fillRect(fill, kPeakColor());
         }
     }
+}
+
+
+void ClientGateLevelView::showEvent(QShowEvent* ev)
+{
+    QWidget::showEvent(ev);
+    if (m_gate && m_timer) m_timer->start();
+}
+
+void ClientGateLevelView::hideEvent(QHideEvent* ev)
+{
+    if (m_timer) m_timer->stop();
+    QWidget::hideEvent(ev);
 }
 
 } // namespace AetherSDR

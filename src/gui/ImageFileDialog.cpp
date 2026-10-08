@@ -1,4 +1,5 @@
 #include "ImageFileDialog.h"
+#include "ScopedChildWidget.h"
 
 #include <QButtonGroup>
 #include <QDialog>
@@ -259,7 +260,8 @@ private:
 
 QString getBackgroundImagePath(QWidget* parent, const QString& caption)
 {
-    QFileDialog dlg(parent, caption, QString(), buildImageFilter());
+    ScopedChildWidget<QFileDialog> dialogOwner(parent, caption, QString(), buildImageFilter());
+    QFileDialog& dlg = *dialogOwner.get();
     dlg.setFileMode(QFileDialog::ExistingFile);
     dlg.setOption(QFileDialog::DontUseNativeDialog, true);
     dlg.setAcceptMode(QFileDialog::AcceptOpen);
@@ -279,21 +281,11 @@ QString getBackgroundImagePath(QWidget* parent, const QString& caption)
     PreviewLabel* previewLabel = nullptr;
 
     if (grid && listView) {
-        // Deliberately not touching QFileDialog's own view/flow/layout
-        // (setViewMode, setFlow, setWrapping, setResizeMode,
-        // setUniformItemSizes) — that was ruled out on real hardware as the
-        // cause of broken drive/folder navigation.
-        //
-        // The actual cause: QFileDialogPrivate's own navigation slots
-        // (_q_enterDirectory and friends) map a clicked view index back to
-        // the real QFileSystemModel via a private `proxyModel` pointer that
-        // is only populated by QFileDialog::setProxyModel(). Setting
-        // listView/treeView's model directly (as this used to do) leaves
-        // that private pointer null, so the dialog resolves proxy-model
-        // indices against the raw model and silently fails to navigate —
-        // clicking anything did nothing. setProxyModel() is the sanctioned
-        // API for exactly this (augmenting the model backing the dialog's
-        // views) and wires both listView and treeView itself.
+        // Use setProxyModel(), never set the views' models directly:
+        // QFileDialogPrivate's navigation slots map view indices through a
+        // private proxyModel pointer that only setProxyModel() populates, so
+        // otherwise drive/folder navigation silently fails. Leave the dialog's
+        // view/flow/layout settings alone.
         auto* proxy = new ImageThumbnailProxyModel(&dlg);
         dlg.setProxyModel(proxy);
 
@@ -401,8 +393,10 @@ QString getBackgroundImagePath(QWidget* parent, const QString& caption)
                           [previewLabel](const QString& path) { previewLabel->setPreviewPath(path); });
     }
 
-    if (dlg.exec() != QDialog::Accepted)
+    const int result = dlg.exec();
+    if (!dialogOwner || result != QDialog::Accepted) {
         return {};
+    }
     return dlg.selectedFiles().value(0, QString());
 }
 

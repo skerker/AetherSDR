@@ -1,7 +1,10 @@
 #include "RadioStateMemory.h"
 
 #include <QDebug>
+#include <QJsonArray>
 #include <QJsonDocument>
+
+#include <cmath>
 
 namespace AetherSDR {
 namespace RadioStateMemory {
@@ -13,6 +16,13 @@ using Domain = RadioCapabilities::ClientSettingsDomain;
 bool has(const RadioCapabilities& caps, Domain domain)
 {
     return caps.clientSettingsDomains.testFlag(domain);
+}
+
+// The AGC-off level is client-owned only where the client owns the AGC and the
+// backend declares a writable threshold/off level. Never a family check.
+bool ownsAgcOffLevel(const RadioCapabilities& caps)
+{
+    return has(caps, Domain::Agc) && caps.hasAgcThreshold;
 }
 
 // The extension document's domain sub-keys (PR #4614 review): the engine
@@ -56,6 +66,7 @@ RestoredRadioState load(const RadioSettingsScope& scope,
     if (has(caps, Domain::Tuning)) {
         state.rfFrequencyHz = doc.value(QStringLiteral("rfFrequencyHz")).toDouble();
         state.mode = doc.value(QStringLiteral("mode")).toString();
+        state.tuningStepHz = doc.value(QStringLiteral("tuningStepHz")).toInt();
     }
     if (has(caps, Domain::Passband)) {
         state.filterLowHz = doc.value(QStringLiteral("filterLowHz")).toDouble();
@@ -70,6 +81,34 @@ RestoredRadioState load(const RadioSettingsScope& scope,
         // default must sit outside the control's range — see RestoredRadioState.
         state.agcThreshold =
             doc.value(QStringLiteral("agcThreshold")).toInt(-1);
+    }
+    if (ownsAgcOffLevel(caps)) {
+        // One entry per receiver. A missing key gives an empty list, and an
+        // entry that is not a whole number reads as -1: "not restored".
+        const QJsonArray levels =
+            doc.value(QStringLiteral("agcOffLevels")).toArray();
+        for (const QJsonValue& level : levels) {
+            state.agcOffLevels.append(level.toInt(-1));
+        }
+    }
+    if (has(caps, Domain::Cw)) {
+        state.cwSpeed = doc.value(QStringLiteral("cwSpeed")).toInt();
+        state.cwPitch = doc.value(QStringLiteral("cwPitch")).toInt();
+        state.cwBreakIn = doc.value(QStringLiteral("cwBreakIn")).toInt(-1);
+        state.cwDelay = doc.value(QStringLiteral("cwDelay")).toInt(-1);
+        state.cwSidetone = doc.value(QStringLiteral("cwSidetone")).toInt(-1);
+        state.cwIambic = doc.value(QStringLiteral("cwIambic")).toInt(-1);
+        state.cwIambicMode = doc.value(QStringLiteral("cwIambicMode")).toInt(-1);
+        state.cwSwapPaddles = doc.value(QStringLiteral("cwSwapPaddles")).toInt(-1);
+        state.cwlEnabled = doc.value(QStringLiteral("cwlEnabled")).toInt(-1);
+        state.monGainCw = doc.value(QStringLiteral("monGainCw")).toInt(-1);
+        state.monPanCw = doc.value(QStringLiteral("monPanCw")).toInt(-1);
+    }
+    if (has(caps, Domain::ReceiveOutputLevel)) {
+        // Out of range reads as absent, not clamped: the backend's default
+        // applies rather than a level nobody chose.
+        const int pct = doc.value(QStringLiteral("receiveOutputLevelPct")).toInt(-1);
+        state.receiveOutputLevelPct = (pct >= 0 && pct <= 100) ? pct : -1;
     }
 
     // The extension is gated per domain too: only a declared domain's
@@ -106,7 +145,7 @@ bool store(const RadioSettingsScope& scope, const RadioCapabilities& caps,
     }
 
     // Read-only toward the future: never overwrite a document written by a
-    // newer schema — a v1 rebuild would drop the fields v1 doesn't know and
+    // newer schema — an older rebuild would drop fields it doesn't know and
     // stamp the version back down (PR #4614 review, three independent
     // reports). Mirrors SettingsDatabase's own newer-schema rule.
     // EXACT row only: the guard judges the document this write would
@@ -131,6 +170,9 @@ bool store(const RadioSettingsScope& scope, const RadioCapabilities& caps,
         if (!state.mode.isEmpty()) {
             doc.insert(QStringLiteral("mode"), state.mode);
         }
+        if (state.tuningStepHz > 0) {
+            doc.insert(QStringLiteral("tuningStepHz"), state.tuningStepHz);
+        }
     }
     if (has(caps, Domain::Passband)
         && (state.filterLowHz != 0.0 || state.filterHighHz != 0.0)) {
@@ -148,6 +190,58 @@ bool store(const RadioSettingsScope& scope, const RadioCapabilities& caps,
         if (state.agcThreshold >= 0) {
             doc.insert(QStringLiteral("agcThreshold"), state.agcThreshold);
         }
+    }
+    if (ownsAgcOffLevel(caps)) {
+        // Written only when at least one receiver has a level; -1 holds the
+        // place of a receiver without one.
+        QJsonArray levels;
+        bool any = false;
+        for (const int level : state.agcOffLevels) {
+            levels.append(level >= 0 ? level : -1);
+            any = any || level >= 0;
+        }
+        if (any) {
+            doc.insert(QStringLiteral("agcOffLevels"), levels);
+        }
+    }
+    if (has(caps, Domain::Cw)) {
+        if (state.cwSpeed > 0) {
+            doc.insert(QStringLiteral("cwSpeed"), state.cwSpeed);
+        }
+        if (state.cwPitch > 0) {
+            doc.insert(QStringLiteral("cwPitch"), state.cwPitch);
+        }
+        if (state.cwBreakIn >= 0) {
+            doc.insert(QStringLiteral("cwBreakIn"), state.cwBreakIn);
+        }
+        if (state.cwDelay >= 0) {
+            doc.insert(QStringLiteral("cwDelay"), state.cwDelay);
+        }
+        if (state.cwSidetone >= 0) {
+            doc.insert(QStringLiteral("cwSidetone"), state.cwSidetone);
+        }
+        if (state.cwIambic >= 0) {
+            doc.insert(QStringLiteral("cwIambic"), state.cwIambic);
+        }
+        if (state.cwIambicMode >= 0) {
+            doc.insert(QStringLiteral("cwIambicMode"), state.cwIambicMode);
+        }
+        if (state.cwSwapPaddles >= 0) {
+            doc.insert(QStringLiteral("cwSwapPaddles"), state.cwSwapPaddles);
+        }
+        if (state.cwlEnabled >= 0) {
+            doc.insert(QStringLiteral("cwlEnabled"), state.cwlEnabled);
+        }
+        if (state.monGainCw >= 0) {
+            doc.insert(QStringLiteral("monGainCw"), state.monGainCw);
+        }
+        if (state.monPanCw >= 0) {
+            doc.insert(QStringLiteral("monPanCw"), state.monPanCw);
+        }
+    }
+    // >= 0, so a level of 0 IS written — the sentinel is -1.
+    if (has(caps, Domain::ReceiveOutputLevel) && state.receiveOutputLevelPct >= 0) {
+        doc.insert(QStringLiteral("receiveOutputLevelPct"), state.receiveOutputLevelPct);
     }
 
     // Extension: same per-domain sub-object gate as load().
@@ -175,6 +269,101 @@ bool store(const RadioSettingsScope& scope, const RadioCapabilities& caps,
     if (!scope.setFeature(featureName(), kSchemaVersion, doc)) {
         qWarning() << "RadioStateMemory: operating-state write failed for"
                    << scope.family() << scope.radioId();
+        return false;
+    }
+    return true;
+}
+
+RtlMigrationSource rtlMigrationSource(const RadioSettingsScope& scope)
+{
+    RtlMigrationSource result;
+    if (scope.family() != QLatin1String("rtl")) {
+        return result;
+    }
+    int version = 0;
+    const QJsonObject doc = scope.featureExact(featureName(), &version, &result.status);
+    if (result.status != AppSettings::FeatureReadStatus::Present) {
+        return result;
+    }
+    if (version < 1 || version > kSchemaVersion) {
+        result.status = AppSettings::FeatureReadStatus::Corrupt;
+        return result;
+    }
+    const QStringList numbers{QStringLiteral("rfFrequencyHz"), QStringLiteral("filterLowHz"),
+        QStringLiteral("filterHighHz"), QStringLiteral("sampleRateHz")};
+    for (const QString& key : numbers) {
+        if (!doc.value(key).isDouble()) {
+            result.status = AppSettings::FeatureReadStatus::Corrupt;
+            return result;
+        }
+    }
+    const double rate = doc.value(QStringLiteral("sampleRateHz")).toDouble();
+    if (!std::isfinite(rate) || rate <= 0 || rate > 2147483647.0
+        || std::trunc(rate) != rate) {
+        result.status = AppSettings::FeatureReadStatus::Corrupt;
+        return result;
+    }
+    // Decode this exact snapshot; a second effective read could change scope
+    // or schema if another process replaced/deleted the row in between.
+    result.state.rfFrequencyHz = doc.value(QStringLiteral("rfFrequencyHz")).toDouble();
+    result.state.mode = doc.value(QStringLiteral("mode")).toString();
+    result.state.filterLowHz = doc.value(QStringLiteral("filterLowHz")).toDouble();
+    result.state.filterHighHz = doc.value(QStringLiteral("filterHighHz")).toDouble();
+    result.state.sampleRateHz = static_cast<int>(rate);
+    return result;
+}
+
+bool storeRtlRfGainPreservingLegacy(const RadioSettingsScope& scope,
+                                    const RestoredRadioState& state)
+{
+    if (scope.family() != QLatin1String("rtl")) {
+        qWarning() << "RadioStateMemory: refusing RTL gain update for a non-RTL scope";
+        return false;
+    }
+    int version = 0;
+    AppSettings::FeatureReadStatus status;
+    QJsonObject doc = scope.featureExact(featureName(), &version, &status);
+    if (status == AppSettings::FeatureReadStatus::Corrupt
+        || status == AppSettings::FeatureReadStatus::Unavailable
+        || version > kSchemaVersion) {
+        qWarning() << "RadioStateMemory: refusing RTL gain update over unreadable/newer legacy state";
+        return false;
+    }
+    // This helper understands RTL extension schema 1 only. Missing extVersion
+    // is an older legacy snapshot; a present invalid/future version must never
+    // be laundered into a schema-1 document by an RF-gain update.
+    const QJsonValue storedExtVersion = doc.value(QStringLiteral("extVersion"));
+    if (state.extensionSchemaVersion != 1
+        || (!storedExtVersion.isUndefined()
+            && (!storedExtVersion.isDouble() || storedExtVersion.toDouble() != 1.0))) {
+        qWarning() << "RadioStateMemory: refusing RTL gain update with unsupported/malformed extension version";
+        return false;
+    }
+    const QJsonValue storedExtension = doc.value(QStringLiteral("ext"));
+    if (!storedExtension.isUndefined() && !storedExtension.isObject()) {
+        qWarning() << "RadioStateMemory: refusing RTL gain update over malformed extension";
+        return false;
+    }
+    QJsonObject extension = storedExtension.toObject();
+    const QJsonValue storedGain = extension.value(QStringLiteral("rfGain"));
+    const QJsonValue requestedGain = state.extension.value(QStringLiteral("rfGain"));
+    const QJsonValue gainDb = requestedGain.toObject().value(QStringLiteral("gainDb"));
+    const double gainValue = gainDb.toDouble();
+    if ((!storedGain.isUndefined() && !storedGain.isObject())
+        || !requestedGain.isObject() || !gainDb.isDouble() || !std::isfinite(gainValue)
+        || std::trunc(gainValue) != gainValue || gainValue < -100 || gainValue > 100) {
+        qWarning() << "RadioStateMemory: refusing RTL gain update with malformed gain state";
+        return false;
+    }
+    // Only the known accepted gain value is replaced. Preserve unknown fields
+    // inside rfGain, the rest of the extension and the frozen legacy snapshot.
+    QJsonObject mergedGain = storedGain.toObject();
+    mergedGain.insert(QStringLiteral("gainDb"), gainDb);
+    extension.insert(QStringLiteral("rfGain"), mergedGain);
+    doc.insert(QStringLiteral("ext"), extension);
+    doc.insert(QStringLiteral("extVersion"), state.extensionSchemaVersion);
+    if (!scope.setFeature(featureName(), version > 0 ? version : kSchemaVersion, doc)) {
+        qWarning() << "RadioStateMemory: RTL gain update failed; legacy snapshot retained";
         return false;
     }
     return true;

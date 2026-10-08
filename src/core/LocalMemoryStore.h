@@ -9,33 +9,25 @@
 
 namespace AetherSDR {
 
-// Portable, versioned JSON persistence for the CLIENT-side memory bank — the
-// channels an operator saves on a radio that has no memory storage of its own
-// (Hermes-Lite 2, Kiwi, the demo backend). On a Flex the radio owns the slots
-// and this file is never touched; see RadioCapabilities::persistsMemories.
-//
-// Envelope:
+// Versioned JSON persistence for the CLIENT-side memory bank (local channels and
+// explicitly imported radio snapshots); on a Flex the radio owns active slots
+// (see RadioCapabilities::persistsMemories). Envelope:
 //   {
 //     "format": "aether.memories",
-//     "version": 1,
+//     "version": 1 or 2,
 //     "savedAt": "2026-07-29T14:00:00Z",
 //     "savedBy": "AetherSDR",
 //     "memories": [ { "index": 0, ...MemoryEntry... } ]
 //   }
-//
-// Evolved additively the same way the net schedule is: new fields are optional
-// with MemoryEntry's defaults, unknown fields are ignored, and a file whose
-// version is NEWER than this build is reported as an error rather than
-// half-read — a downgrade must not silently drop channels it cannot represent
-// and then write the loss back to disk.
-//
-// The slot index is stored, not derived from array position. It is the handle
-// the whole memory UX addresses a channel by (spot ids, `memory apply`, the
-// browse panel), so it has to survive a save/load cycle intact even when the
-// bank is sparse.
+// Additive evolution: new fields optional, unknown ignored; a NEWER version is
+// an error, not half-read, so a downgrade can't drop channels and write that
+// back. The slot index is stored (sparse banks keep their handles).
 class LocalMemoryStore {
 public:
-    static constexpr int kFormatVersion = 1;
+    static constexpr int kFormatVersion = 2;
+    // Keep ordinary client memories readable by version-1 builds. Imported
+    // recall state needs version 2: older writers would drop safety metadata.
+    static int formatVersionFor(const QMap<int, MemoryEntry>& memories);
     static constexpr const char* kFormatId = "aether.memories";
 
     // The bank's home since RFC #4603 PR 6: ONE shared feature document in
@@ -53,16 +45,9 @@ public:
         QMap<int, MemoryEntry> memories;
         QStringList errors;
         int version{0};
-        // The file exists but could not be UNDERSTOOD: unparseable JSON, a
-        // non-object root, a foreign format id, or a version newer than this
-        // build. Distinct from `errors`, which also carries recoverable
-        // complaints (a skipped duplicate slot, an entry with no index) where
-        // everything else in the file was read correctly.
-        //
-        // This is the flag that decides whether overwriting is safe. Anything
-        // this build could not read is somebody's data it cannot represent, so
-        // saving over it would destroy channels rather than lose a field —
-        // which is the whole reason the version check exists (see above).
+        // The file exists but could not be UNDERSTOOD (bad JSON, non-object root, foreign
+        // format, newer version), unlike recoverable `errors`. Decides whether
+        // overwriting is safe: never save over data this build can't represent.
         bool unreadable{false};
 
         bool ok() const { return errors.isEmpty(); }

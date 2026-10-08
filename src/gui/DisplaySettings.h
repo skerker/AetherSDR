@@ -1,34 +1,69 @@
 #pragma once
 
 #include "core/AppSettings.h"
+#include "WaterfallTimeMarkers.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 
 namespace AetherSDR {
 
-// Persistence helper for display-related UI toggles (the SmartMTR meter view
-// and its options; future display-feature toggles land here as additional
-// fields).
-//
-// Stored as a nested JSON blob under AppSettings["Display"], per the
-// nested-JSON-per-feature convention (constitution Principle V).
-//
-// RETIRED KEYS — do not reuse. Pre-removal installs still carry these values,
-// so a new feature reusing the name would inherit stale state (e.g. a
-// leftover "True" force-enabling itself):
-//   - "leanMode" (nested, this blob) — Lean Mode, removed with #3283's
-//     mitigation retirement; ex-lean users have "True" persisted.
-//   - "LeanMode" (legacy flat AppSettings key) — pre-blob spelling, was
-//     migrated by the now-removed migrateLegacy().
-//   - "TitleBar" (legacy flat AppSettings JSON blob) — held the removed
-//     title-bar Pan Lock control state.
-//   - "panLockEnabled" (nested in "TitleBar") — removed title-bar Pan Lock.
-//   - "PanLockEnabled" (legacy flat AppSettings key) — pre-blob Pan Lock
-//     spelling migrated by the now-removed TitleBarSettings helper.
+// Display UI toggles (SmartMTR view and options), stored as nested JSON under
+// AppSettings["Display"]. Retired keys, never reuse (old installs still carry
+// values, e.g. "True"): "leanMode" (nested), "LeanMode" (flat), "TitleBar"
+// (flat blob), "panLockEnabled" (nested in TitleBar), "PanLockEnabled" (flat).
 class DisplaySettings {
 public:
+    // Live pan status owns these values. Retire competing legacy copies for
+    // the slot being loaded, preserving client-rendered and other-slot state.
+    static void retireRadioOwnedPanSettings(int slot)
+    {
+        AppSettings& settings = AppSettings::instance();
+        const QStringList keys = {
+            QStringLiteral("DisplayFftAverage"),
+            QStringLiteral("DisplayFftFps"),
+            QStringLiteral("DisplayFftWeightedAvg"),
+            QStringLiteral("DisplayWfLineDuration"),
+            QStringLiteral("DisplayWnbEnabled"),
+            QStringLiteral("DisplayWnbLevel"),
+        };
+        bool removed = false;
+        for (const QString& base : keys) {
+            const QString key = slot == 0 ? base : QString("%1_%2").arg(base).arg(slot);
+            if (settings.contains(key)) {
+                settings.remove(key);
+                removed = true;
+            }
+        }
+        if (removed) {
+            settings.save();
+        }
+    }
+
+    static int waterfallTimeMarkerSeconds(int slot)
+    {
+        if (!isValidPanSlotIndex(slot)) {
+            return 0;
+        }
+        return validWaterfallMarkerInterval(readObj()
+            .value("waterfallTimeMarkers").toObject()
+            .value(QString::number(slot)).toInt(0));
+    }
+
+    static void setWaterfallTimeMarkerSeconds(int slot, int seconds)
+    {
+        if (!isValidPanSlotIndex(slot)) {
+            return;
+        }
+        QJsonObject document = readObj();
+        QJsonObject slotStates = document.value("waterfallTimeMarkers").toObject();
+        slotStates[QString::number(slot)] = validWaterfallMarkerInterval(seconds);
+        document["waterfallTimeMarkers"] = slotStates;
+        write(document);
+    }
+
     // Global panadapter marker overlay preference. Default False preserves the
     // waterfall as signal history unless the operator opts into the overlay.
     static bool extendedPassband()
@@ -40,6 +75,21 @@ public:
     {
         QJsonObject o = readObj();
         o["extendedPassband"] = on ? QStringLiteral("True") : QStringLiteral("False");
+        write(o);
+    }
+
+    // Sibling of extendedPassband for tracking-notch markers. Same default and
+    // same reasoning: the waterfall is a record of what was received, so an
+    // overlay that paints over that history is opt-in.
+    static bool extendedTnf()
+    {
+        return readObj().value("extendedTnf").toString("False") == "True";
+    }
+
+    static void setExtendedTnf(bool on)
+    {
+        QJsonObject o = readObj();
+        o["extendedTnf"] = on ? QStringLiteral("True") : QStringLiteral("False");
         write(o);
     }
 
@@ -56,6 +106,33 @@ public:
     {
         QJsonObject o = readObj();
         o["threeDSliceDepth"] = on ? QStringLiteral("True") : QStringLiteral("False");
+        write(o);
+    }
+
+    // The overlay button rail belongs to the client-side display layout. Keep
+    // one value per stable pan slot inside the feature-owned Display document;
+    // radio-assigned pan IDs are not stable across sessions.
+    static bool panMenuExpanded(int panSlotIndex)
+    {
+        if (!isValidPanSlotIndex(panSlotIndex)) {
+            return true;
+        }
+        const QJsonObject slotStates =
+            readObj().value("panMenuExpanded").toObject();
+        return slotStates.value(QString::number(panSlotIndex))
+                   .toString("True") == "True";
+    }
+
+    static void setPanMenuExpanded(int panSlotIndex, bool expanded)
+    {
+        if (!isValidPanSlotIndex(panSlotIndex)) {
+            return;
+        }
+        QJsonObject o = readObj();
+        QJsonObject slotStates = o.value("panMenuExpanded").toObject();
+        slotStates[QString::number(panSlotIndex)] =
+            expanded ? QStringLiteral("True") : QStringLiteral("False");
+        o["panMenuExpanded"] = slotStates;
         write(o);
     }
 
@@ -192,6 +269,12 @@ public:
     }
 
 private:
+    static bool isValidPanSlotIndex(int panSlotIndex)
+    {
+        constexpr int kPanSlotCount = 4;
+        return panSlotIndex >= 0 && panSlotIndex < kPanSlotCount;
+    }
+
     static QJsonObject readObj()
     {
         const QString json =

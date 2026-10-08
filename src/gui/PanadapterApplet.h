@@ -66,17 +66,24 @@ public:
 
     // CW decode panel
     void setCwPanelVisible(bool visible);
+    // The four CW confidence colors, lowest cost (green) to highest (red).
+    static QString cwCostColor(float cost);
     void appendCwText(const QString& text, float cost = 0.0f);
     void appendCwTextTx(const QString& text, float cost = 0.0f);
     void setCwStats(float pitchHz, float speedWpm);
+    void setCwInputHint(const QString& hint, const QString& reason);
     void clearCwText();
+#ifdef HAVE_DEEPFIST
+    bool deepFistEngineSelected() const;
+    void setCwBackendState(const QString& key, bool tuning, const QString& status, bool preparing,
+                         bool canRetry, const QString& detail);
+    void appendUnscoredCwText(const QString& text);
+    // Colored like appendCwText, but never dropped by the Sens threshold.
+    void appendColoredCwText(const QString& text, float cost);
+#endif
     QPushButton* lockPitchButton()  const { return m_lockPitchBtn; }
     QPushButton* lockSpeedButton()  const { return m_lockSpeedBtn; }
     float        cwCostThreshold()  const { return m_cwCostThreshold; }
-    // Reflect the active decode backend in the header: relabel the Decoder
-    // toggle (DSP/Neural) and grey out the ggmorse-only search controls
-    // (pitch/WPM ranges, lock pitch/speed) that a neural model ignores.
-    void setCwNeuralUi(bool neural);
     // Contact card beside the decoded text — MainWindow's QRZ wiring
     // fills it when the CW stream identifies a station (hidden until then).
     CallsignCard* cwCallsignCard() const { return m_cwCallsignCard; }
@@ -89,15 +96,24 @@ public:
     void  setRttyPanelVisible(bool visible);
     void  appendRttyText(const QString& text, float confidence);
     void  setRttyStats(float markLevel, float spaceLevel, float snrDb, bool locked);
+    void  setRttyInputHint(const QString& hint, const QString& reason);
     void  clearRttyText();
     int   rttyMarkHz()  const;
     int   rttyShiftHz() const;
     float rttyBaud()    const;
     bool  rttyReverse() const;
+    // Per-character confidence below which appendRttyText() drops the
+    // character (#5028).  Confidence is max(mark,space)/(mark+space), so it
+    // lives in [0.5, 1.0]; the slider maps 0..100 onto 0.50..0.95.
+    float rttyConfThreshold() const { return m_rttyConfThreshold; }
 
     QSize sizeHint() const override { return {800, 316}; }
 
 signals:
+#ifdef HAVE_DEEPFIST
+    void cwEngineChanged(const QString& backend);
+    void cwModelActionRequested();
+#endif
     void activated(const QString& panId);
     // The canvas live-move stream (RFC #4887 phase 4; only while on-canvas).
     void canvasDragBegan(const QPoint& globalPos);
@@ -112,10 +128,6 @@ signals:
     void pitchRangeChanged(int minHz, int maxHz);
     void speedRangeChanged(int minWpm, int maxWpm);
     void cwPanelCloseRequested();
-    // Decoder engine toggle in the header: true = DeepCW neural, false = ggmorse.
-    void cwBackendChanged(bool neural);
-    // Header Zero Beat: tune so the received CW tone matches the configured pitch.
-    void cwZeroBeatRequested();
     // RX text that passed the confidence filter and was rendered — the
     // stream the CW callsign spotter watches for "DE <call> <call>".
     void cwRxTextDisplayed(const QString& text);
@@ -170,14 +182,17 @@ private:
 #endif
 
     // CW decode
+#ifdef HAVE_DEEPFIST
+    QComboBox*    m_cwEngineCombo{nullptr};
+    QPushButton* m_cwModelAction{nullptr};
+#endif
     QWidget*      m_cwPanel{nullptr};
     QWidget*      m_cwGrip{nullptr};
     QTextEdit*    m_cwText{nullptr};
     CallsignCard* m_cwCallsignCard{nullptr};
     QLabel*       m_cwStatsLabel{nullptr};
+    QLabel*       m_cwInputHint{nullptr};
     QSlider*      m_cwSensSlider{nullptr};
-    QPushButton*  m_cwBackendBtn{nullptr};   // Decoder: DSP / Neural toggle
-    QPushButton*  m_cwZeroBeatBtn{nullptr};  // Zero Beat (mirrors the VFO-flag button)
     QPushButton*  m_lockPitchBtn{nullptr};
     QPushButton*  m_lockSpeedBtn{nullptr};
     RangeSlider*  m_pitchRangeSlider{nullptr};
@@ -198,10 +213,13 @@ private:
     QWidget*      m_rttyPanel{nullptr};
     QTextEdit*    m_rttyText{nullptr};
     QLabel*       m_rttyStatsLabel{nullptr};
+    QLabel*       m_rttyInputHint{nullptr};
     QComboBox*    m_rttyMarkCombo{nullptr};
     QComboBox*    m_rttyShiftCombo{nullptr};
     QComboBox*    m_rttyBaudCombo{nullptr};
     QPushButton*  m_rttyRevBtn{nullptr};
+    QSlider*      m_rttySensSlider{nullptr};
+    float         m_rttyConfThreshold{0.5f};   // slider default 0 = the confidence floor: never drops
 };
 
 } // namespace AetherSDR

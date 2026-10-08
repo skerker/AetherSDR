@@ -3,6 +3,7 @@
 #include "MidiControlManager.h"
 #include "CwTrace.h"
 #include "LogManager.h"
+#include "ThreadName.h"
 
 #include <RtMidi.h>
 #include <QDateTime>
@@ -154,6 +155,7 @@ bool MidiControlManager::openPortByName(const QString& portName)
 
 void MidiControlManager::closePort()
 {
+    if (m_discardTxInputs) { m_discardTxInputs(); }
     m_hotplugTimer->stop();
     if (m_midiIn) {
         try {
@@ -277,6 +279,16 @@ void MidiControlManager::rtmidiCallback(double deltatime,
                                          std::vector<unsigned char>* message,
                                          void* userData)
 {
+    // Name this RtMidi backend thread once (#2554); it was created by CoreMIDI/ALSA/
+    // WinMM, not us, and is the MIDI input path CW keyer timing is measured through.
+    // A name can only be set from the thread itself; thread_local (not once_flag)
+    // because each input port has its own thread.
+    thread_local bool named = false;
+    if (!named) {
+        named = true;
+        setCurrentThreadName("MidiIn");
+    }
+
     if (!message || message->size() < 2) return;
     auto* self = static_cast<MidiControlManager*>(userData);
     int status = (*message)[0];
@@ -284,6 +296,8 @@ void MidiControlManager::rtmidiCallback(double deltatime,
     int data2 = message->size() > 2 ? (*message)[2] : 0;
     const quint64 traceId = nextCwTraceId();
     const quint64 callbackMs = cwTraceNowMs();
+    const TxCoordinator::Request input = self->m_captureTxInput ? self->m_captureTxInput()
+                                                              : TxCoordinator::Request{};
 
     if (lcCw().isDebugEnabled()) {
         qCDebug(lcCw).noquote().nospace()
@@ -297,14 +311,14 @@ void MidiControlManager::rtmidiCallback(double deltatime,
 
     // Bridge to Qt main thread
     QMetaObject::invokeMethod(self, [self, status, data1, data2,
-                                     traceId, callbackMs, deltatime]() {
-        self->onMidiMessage(status, data1, data2, traceId, callbackMs, deltatime);
+                                     traceId, callbackMs, deltatime, input]() {
+        self->onMidiMessage(status, data1, data2, traceId, callbackMs, deltatime, input);
     }, Qt::QueuedConnection);
 }
 
 void MidiControlManager::onMidiMessage(int status, int data1, int data2,
                                        quint64 traceId, quint64 midiCallbackMs,
-                                       double rtDeltaSeconds)
+                                       double rtDeltaSeconds, const TxCoordinator::Request& input)
 {
     const quint64 dispatchMs = cwTraceNowMs();
     int channel = status & 0x0F;
@@ -411,20 +425,12 @@ void MidiControlManager::onMidiMessage(int status, int data1, int data2,
         return;
     }
 
-    // ── Relative knob mode: decode delta and accumulate ────────────────
-    //
-    // Learned VFO bindings auto-detect the two common signed encodings from the
-    // first unit detent: 1/127 selects two's-complement, the distinctive 63/65
-    // pair selects center-64 (see decodeMidiRelativeCc). Other relative
-    // parameters retain the established two's-complement behavior.
-    //
-    // NOTE: MIDI Learn always marks a VFO CC binding relative (see startLearn),
-    // so the Tier-1/Tier-2 backward-compat paths below (guarded by
-    // !binding.relative) are reached only by legacy non-relative bindings, never
-    // by a freshly-learned one. A binary/Thetis (0/127) encoder learned on the
-    // VFO is therefore decoded here as two's-complement (127 → −1), NOT via
-    // Tier 1 — genuine binary support needs its own encoding, since 0/127 is
-    // ambiguous with two's-complement's own ±1 unit values (tracked in #4402).
+    // Relative knob mode: decode and accumulate. Learned VFO bindings auto-detect the
+    // encoding from the first unit detent (1/127 two's-complement, 63/65 center-64;
+    // see decodeMidiRelativeCc); other relative parameters use two's-complement.
+    // MIDI Learn always marks a VFO CC binding relative, so the Tier-1/Tier-2 paths
+    // below serve only legacy non-relative bindings; a binary 0/127 encoder learned
+    // on the VFO decodes as two's-complement (0/127 is ambiguous with its +/-1; #4402).
     if (binding.relative && msgType == MidiBinding::CC) {
         dispatchRelativeCc(binding, data2);
         return;
@@ -503,7 +509,7 @@ void MidiControlManager::onMidiMessage(int status, int data1, int data2,
 
         // Don't call setter directly — may be on a worker thread while
         // setters access main-thread objects. Emit signal instead. (#502)
-        emit paramActionTrace(binding.paramId, scaled, traceId, midiCallbackMs, dispatchMs);
+        emit paramActionTrace(binding.paramId, scaled, traceId, midiCallbackMs, dispatchMs, input);
     }
 
     emit paramValueChanged(binding.paramId, value);

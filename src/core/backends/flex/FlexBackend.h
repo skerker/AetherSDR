@@ -14,20 +14,13 @@ namespace AetherSDR {
 class RadioConnection;
 class PanadapterStream;
 
-// FlexBackend — the first IRadioBackend implementor (aetherd RFC step 2),
-// wrapping the SmartSDR / FlexRadio wire stack.
-//
-// As of 2.2b it OWNS the wire objects: the RadioConnection and PanadapterStream
-// plus their two worker threads, created here in the exact order RadioModel
-// used (panStream thread first, connection thread second) and torn down here in
-// the exact #502 order (BlockingQueued stop → deleteLater → thread quit/wait).
-// RadioModel holds non-owning pointers it obtains via connection()/panStream()
-// and keeps its command/WAN orchestration and its sub-models — so the move is
-// ownership-only and behavior-neutral.
-//
-// The canonical core verbs build the exact SmartSDR command strings and emit
-// them through the model-provided command sink; they grow onto the live path as
-// the touchpoint burndown converts each model (2.3).
+// FlexBackend — the IRadioBackend for the SmartSDR / FlexRadio wire stack.
+// Owns the RadioConnection and PanadapterStream and their two worker threads:
+// created panStream thread first, connection thread second, and torn down in
+// the #502 order (BlockingQueued stop → deleteLater → thread quit/wait).
+// RadioModel holds non-owning pointers via connection()/panStream() and keeps
+// the command/WAN orchestration and sub-models. Core verbs build SmartSDR
+// command strings and emit them through the model-provided command sink.
 class FlexBackend : public IRadioBackend {
     Q_OBJECT
 
@@ -44,6 +37,10 @@ public:
     // Where the core verbs emit their SmartSDR command strings — RadioModel's
     // existing sendCommand() funnel, so verbs reuse the one wire-write path.
     void setCommandSink(std::function<void(const QString&)> sink);
+    // Primary keying verbs use an operation-fenced writer, never the generic
+    // command sink. The bool distinguishes key-on from cleanup, not authority.
+    // Trusted engine composition supplies the original operation at dispatch.
+    void setTxCommandSink(std::function<void(const QString&, const TxCoordinator::Command&)> sink);
     // Slice verbs (setSliceFrequency/Mode/Filter) route through THIS sink, which
     // RadioModel wires to its TX-inhibit-guarded sendSliceCommand — so keeping
     // the encode's TX safety above the seam (RFC §6). Falls back to the generic
@@ -53,12 +50,32 @@ public:
     // where RadioModel lives — capabilities() is not thread-safe (no off-thread
     // caller exists yet; this documents the assumption).
     void setModelProvider(std::function<QString()> provider);
+    void setIndependentTxSequenceProvider(std::function<quint32()> sequence);
+    IndependentTxControl independentTxControl() const override;
+    bool independentTxReady() const override;
+    void stopIndependentTx(const TxCoordinator::Operation& operation,
+                           const TxCoordinator::StopRequest& request) override;
+
+    // The capacity THIS radio declared in its discovery packet, as opposed to the
+    // model-table estimate (#5594 item 3). Pushed from RadioModel, which owns
+    // discovery. A value <= 0 means "not reported" and keeps the model-table
+    // estimate. Emits capabilitiesChanged() when a value changes, since the
+    // descriptor is what the control protocol serializes.
+    void setRadioReportedCapacity(int maxSlices, int maxPanadapters);
 
     // ---- IRadioBackend ----
     RadioCapabilities capabilities() const override;
     void connectRadio(const RadioConnectRequest& request) override;
     void disconnectRadio() override;
     bool isConnected() const override;
+    void requestSliceTune(int sliceId, const SliceTuneRequest& request) override;
+    void requestSliceFilter(int sliceId, const SliceFilterRequest& request) override;
+    void requestSliceAgc(int sliceId, const SliceAgcRequest& request) override;
+    ReceiveDispatch requestSliceDsp(int sliceId, const SliceDspRequest& request) override;
+    ReceiveDispatch requestSliceAudio(int sliceId, const SliceAudioRequest& request) override;
+    ReceiveDispatch requestSliceSquelch(int sliceId, const SliceSquelchRequest& request) override;
+    ReceiveDispatch requestSliceRxAntenna(int sliceId, const QString& antenna) override;
+    ReceiveDispatch requestSliceLock(int sliceId, bool locked) override;
     void setSliceFrequency(int sliceId, double hz) override;
     void setSliceMode(int sliceId, const QString& mode) override;
     void setSliceFilter(int sliceId, int lowHz, int highHz) override;
@@ -70,7 +87,10 @@ public:
     void removeNotch(int notchId) override;
     void setNotchesEnabled(bool on) override;
     void sendSliceWaveformCommand(int sliceId, const QString& command);
-    void setKeying(bool key) override;
+    void setKeying(bool key, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) override;
+    void setTune(bool on, int tunePowerPercent, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) override;
+    void setAtu(bool start, const AetherSDR::TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) override;
+    void abortCwText(const TxCoordinator::Operation& operation, const AetherSDR::TxCoordinator::Completion& completion = {}) override;
     void invokeExtension(const QString& ns, const QString& verb,
                          quint64 requestId, const QVariant& arg = {}) override;
 
@@ -171,15 +191,19 @@ public:
 
 private:
     void send(const QString& cmd);
+    void sendTx(const QString& cmd, const TxCoordinator::Command& command);
     void sendSlice(const QString& cmd);   // guarded slice path (§6)
+    void sendSliceTune(int sliceId, const SliceTuneRequest& request);
 
     RadioConnection*  m_connection{nullptr};    // owned; lives on m_connThread
     QThread*          m_connThread{nullptr};    // owned (this-parented)
     PanadapterStream* m_panStream{nullptr};     // owned; lives on m_networkThread
     QThread*          m_networkThread{nullptr}; // owned (this-parented)
     std::function<void(const QString&)> m_sink;
+    std::function<void(const QString&, const TxCoordinator::Command&)> m_txSink;
     std::function<void(const QString&)> m_sliceSink;
     std::function<QString()> m_modelProvider;
+    std::function<quint32()> m_sequenceProvider;
 
     // Decode-side handle state (#4198). Captured from the amplifier/tgxl status
     // decode and consumed by invokeExtension() to build the amp/tuner relay wire,
@@ -188,6 +212,23 @@ private:
     // and the encode intent lambdas run there — so a plain QString needs no sync.
     QString m_ampHandle;
     QString m_tunerHandle;
+
+    // Radio-declared capacity (#5594 item 3), 0 until the radio says. Cleared by
+    // clearExtensionHandles() on disconnect so a different radio cannot inherit
+    // the previous one's limits.
+    int m_reportedMaxSlices{0};
+    int m_reportedMaxPanadapters{0};
+
+    // The model name the last capabilitiesChanged() announcement described
+    // (#5594, M1). Flex's whole capability table is derived from the model name
+    // — capabilitiesFor(caps.model) seeds maxSlices, the DSP tier and the rest —
+    // and that name arrives in a `radio ...` status AFTER the connect edge, so
+    // without this the descriptor silently changed with nothing announcing it.
+    // Held here rather than compared through m_modelProvider so the guard does
+    // not depend on radioChanged being delivered synchronously.
+    // Cleared by clearExtensionHandles() on disconnect: a reconnect to a
+    // DIFFERENT radio must announce again.
+    QString m_announcedModel;
 };
 
 }  // namespace AetherSDR

@@ -11,32 +11,18 @@
 
 namespace AetherSDR {
 
-// SPE Expert linear amplifier serial protocol (1.3K-FA / 1.5K-FA / 2K-FA).
-//
-// Protocol authority: "Application Programmer's Guide — Expert 1.3K-FA,
-// Expert 1.5K-FA, Expert 2K-FA", Rev 1.1 (2015-10-15), published by SPE
-// s.r.l. (linear-amplifier.com) — the manufacturer's own spec (see
-// docs/architecture/spe-expert-amplifier-design.md and THIRD_PARTY_LICENSES
-// for the provenance record).
-//
-// Wire framing is asymmetric by direction (unlike ACOM's, which is
-// symmetric — see AcomProtocol.h for that family):
+// SPE Expert amplifier serial protocol (1.3K-FA / 1.5K-FA / 2K-FA).
+// Authority: SPE "Application Programmer's Guide", Rev 1.1 (2015-10-15); see
+// docs/architecture/spe-expert-amplifier-design.md.
 //
 //   host -> amp:  | 0x55 0x55 0x55 | CNT | DATA... | CHK |
 //   amp  -> host: | 0xAA 0xAA 0xAA | CNT | DATA... | CHK... |
 //
-// CNT counts the DATA bytes only (checksum excluded). CHK is the modulo-256
-// sum of the DATA bytes — for the single-byte commands this protocol
-// actually uses, the checksum is simply the command byte repeated. The
-// amplifier's replies use two different checksum shapes (spec §3/§5):
-// the single-byte ACK echoes the received command with a 1-byte checksum,
-// while the 67-byte Status string carries a 16-bit checksum (low byte =
-// sum % 256, high byte = sum / 256) followed by CR LF.
-//
-// Every command is the equivalent of a front-panel keystroke; there is no
-// richer command envelope. Complex operations (settings, antenna presets,
-// firmware updates) are explicitly reserved by SPE for their own KTerm
-// application and are out of scope here by design.
+// CNT counts DATA bytes; CHK = sum(DATA) mod 256 (single-byte commands repeat
+// the command byte). Replies: the ACK echoes the command with a 1-byte
+// checksum; the 67-byte Status has a 16-bit checksum (lo = sum%256, hi =
+// sum/256) then CR LF. Every command is a front-panel keystroke; settings and
+// firmware updates are reserved for SPE's KTerm and out of scope.
 namespace Spe {
 
 constexpr quint8 kHostSync = 0x55;  // host -> amplifier sync byte (x3)
@@ -55,9 +41,9 @@ enum class Key : quint8 {
     BandDown   = 0x02,
     BandUp     = 0x03,
     Antenna    = 0x04,
-    LMinus     = 0x05,  // manual ATU inductance — not exposed in v1 (KTerm territory)
+    LMinus     = 0x05,  // manual ATU inductance — floating LCD presentation only
     LPlus      = 0x06,
-    CMinus     = 0x07,  // manual ATU capacitance — not exposed in v1
+    CMinus     = 0x07,  // manual ATU capacitance — floating LCD presentation only
     CPlus      = 0x08,
     Tune       = 0x09,
     SwitchOff  = 0x0A,  // powers the amplifier down
@@ -109,6 +95,18 @@ struct Frame {
 class FrameParser {
 public:
     void setFrameCallback(std::function<void(const Frame&)> cb) { m_onFrame = std::move(cb); }
+    // Raw LCD display frames (see the Lcd namespace below) use a different
+    // header shape than ACK/Status — the parser recognises them by their
+    // payload-length + type-marker bytes and hands the complete raw frame
+    // here instead of misreading the length field as a CNT byte.
+    void setDisplayCallback(std::function<void(const QByteArray&)> cb) { m_onDisplay = std::move(cb); }
+    // Fires when a complete display-shaped frame fails validation in both
+    // its raw and telnet-escaped readings and is dropped. A display reply
+    // is 371 bytes against Status's ~76, so under the same bit-error rate
+    // (strong RF near the serial run mid-transmit is the field case) it is
+    // ~5x as likely to die — and unlike Status, nothing re-polls it for
+    // most of a poll gap. The owner uses this to schedule a prompt retry.
+    void setDisplayRejectCallback(std::function<void()> cb) { m_onDisplayReject = std::move(cb); }
     void feed(const QByteArray& bytes);
     void reset() { m_buf.clear(); }
 
@@ -120,6 +118,8 @@ private:
 
     QByteArray m_buf;
     std::function<void(const Frame&)> m_onFrame;
+    std::function<void(const QByteArray&)> m_onDisplay;
+    std::function<void()> m_onDisplayReject;
 };
 
 // ── Status string decode (spec §5) ───────────────────────────────────────
@@ -169,6 +169,43 @@ QString alarmText(QChar code);
 
 QString powerLevelName(QChar code);  // L/M/H -> LOW/MID/HIGH
 
+// Remote LCD display (request code 0x80). Undocumented by the spec; decode
+// from a field-proven 1.5K-FA control application. Reply frame (371 bytes):
+//   AA AA AA | 6A 01 (payload length, LE) | 95 FE |
+//   2-byte inverted flag word | 320 character bytes (8 rows x 40 cols) |
+//   40 attribute bytes (one per column, bit N = inverse video on row N) |
+//   2-byte little-endian payload checksum
+// The 362-byte payload runs flag word..attributes; characters start at offset
+// 9 (pinned to a captured frame in spe_protocol_test). Font ROM: 0x00 blank,
+// 0x01..0x7E and 0x80..0xDF pass through, all else blanks.
+namespace Lcd {
+
+constexpr int kRows = 8;
+constexpr int kCols = 40;
+constexpr quint8 kRequestCode = 0x80;
+constexpr int kPayloadOffset = 7;     // sync + length + 95 FE type marker
+constexpr int kPayloadLength = 362;   // flags + characters + attributes
+constexpr int kFlagLength = 2;
+constexpr int kDataOffset = kPayloadOffset + kFlagLength;
+constexpr int kAttributeOffset = kDataOffset + kRows * kCols;
+constexpr int kChecksumOffset = kPayloadOffset + kPayloadLength;
+constexpr int kFrameLength = kChecksumOffset + 2;
+
+QByteArray buildRequest();
+
+// One decoded display refresh: font-ROM indices plus the per-cell
+// inverse-video attribute. Plain aggregate so it can cross a queued signal.
+struct Frame {
+    quint8 chars[kRows][kCols] = {};
+    bool   inverse[kRows][kCols] = {};
+};
+
+// Decodes one complete, checksum-valid logical display frame (header
+// included). Returns nullopt for a wrong header, length, checksum, or size.
+std::optional<Frame> decode(const QByteArray& raw);
+
+}  // namespace Lcd
+
 // ── Remote power-ON (RFC 2217 Telnet COM-port control) ───────────────────
 
 // The Expert powers ON via a pulse on a hardware line of its serial
@@ -202,10 +239,9 @@ QByteArray buildSetControl(quint8 ctrl);
 enum class OptionReply { None, Accepted, Refused };
 
 // Scans a raw inbound chunk for that answer, returning the last one present.
-// Read-only: the negotiation bytes stay in the stream for FrameParser, whose
-// sync-run resync steps over them. A false positive would need the literal
-// sequence FF FD 2C inside a Status payload, which is ASCII CSV and cannot
-// contain 0xFF.
+// Doubled IAC bytes (FF FF) are escaped binary data, not a negotiation verb.
+// SpeConnection only scans while an explicit WILL request is outstanding, so
+// an unescaped raw-mode LCD payload cannot mutate the cached result later.
 OptionReply scanComPortOptionReply(const QByteArray& bytes);
 
 }  // namespace Rfc2217
@@ -239,17 +275,10 @@ QStringList modelIds();
 // H (or an unknown letter) is the model's full nominalPowerW.
 float levelNominalW(const ModelSpec& spec, QChar level);
 
-// The complete power-gauge axis for that level, so the bar rescales as the
-// operator cycles LOW/MID/HIGH exactly like the amplifier's own display.
-//
-// At HIGH this returns the model row's own three figures verbatim — the
-// table is the single source of truth, so correcting a row (the design note
-// §5 invites an owner to verify the 1.3K-FA/2K-FA numbers against real
-// hardware) actually moves the bar instead of being silently overridden by
-// a duplicate derivation in the GUI wiring. LOW/MID have no tabulated
-// warn/max, so they take the hardware-validated 1.5K-FA shape: yellow from
-// nominal−50 W, red from nominal, ceiling at nominal+100 W — which is
-// exactly what the tabulated HIGH rows encode too.
+// Power-gauge axis for a level, so the bar rescales on LOW/MID/HIGH like the
+// amp's display. HIGH returns the model row verbatim (the table is the single
+// source of truth). LOW/MID use the 1.5K-FA shape: yellow from nominal−50 W,
+// red from nominal, ceiling nominal+100 W.
 struct GaugeRange {
     float nominalW{0};  // gauge red threshold
     float warnW{0};     // gauge yellow zone start
@@ -261,3 +290,4 @@ GaugeRange levelGaugeRange(const ModelSpec& spec, QChar level);
 }  // namespace AetherSDR
 
 Q_DECLARE_METATYPE(AetherSDR::Spe::Status)
+Q_DECLARE_METATYPE(AetherSDR::Spe::Lcd::Frame)

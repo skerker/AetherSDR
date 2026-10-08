@@ -46,9 +46,12 @@ QStringList mqttSubscriptionTopics(const QStringList& userTopics);
 
 inline constexpr QLatin1String kCwDecodeTopic   {"aethersdr/cw/decode"};
 inline constexpr QLatin1String kCwTransmitTopic {"aethersdr/cw/transmit"};
-// Note: relay scripts that forward cw/decode into cw/transmit should filter
-// on the topic namespace ("aethersdr/...") to avoid re-publishing AetherSDR's
-// own output back to it and creating a feedback loop.
+// Relay scripts forwarding cw/decode into cw/transmit should filter on the
+// "aethersdr/..." namespace to avoid a feedback loop.
+// Radio-state payload contract: core/MqttRadioState.h. Fields are keyed by
+// PRESENCE; `max_power_level` is the client's best ceiling, not always firmware;
+// and nothing republishes mid-CWX once tx:true has gone out (a disconnect
+// publishes immediately), so the last message can predate the current TX.
 inline constexpr QLatin1String kRadioStateTopic {"aethersdr/radio/state"};
 inline constexpr QLatin1String kAx25RxTopic     {"aethersdr/ax25/rx"};
 inline constexpr QLatin1String kAx25TxTopic     {"aethersdr/ax25/tx"};

@@ -3,6 +3,9 @@
 #include <QObject>
 #include <QString>
 #include <QVector>
+#include <atomic>
+#include <functional>
+#include <memory>
 
 namespace AetherSDR {
 
@@ -10,6 +13,7 @@ class CwxModel : public QObject {
     Q_OBJECT
 public:
     explicit CwxModel(QObject* parent = nullptr);
+    ~CwxModel() override;
 
     // A contiguous run of text to be keyed at a single WPM.
     // expandSpeedModifiers() returns a sequence of these.
@@ -39,10 +43,46 @@ public:
     int   drainEpoch()  const { return m_drainEpoch; }
     QString macro(int idx) const;  // 0-based (0=F1, 11=F12)
 
+    // Read-only TX availability for text keying (#5422). RadioModel wires this
+    // to TransmitModel::admitsCwxSend() so no text is queued while TUNE is
+    // active (the radio would key it at TUNE power). Unset = always available.
+    // This predicate never acquires a coordinator operation.
+    using SendAvailability = std::function<bool()>;
+    void setSendAvailability(SendAvailability availability) { m_sendAvailability = std::move(availability); }
+    // Ask before committing anything (history bubble, editor clear, speed
+    // changes): true when a send would be admitted right now. (#5422)
+    bool canSend() const { return !m_sendAvailability || m_sendAvailability(); }
+
+    // Actual-send operation fence, separate from a UI's read-only can-send
+    // predicate. Checking whether a button is enabled must never acquire TX.
+    using TransmissionPermit = std::function<bool()>;
+    // Capture on the model thread; the returned cancellation check may be
+    // read at a transport writer. It conveys batch validity, not TX authority,
+    // and never dereferences this QObject from a worker thread.
+    TransmissionPermit queuedTransmissionPermit() const;
+    using TransmissionAdmission = std::function<TransmissionPermit()>;
+    void setTransmissionAdmission(TransmissionAdmission admission) { m_transmissionAdmission = std::move(admission); }
+    // Optional neutral backend dispatch. False rejects the batch before the
+    // sidetone notification; the radio-specific command path stays separate.
+    using TextSender = std::function<bool(const QString&, int)>;
+    void setTextSender(TextSender sender) { m_textSender = std::move(sender); }
+    // Explicit synchronous route for an engine producer. Every command keeps
+    // the request captured by that controller; no temporary ambient identity
+    // is installed around UI signals or a nested event loop.
+    struct TransmissionRoute {
+        TransmissionAdmission admit;
+        TextSender text;
+        std::function<void(const QString&, int, int)> command; // nChars < 0: no reply
+        std::function<void(int, bool)> dispatched;
+    };
+
     // Actions
     void send(const QString& text);      // Send mode: full string
+    void send(const QString& text, const TransmissionRoute& route);
     void sendChar(const QString& ch);    // Live mode: single char
+    void sendChar(const QString& ch, const TransmissionRoute& route);
     void sendMacro(int idx);             // 1-based (1=F1, 12=F12)
+    void sendMacro(int idx, const TransmissionRoute& route);
     void saveMacro(int idx, const QString& text); // 0-based
     void erase(int numChars);
     void clearBuffer();
@@ -51,7 +91,14 @@ public:
     // (via RadioModel::onDisconnected) so a stale m_cwxEndIndex can't wedge the
     // monotonic guard across a reconnect. (#3949)
     void resetDrainWatch();
+    // An unknown-length macro appended to a batch invalidates its end index,
+    // but must not cancel text that is still queued for transport delivery.
+    void abandonDrainWatch();
     void setSpeed(int wpm);
+    // Adopt a radio-authoritative speed without emitting a command back to the
+    // radio. Used by non-Flex keyers after their connect-time readback.
+    void adoptSpeed(int wpm);
+    void setSpeedModifiersEnabled(bool enabled) { m_speedModifiersEnabled = enabled; }
     void setDelay(int ms);
     void setSpeedStep(int step);
     void setQsk(bool on);
@@ -59,18 +106,11 @@ public:
 
     // Status parsing (from radio)
     void applyStatus(const QMap<QString, QString>& kvs);
-    // Invoked by RadioModel with the reply to the final cwx send command.
-    // Body format is "<radio_index>,<block>" per FlexLib CWX.cs:54-83.
-    //
-    // radio_index is the INSERTION-START (first-char) queue position of the
-    // batch, NOT the last char — confirmed on FLEX-6500 fw 4.2.20.41343: a
-    // 23-char send into a queue at sent=48 replied radio_index=49 (=48+1), and
-    // `cwx sent=` then climbed 48→71 as the radio keyed. So the batch-end index
-    // to watch is radio_index + nChars - 1 (49+23-1 = 71, matching the observed
-    // final sent=). nChars is the char count of this send (spaces included).
-    // The epoch is the drainEpoch() snapshot taken when the command was emitted;
-    // a reply whose epoch no longer matches belongs to a batch that was since
-    // aborted (ESC/clear/disconnect) and is ignored. (#3949)
+    // Reply to the final cwx send: body "<radio_index>,<block>" (FlexLib
+    // CWX.cs:54-83). radio_index is the batch's first-char queue position, so the
+    // batch-end index is radio_index + nChars - 1 (FLEX-6500 fw 4.2.20.41343;
+    // nChars counts spaces). A reply whose epoch no longer matches drainEpoch()
+    // belongs to an aborted batch and is ignored (#3949).
     void handleSendReply(int resultCode, const QString& body, int epoch, int nChars);
 
     // Parses text for leading +/- speed modifiers on words.
@@ -93,6 +133,7 @@ signals:
     // See handleSendReply(). (#3949)
     void replyCommandReady(const QString& cmd, int epoch, int nChars);
     void speedChanged(int wpm);
+    void speedCommandIssued(int wpm);
     void speedStepChanged(int step);
     void delayChanged(int ms);
     void qskChanged(bool on);
@@ -106,10 +147,24 @@ signals:
     // self-contained even if speed changes mid-transmission.
     void transmissionRequested(const QString& text, int wpm);
     void transmissionCancelled();        // erase / clearBuffer / interrupt
+    // All synchronous sends in this batch have been handed off. This is NOT
+    // radio-idle evidence. untrackedMacro has no client-side drain index.
+    void transmissionDispatched(int epoch, bool untrackedMacro);
     void queueEmpty();                   // radio CWX buffer drained — TX teardown required
 
 private:
-    void emitExpandedSend(const QVector<SpeedSegment>& segs);
+    TransmissionPermit admitTransmission(const TransmissionRoute& route = {});
+    void emitExpandedSend(const QVector<SpeedSegment>& segs, const TransmissionPermit& permit,
+                          const TransmissionRoute& route = {});
+    bool notifyTransmission(const QString& text, int wpm, const TransmissionPermit& permit,
+                            const TransmissionRoute& route = {});
+    void dispatchCommand(const QString& command, int epoch, int nChars,
+                         const TransmissionRoute& route);
+    SendAvailability m_sendAvailability;
+    TransmissionAdmission m_transmissionAdmission;
+    TextSender m_textSender;
+    bool m_clearing{false}; // synchronous abort notifications cannot replace the queue being cleared
+    std::shared_ptr<std::atomic<bool>> m_queueValid{std::make_shared<std::atomic<bool>>(true)};
 
     int     m_speed{20};
     int     m_delay{5};
@@ -122,6 +177,7 @@ private:
     int     m_pendingWpmEchoes{0};
     bool    m_qsk{false};
     bool    m_live{false};
+    bool    m_speedModifiersEnabled{true};
     int     m_sentIndex{-1};
     int     m_nextBlock{1};
     int     m_cwxEndIndex{-1};   // radio_index to watch for; -1 = not tracking

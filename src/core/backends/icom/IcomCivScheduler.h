@@ -4,23 +4,21 @@
 #include <deque>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "core/backends/icom/CivCodec.h"
+#include "core/TxCoordinator.h"
 
 namespace AetherSDR::icom {
 
-// The single ordinary writer for Icom CI-V traffic.
-//
-// An Icom has no meter stream: meters, front-panel reconciliation, startup
-// snapshots and operator commands all share one serial command plane.  Sending
-// each producer directly creates bursts, unbounded stale reads and, for PTT, a
-// causal inversion where an old RX answer can arrive after a newer TX request.
-//
-// This class owns policy but not a timer or socket.  The backend supplies a
-// monotonic clock, takes dispatches, and writes them through IcomSession.  That
-// makes pacing, coalescing and lost/late replies deterministic unit tests.
+// The single ordinary writer for Icom CI-V traffic. Meters, front-panel
+// reconciliation, startup snapshots and operator commands share one serial
+// command plane; direct sends cause bursts, stale reads and, for PTT, an old RX
+// answer arriving after a newer TX request. Owns policy only — the backend
+// supplies the monotonic clock and writes dispatches through IcomSession — so
+// pacing, coalescing and lost/late replies are deterministic unit tests.
 class IcomCivScheduler {
 public:
     enum class Priority : std::uint8_t {
@@ -44,11 +42,13 @@ public:
         std::uint8_t replyCmd = 0;
         bool replyHasSub = false;
         std::uint8_t replySub = 0;
+        std::vector<std::uint8_t> replyDataPrefix;
         // A write supersedes all older observations of the same semantic key.
         bool supersedes = false;
         // Reads and repeated slider writes collapse to the newest queued item.
         bool coalesce = true;
         std::int64_t notBeforeMs = 0;
+        std::optional<TxCoordinator::Command> txCommand;
     };
 
     struct Dispatch {
@@ -57,6 +57,7 @@ public:
         Priority priority = Priority::Control;
         std::uint64_t generation = 0;
         bool supersedes = false;
+        std::optional<TxCoordinator::Command> txCommand;
     };
 
     enum class Observation : std::uint8_t {
@@ -65,17 +66,74 @@ public:
         Stale,
     };
 
+    // Bounded, payload-free lifecycle events for transactions that actually
+    // reached the wire. A timed-out transaction can have a second event if its
+    // reply later arrives. Raw CI-V bytes remain available through `civ trace
+    // all`; this history answers the different post-mortem question: how long
+    // did each semantic command wait, how long did its reply take, and how did
+    // it terminate? Keeping only the semantic key avoids placing frequencies,
+    // memories, or text payloads into the default support log.
+    enum class Completion : std::uint8_t {
+        Reply,
+        StaleReply,
+        LateReply,
+        LateStaleReply,
+        Timeout,
+        Displaced,
+        NoReply,
+    };
+
+    struct TransactionEvent {
+        std::uint64_t eventId = 0; // Lifetime-unique, including after reset/history clear.
+        std::string key;
+        Priority priority = Priority::Control;
+        std::uint64_t generation = 0;
+        Completion completion = Completion::Reply;
+        std::int64_t completedAtMs = 0;
+        std::int64_t queueWaitMs = -1;
+        std::int64_t responseMs = -1;
+    };
+
     struct Stats {
         std::uint64_t queued = 0;
         std::uint64_t dispatched = 0;
         std::uint64_t coalesced = 0;
         std::uint64_t replies = 0;
         std::uint64_t staleReplies = 0;
+        std::uint64_t lateReplies = 0;
+        std::uint64_t unmatchedFrames = 0;
         std::uint64_t timeouts = 0;
+        std::uint64_t responseSamples = 0;
+        std::int64_t totalResponseMs = 0;
+        std::int64_t lastResponseMs = -1;
+        std::int64_t maxResponseMs = -1;
+        std::int64_t lastResponseAtMs = 0;
+        std::string lastCompletedKey;
+        // Command byte of the frame that lastCompletedKey retired. The key is
+        // semantic and deliberately coarse (a frequency READ and WRITE share
+        // "frequency"); a consumer that must tell them apart reads this.
+        std::uint8_t lastCompletedCmd = 0;
+        std::string lastTimeoutKey;
         std::size_t queueDepth = 0;
         bool readInFlight = false;
         std::string inFlightKey;
         std::int64_t lastDispatchMs = 0;
+    };
+
+    enum class TerminalOutcome : std::uint8_t {
+        Cancelled,
+        Failed,
+    };
+
+    struct TerminalRequest {
+        std::string key;
+        std::uint64_t generation = 0;
+        bool wasInFlight = false;
+        TerminalOutcome outcome = TerminalOutcome::Cancelled;
+    };
+
+    struct ResetResult {
+        std::vector<TerminalRequest> requests;
     };
 
     // Returns the semantic generation assigned to the request.  A return of
@@ -85,13 +143,31 @@ public:
     [[nodiscard]] std::optional<Dispatch> takeNext(std::int64_t nowMs);
     [[nodiscard]] Observation observe(const CivFrame& frame, std::int64_t nowMs);
 
-    void reset() noexcept;
+    // Return every request removed by reset with its terminal disposition.
+    // Dispatch policy is deliberately unchanged; this is lifecycle accounting
+    // for callers that must distinguish teardown cancellation from link failure.
+    [[nodiscard]] ResetResult reset(
+        TerminalOutcome outcome = TerminalOutcome::Cancelled) noexcept;
     [[nodiscard]] Stats stats() const;
+    [[nodiscard]] const std::deque<TransactionEvent>& recentTransactions() const noexcept
+    {
+        return m_recentTransactions;
+    }
+    void clearTransactionHistory() noexcept { m_recentTransactions.clear(); }
     [[nodiscard]] bool idle() const noexcept { return m_queue.empty() && !m_inFlight; }
+    [[nodiscard]] bool hasPendingKeyPrefix(
+        std::string_view prefix, std::int64_t nowMs) const noexcept;
 
     static constexpr int kSlotMs = 25;
     static constexpr int kReadTimeoutMs = 350;
     static constexpr int kPriorityAgingMs = 1000;
+    static constexpr int kMeterQueueBudgetMs = 100;
+    // Ceiling on how long overdue meters may hold background work off; without it
+    // fast-replenishing meters starve background aging forever. 1500 ms measured
+    // over 60 s of TX with every meter visible: worst forward-power age 620/710/1190
+    // ms at 63/75/100 ms RTT (same as an unbounded hold at 63/75 ms), with control
+    // reconciliation landing ~39-45 times a minute. Higher values gain no freshness.
+    static constexpr int kBackgroundStarvationCeilingMs = 1500;
     // How long a timed-out or displaced transaction stays recognisable, so a
     // late answer is still generation-checked rather than adopted as fresh
     // radio truth. Comfortably longer than kReadTimeoutMs and shorter than the
@@ -100,11 +176,14 @@ public:
     static constexpr int kLateReplyGraceMs = 2000;
 
 private:
+    friend struct IcomCivBackendTestAccess;
+
     struct Queued {
         Request request;
         std::uint64_t generation = 0;
         std::uint64_t sequence = 0;
         std::int64_t enqueuedAtMs = 0;
+        std::int64_t dispatchedAtMs = -1;
     };
 
     struct Expired {
@@ -115,13 +194,18 @@ private:
     [[nodiscard]] static bool sameReplyShape(const Request& a, const Request& b) noexcept;
     [[nodiscard]] bool matches(const CivFrame& frame, const Queued& request) const noexcept;
     [[nodiscard]] Priority effectivePriority(const Queued& request,
-                                             std::int64_t nowMs) const noexcept;
+                                             std::int64_t nowMs,
+                                             bool yieldToMeters) const noexcept;
     void expireRead(std::int64_t nowMs);
     void dropStaleExpired(std::int64_t nowMs);
+    void recordTransaction(const Queued& request, Completion completion,
+                           std::int64_t completedAtMs, std::int64_t responseMs = -1);
+    void noteResponse(const Queued& request, std::int64_t nowMs);
 
     // Bounded: one ordinary transaction is outstanding at a time and each entry
     // lives only kLateReplyGraceMs, so this cannot grow with queue depth.
     static constexpr std::size_t kMaxExpiredTracked = 16;
+    static constexpr std::size_t kTransactionHistoryMax = 128;
 
     std::deque<Queued> m_queue;
     std::optional<Queued> m_inFlight;
@@ -130,7 +214,15 @@ private:
     std::uint64_t m_sequence = 0;
     std::int64_t m_lastDispatchMs = 0;
     std::int64_t m_inFlightAtMs = 0;
+    // Background aging may win one meter-band slot, then yields until an
+    // actual meter is dispatched. PTT/operator traffic does not reset it.
+    bool m_backgroundSinceMeter = false;
+    // When background work last reached the radio, so yielding to overdue
+    // meters stays a delay rather than an indefinite hold.
+    std::int64_t m_lastBackgroundDispatchMs = 0;
     Stats m_stats;
+    std::uint64_t m_transactionEventId = 0;
+    std::deque<TransactionEvent> m_recentTransactions;
 };
 
 }  // namespace AetherSDR::icom

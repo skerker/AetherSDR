@@ -156,6 +156,13 @@ float ClientDeEss::sidechainPeakDb() const noexcept
 float ClientDeEss::gainReductionDb() const noexcept
 { return m_meters.gainReductionDb.load(std::memory_order_relaxed); }
 
+void ClientDeEss::copyMeteringFrom(const ClientDeEss& source) noexcept
+{
+    m_meters.inputPeakDb.store(source.inputPeakDb(), std::memory_order_relaxed);
+    m_meters.sidechainPeakDb.store(source.sidechainPeakDb(), std::memory_order_relaxed);
+    m_meters.gainReductionDb.store(source.gainReductionDb(), std::memory_order_relaxed);
+}
+
 void ClientDeEss::recacheIfDirty() noexcept
 {
     const uint64_t v = m_atomics.version.load(std::memory_order_acquire);
@@ -248,16 +255,10 @@ void ClientDeEss::process(float* interleaved, int frames, int channels) noexcept
             gainLin = dbToLin(gainDb);
         }
 
-        // Split-band de-essing: only attenuate the sibilant band
-        // (the bandpass output), leave lows + mids untouched. The
-        // bandpass is a constant-0-dB-peak filter, so subtracting
-        // bp*(1-gain) from the full signal reduces only the 4-8 kHz
-        // slice by the gain amount. The original broadband-attenuate
-        // implementation pulled the whole signal down on sibilance,
-        // crashing RMS during S-heavy phrases.
+        // Split-band: attenuate only the sibilant band. The bandpass has a constant
+        // 0 dB peak, so
         //   output = full + bp * (gain - 1)
-        // gain = 1  → output = full       (no change, perfect pass-through)
-        // gain = 0.5→ output = full - 0.5*bp (HF band reduced by 6 dB)
+        // leaves the signal unchanged at gain = 1 and cuts that band 6 dB at gain = 0.5.
         if (enabled && gainLin < 0.9999f) {
             const float scGainDelta = gainLin - 1.0f;
             l += scL * scGainDelta;

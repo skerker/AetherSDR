@@ -43,14 +43,20 @@ int main(int argc, char** argv)
     // one without the other.
     {
         SliceModel s(1);
-        QStringList commands;
-        QObject::connect(&s, &SliceModel::commandReady,
-                         [&commands](const QString& cmd) { commands.append(cmd); });
+        QSignalSpy requests(&s, &SliceModel::receiveSquelchRequested);
+        QSignalSpy rawCommands(&s, &SliceModel::commandReady);
         s.setManualSquelch(true, 45);
         EXPECT_EQ(s.squelchLevel(), 45);
         EXPECT_EQ(s.manualSquelchLevel(), 45);
-        EXPECT_EQ(commands.join(QStringLiteral("|")),
-                  QStringLiteral("slice set 1 squelch=1|slice set 1 squelch_level=45"));
+        EXPECT_EQ(requests.size(), 1);
+        EXPECT_EQ(rawCommands.size(), 0);
+        if (!requests.isEmpty()) {
+            const SliceSquelchRequest request = qvariant_cast<SliceSquelchRequest>(requests.at(0).at(0));
+            EXPECT_EQ(request.enabled, true);
+            EXPECT_EQ(request.level, 45);
+            EXPECT_EQ(request.enabledChanged, true);
+            EXPECT_EQ(request.levelChanged, true);
+        }
     }
 
     // ── Plain setSquelch() (the shape Auto-mode call sites use) must NOT
@@ -202,6 +208,43 @@ int main(int argc, char** argv)
             d.squelchOn = true; d.squelchLevel = 33;
         }));
         EXPECT_EQ(s.manualSquelchLevel(), before);
+    }
+
+    // DTCS is one radio register: a three-digit code plus independent TX/RX
+    // polarity. The normalized model must move and publish that tuple intact.
+    {
+        SliceModel s(7);
+        QSignalSpy commandSpy(&s, &SliceModel::fmDtcsCommandIssued);
+        QSignalSpy stateSpy(&s, &SliceModel::fmDtcsChanged);
+        EXPECT_EQ(s.fmDtcsCode(), -1);
+        s.setFmDtcs(23, true, false);
+        EXPECT_EQ(commandSpy.count(), 1);
+        EXPECT_EQ(stateSpy.count(), 0);
+        EXPECT_EQ(s.fmDtcsCode(), -1);
+        EXPECT_EQ(s.fmDtcsTxReverse(), false);
+        EXPECT_EQ(s.fmDtcsRxReverse(), false);
+
+        s.setFmDtcs(123, false, false);
+        EXPECT_EQ(commandSpy.count(), 1); // non-standard operator intent is refused
+
+        s.applyChanges(delta([](SliceDelta& d) {
+            d.fmDtcsCode = 754;
+            d.fmDtcsTxReverse = false;
+            d.fmDtcsRxReverse = true;
+        }));
+        EXPECT_EQ(commandSpy.count(), 1); // radio echo is state, not new intent
+        EXPECT_EQ(stateSpy.count(), 1);
+        EXPECT_EQ(s.fmDtcsCode(), 754);
+        EXPECT_EQ(s.fmDtcsTxReverse(), false);
+        EXPECT_EQ(s.fmDtcsRxReverse(), true);
+
+        s.applyChanges(delta([](SliceDelta& d) {
+            d.fmDtcsCode = 754;
+            d.fmDtcsTxReverse = false;
+            d.fmDtcsRxReverse = true;
+        }));
+        EXPECT_EQ(commandSpy.count(), 1);
+        EXPECT_EQ(stateSpy.count(), 1); // repeated radio truth is a no-op
     }
 
     if (g_failures == 0) {

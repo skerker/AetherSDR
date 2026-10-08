@@ -18,13 +18,13 @@
 // SKIP_RETURN_CODE on its add_test turns into an honest ctest "Skipped" rather
 // than a "Passed" that measured nothing.
 //
-// WHICH SIDE OF CENTRE A TONE LANDS ON. The loop conjugates TWICE. Hl2TxDsp
-// conjugates the modulator output for the wire (the HPSDR wire has the opposite
-// handedness to the analytic convention); the simulator feeds that IQ back
-// verbatim; Hl2RxDsp conjugates the receive stream back before it reaches the
-// panadapter FFT. Two conjugations cancel, so the spectrum this test reads is in
-// the ANALYTIC convention: a tone transmitted 5 kHz above the carrier appears
-// 5 kHz ABOVE centre.
+// WHICH SIDE OF CENTRE A TONE LANDS ON. The loop flips handedness TWICE. The
+// transmit side puts IQ on the wire in wire order, the opposite handedness to
+// the analytic convention (the tone generator conjugates; the default TXA
+// modulator gets there through its signed passband); the simulator feeds that IQ
+// back verbatim; Hl2RxDsp conjugates it before the panadapter FFT. The two
+// flips cancel, so the spectrum this test reads is in the ANALYTIC convention:
+// a tone transmitted 5 kHz above the carrier appears 5 kHz ABOVE centre.
 //
 // It did not always. The receive-side conjugation arrived in #4471, to fix a
 // panadapter that drew every signal mirrored — on 40 m it put FT8 below a
@@ -32,7 +32,7 @@
 // the fed-back tone read BELOW centre. This test was written against that older
 // display in #4466 and went on asserting the negative offset afterwards. That
 // staleness — not transmit — is the whole of the "fails on transmit-sideband
-// checks" that HERMES.md carried as pre-existing.
+// checks" that docs/HERMES.md carried as pre-existing.
 //
 // BUT cancelling conjugations mean this loopback ALONE cannot prove absolute
 // sideband: a handedness error at BOTH ends still cancels. That is exactly how a
@@ -43,6 +43,7 @@
 // the scene anchor below.
 
 #include "core/backends/hl2/Hl2Backend.h"
+#include "TxTestAuthority.h"
 #include "core/backends/hl2/MetisProtocol.h"
 
 #include "TestDspBuildWait.h"
@@ -97,7 +98,7 @@ enum class Probe { NoReply, Unreadable, NotSimulator, Simulator };
 // "fails non-deterministically" reputation came from, since the answers depended
 // on what that other machine was doing at the time.
 //
-// Which hpsdrsim: the g0orx/pihpsdr build HERMES.md §7 pins as the fixture. It
+// Which hpsdrsim: the g0orx/pihpsdr build docs/HERMES.md §7 pins as the fixture. It
 // writes those bytes at hpsdrsim.c:628-633. Current upstream (dl1ycf/pihpsdr)
 // uses a different synthetic MAC, so a simulator built from that one reads as
 // NotSimulator and this test skips rather than running against it.
@@ -200,6 +201,7 @@ static float peakNear(const std::vector<float>& spec, int centreBin, int halfWid
 int main(int argc, char** argv)
 {
     QCoreApplication app(argc, argv);
+    TxTestAuthority authority;
     qRegisterMetaType<SliceDelta>();
 
     // Loopback by default: a simulator on this machine is the normal case, and
@@ -252,7 +254,7 @@ int main(int argc, char** argv)
         // Somebody else's session. hpsdrsim serves one client: connecting tears
         // down its EP6 handler and re-points it at us, and this test then keys
         // PTT. Leaving it alone is the same call as the NotSimulator arm — and
-        // it is the collision HERMES.md used to warn about, now that the local
+        // it is the collision docs/HERMES.md used to warn about, now that the local
         // simulator is the default target rather than an accident.
         if (reply.streaming) {
             std::fprintf(stderr,
@@ -342,12 +344,12 @@ int main(int argc, char** argv)
 
     // ---- transmit a tone ----
     constexpr double kToneOffsetHz = 5000.0;
-    backend.setTxTestTone(kToneOffsetHz, 0.5);
-    backend.setKeying(true);
+    backend.setTxTestTone(kToneOffsetHz, 0.5, authority.operation);
+    backend.setKeying(true, authority.operation);
     spin(2500);
     const std::vector<float> keyed = lastSpectrum;
-    backend.setKeying(false);
-    backend.setTxTestTone(0.0, 0.0);
+    backend.setKeying(false, authority.operation);
+    backend.setTxTestTone(0.0, 0.0, authority.operation);
 
     check(keyed.size() == baseline.size() && !keyed.empty(),
           "spectrum still flowing while keyed");
@@ -359,7 +361,7 @@ int main(int argc, char** argv)
         const int centre = n / 2;
         const double binHz = static_cast<double>(kIqRateHz) / n;
         // POSITIVE offset, and the scene anchor above is what earns the right to
-        // say so. Hl2TxDsp conjugates for the wire and Hl2RxDsp conjugates back
+        // say so. The tone generator conjugates for the wire and Hl2RxDsp conjugates back
         // for the panadapter, so the spectrum reads in the analytic convention
         // and a tone sent 5 kHz up comes back 5 kHz up. The old negative
         // expectation was correct against the pre-#4471 display, which showed
@@ -398,7 +400,7 @@ int main(int argc, char** argv)
     {
         backend.setSliceMode(0, QStringLiteral("USB"));
         spin(300);
-        backend.setKeying(true);
+        backend.setKeying(true, authority.operation);
 
         std::vector<float> voice;
         constexpr double kAudioHz = 1500.0;
@@ -415,7 +417,8 @@ int main(int argc, char** argv)
                 out[2 * n] = v;
                 out[2 * n + 1] = v;      // AudioEngine duplicates across channels
             }
-            backend.submitTxAudio(pcm, kRate, /*clientLeveled=*/false);
+            backend.submitTxAudio(pcm, kRate, TxAudioSource::Microphone,
+                                  authority.context);
             spin(20);
             // Capture WHILE transmitting. Sampling after the loop would read
             // silence: the queue drains in well under a second once audio stops,
@@ -424,7 +427,7 @@ int main(int argc, char** argv)
             if (blk == 80)
                 voice = lastSpectrum;
         }
-        backend.setKeying(false);
+        backend.setKeying(false, authority.operation);
 
         // Assert the capture happened. Without this the three checks below are
         // skipped in silence when `voice` never arrived, and the test still
@@ -438,7 +441,7 @@ int main(int argc, char** argv)
             const int centre = n / 2;
             const double binHz = static_cast<double>(kIqRateHz) / n;
             // USB: 1.5 kHz of audio is transmitted 1.5 kHz ABOVE the carrier and,
-            // through the twice-conjugating loop, reads 1.5 kHz above centre.
+            // through the loop's two cancelling flips, reads 1.5 kHz above centre.
             //
             // Asserting the textbook sign is what let a wrong-sideband
             // transmitter pass its own tests once — but the defence against that

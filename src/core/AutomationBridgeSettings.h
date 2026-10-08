@@ -9,19 +9,15 @@ class QObject;
 
 namespace AetherSDR {
 
-// Owned configuration for the agent automation bridge (#3646), per
-// Constitution Principle V: one nested JSON object under a single root key
-// ("AutomationBridge"), read/written atomically, with a one-shot migration
-// from the earlier flat keys. The secret token is NOT stored here — it lives
-// in the OS secret store via QtKeychain (service/key below), mirroring the
-// MQTT-password pattern (GHSA-mmqp-cm4w-cvpp). The non-secret bools are:
-//
-//   enabled    — the bridge runs at launch (Radio Setup → Network toggle)
-//   txAllowed  — an MCP client may key the transmitter (the TX guard)
-//   txAck      — the operator has acknowledged the TX warning at least once
-//   readOnly   — observe-only: the bridge refuses every mutating verb (#4188)
-//
-// All accessors go through AppSettings and are process-wide.
+// Configuration for the agent automation bridge (#3646): one JSON object under
+// "AutomationBridge", read/written atomically, migrated once from flat keys. The
+// token lives in the OS secret store via QtKeychain (service/key below), never
+// here. Bools:
+//   enabled    - bridge runs at launch (Radio Setup -> Network)
+//   txAllowed  - an MCP client may key the transmitter (the TX guard)
+//   txAck      - operator has acknowledged the TX warning once
+//   readOnly   - bridge refuses every mutating verb (#4188)
+// Accessors go through AppSettings and are process-wide.
 class AutomationBridgeSettings {
 public:
     static bool enabled();
@@ -32,6 +28,20 @@ public:
     static void setTxAck(bool on);
     static bool readOnly();
     static void setReadOnly(bool on);
+
+    // True when AETHER_AUTOMATION force-enabled the bridge at launch (the
+    // headless/CI override). An env-forced start is not an operator opt-in,
+    // so nothing below may rewrite the saved toggle because of one (#4181).
+    static bool envForced();
+    // Persist the outcome of an ASYNCHRONOUS bridge start (#4181). The saved
+    // `enabled` flag is the operator's opt-in as observed by the socket: a
+    // successful bind records true, a failed bind clears it so a doomed start
+    // is not silently re-attempted every launch. When `forced` (see
+    // envForced()) the setting is left untouched on either outcome. Returns
+    // the value now persisted. This is the policy seam the GUI calls from
+    // MainWindow::startAutomationBridge()'s token callback; it is here so it
+    // can be pinned by a socket-free test.
+    static bool recordStartOutcome(bool ok, bool forced);
 
     // Keychain coordinates for the bridge access token (see MqttSettings for
     // the analogous MQTT-password helpers).

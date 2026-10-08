@@ -1,5 +1,6 @@
 #include "RigctlProtocol.h"
 #include "LogManager.h"
+#include "models/PanadapterModel.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 #include "models/TransmitModel.h"
@@ -8,6 +9,9 @@
 #include <QMetaObject>
 #include <QStringList>
 #include <QtGlobal>
+
+#include <algorithm>
+#include <cmath>
 
 namespace AetherSDR {
 
@@ -223,14 +227,56 @@ QString antMaskToName(int mask, const QStringList& available)
     return (bit < available.size()) ? available[bit] : available.first();
 }
 
+// RIG_LEVEL_RF without a command plane (#5774): the slice's rfgain is wire text
+// with nowhere to go, so the level drives the pan's RF gain (the ANT slider's
+// control, e.g. the HL2's -12..+48 dB LNA). Hamlib's 0.0-1.0 is spread across
+// the range the backend published and snapped to its step. A radio with a
+// command plane keeps `slice set N rfgain=` (0-100) for its CAT clients.
+PanadapterModel* rfGainPanFor(const RadioModel* model, const SliceModel* slice)
+{
+    if (!model || !slice || slice->panId().isEmpty()) {
+        return nullptr;
+    }
+    return model->panadapter(slice->panId());
+}
+
+int rfLevelToPanGain(double level, int low, int high, int step)
+{
+    const double span = static_cast<double>(high - low);
+    const int stepSize = std::max(step, 1);
+    const long steps = std::lround(qBound(0.0, level, 1.0) * span / stepSize);
+    return std::clamp(low + static_cast<int>(steps) * stepSize, low, high);
+}
+
+// Only a published range is a scale: before it lands the pan holds
+// PanadapterModel's Flex-shaped defaults (-8..32 step 8). A degenerate range is
+// refused too, since the level divides by its span.
+bool rfGainRangeKnown(const PanadapterModel& pan)
+{
+    return pan.hasRfGainRange() && pan.rfGainHigh() > pan.rfGainLow();
+}
+
+double panGainToRfLevel(int gain, int low, int high)
+{
+    return qBound(0.0, static_cast<double>(gain - low) / (high - low), 1.0);
+}
+
 } // namespace
 
 RigctlProtocol::RigctlProtocol(RadioModel* model)
     : m_model(model)
+    , m_txProducer(model ? model->registerTxProducer() : TxCoordinator::Producer{})
 {}
 
 RigctlProtocol::~RigctlProtocol()
 {
+    m_txProducer.invalidate(); // fences queued key-on before any teardown callback
+    if (m_model) {
+        QMetaObject::invokeMethod(m_model, [model = m_model, request = m_pttRequest, cwx = m_cwxRequest] {
+            (void)model->setProducerTransmit(request, false);
+            model->abortProducerCwx(cwx);
+        }, Qt::QueuedConnection);
+    }
     // Client dropped without a clean set_split_vfo 0 (e.g. WSJT-X quit): best-effort
     // remove the TX slice we created on demand so it isn't orphaned. Safe if it's
     // already gone or never existed.
@@ -249,7 +295,11 @@ void RigctlProtocol::removeCreatedTxSlice()
     if (id < 0 || !m_model) return;
     auto* model = m_model;
     QMetaObject::invokeMethod(model, [model, id]{
-        if (model->slice(id))
+        // hasCommandPlane: defense in depth — the created-slice id is only
+        // ever set from a successful Flex `slice create` callback, but the
+        // remove must not become a logged drop if that invariant ever bends
+        // (M0, #5263).
+        if (model->slice(id) && model->hasCommandPlane())
             model->sendCommand(QStringLiteral("slice remove %1").arg(id));
     }, Qt::QueuedConnection);
 }
@@ -950,7 +1000,19 @@ QString RigctlProtocol::cmdSetPtt(const QString& arg)
     // create-on-demand window too.
     const bool splitActive = clientSplitActive(/*includePending=*/true);
 
-    QMetaObject::invokeMethod(m_model, [model = m_model, sliceId = m_sliceIndex, tx, splitActive]() {
+    if (tx && !m_pttRequest.valid()) {
+        m_pttRequest = m_txProducer.request();
+    }
+    const TxCoordinator::Request request = m_pttRequest;
+    if (!tx) {
+        m_pttRequest = {};
+    } else if (!request.valid()) {
+        return rprt(-1);
+    }
+    QMetaObject::invokeMethod(m_model, [model = m_model, sliceId = m_sliceIndex, tx, splitActive, request]() {
+        if (tx && !request.valid()) {
+            return;
+        }
         // Non-split: ensure this protocol's bound slice is the TX slice so the
         // correct slice is used for transmission. Split: leave the split TX slice
         // (VFOB) keyed — do NOT seize TX back to the RX slice.
@@ -965,7 +1027,7 @@ QString RigctlProtocol::cmdSetPtt(const QString& arg)
             if (slice && !slice->isTxSlice())
                 slice->setTxSlice(true);
         }
-        model->setTransmit(tx, TransmitModel::PttSource::Dax);
+        (void)model->setProducerTransmit(request, tx, TransmitModel::PttSource::Dax);
     }, Qt::QueuedConnection);
     return rprt(0);
 }
@@ -1077,16 +1139,10 @@ QString RigctlProtocol::cmdSetSplitVfo(const QString& args)
     auto* rxSlice = currentSlice();
     if (!rxSlice) return rprt(-8);
 
-    // Edge-only reclaim: only move TX back to our RX slice on a genuine
-    // split→non-split *transition*, never on a steady-state poll.  Hamlib
-    // loggers (VARA/VARAC/N1MM) poll `set_split_vfo 0 VFOA` every few
-    // seconds; each CAT channel binds to a fixed slice, so reassigning TX
-    // to this channel's slice on every poll (the prior !isTxSlice() guard
-    // only suppressed the already-TX case) means the moment the user moves
-    // TX to another slice, the next poll on a non-TX channel re-seizes it
-    // — TX visibly ping-pongs back to this channel's slice within ~2 s.
-    // Acting only on the 1→0 edge (or the same-pass race below) lets a
-    // logger that never toggles split leave the user's TX choice alone.
+    // Reclaim TX only on a split 1→0 transition, never a steady-state poll: Hamlib
+    // loggers (VARA/N1MM) poll `set_split_vfo 0 VFOA` every few seconds per
+    // channel, and reclaiming on each poll would yank TX back from whichever slice
+    // the user moved it to.
     const bool wasEnabled = (m_lastSplitEnable == 1);
     const bool firstReport = (m_lastSplitEnable < 0);
     // m_lastSplitEnable is set to 0 below on disable, and to 1 inside
@@ -1152,16 +1208,11 @@ void RigctlProtocol::ensureSplitTxSlice(bool recordExistingAsEnabled)
     if (!m_model) return;
     auto* rxSlice = currentSlice();
     if (!rxSlice) return;
-    // A create from a prior call is still in flight (WSJT-X "Rig" split fires
-    // set_freq/set_mode VFOB in quick succession, each routing here). Don't create
-    // a second TX slice — tryPromoteTxSlice() will promote the pending one, and
-    // apply the stashed split freq/mode, when it appears. Returning here also keeps
-    // that stash intact: the promote-existing path below clears m_pendingSplitEnable
-    // WITHOUT applying the stash, so we must not fall into it while a create is
-    // pending.
-    // Time-bounded: if the create never lands (radio NAK; or on Multi-Flex the
-    // local slice count was below maxSlices() but the radio is really full), don't
-    // wedge split "pending" forever — once the window lapses, clear and retry.
+    // A create is still in flight (WSJT-X split sends set_freq/set_mode VFOB in
+    // quick succession): don't create a second TX slice; tryPromoteTxSlice() will
+    // promote it and apply the stashed freq/mode. Returning also protects that
+    // stash, which the promote-existing path below clears unapplied. Bounded by
+    // kPendingCreateTimeoutMs in case the create never lands (NAK, radio full).
     if (m_pendingSplitEnable) {
         if (m_pendingSplitTimer.isValid()
                 && m_pendingSplitTimer.elapsed() < kPendingCreateTimeoutMs)
@@ -1255,21 +1306,11 @@ QString RigctlProtocol::cmdSetSplitFreq(const QString& args)
     double hz = parts.isEmpty() ? 0.0 : parts[0].toDouble(&ok);
     // Reject <=0 / NaN / absurdly high (same predicate as the tune seam).
     if (parts.isEmpty() || !ok || !RadioModel::isPlausibleCatTuneMhz(hz / 1e6)) return rprt(-1);
-    // A locked TX slice refuses the tune (see cmdSetFreq). Resolve it READ-ONLY:
-    // the default findTxSlice() runs tryPromoteTxSlice(), which is not a query —
-    // it promotes the pending slice and applies the stashed m_pendingSplitFreqMHz
-    // from an earlier burst. Running that here, before applySplitParam() has
-    // called ensureSplitTxSlice() to decide promotion is safe, would fire a tune
-    // the client already superseded (WSJT-X "Rig" split sends set_freq/set_mode
-    // VFOB in quick succession), and a cross-band stale value would recenter the
-    // pan on top of it.
-    //
-    // Consequence of promote=false: a TX slice not yet promoted is invisible
-    // here, so this cannot catch ensureSplitTxSlice() promoting an EXISTING slice
-    // the operator has locked. That path still answers RPRT 0 and is then dropped
-    // on the lock by the seam — the operator gets the lock feedback, the client
-    // does not. Closing it needs the promotion decision and the lock test in one
-    // place; out of scope here.
+    // Locked TX slice refuses the tune (see cmdSetFreq). Must be read-only:
+    // findTxSlice()'s default promote path would apply a stale stashed split freq
+    // before applySplitParam() decides promotion is safe. Known gap: a not-yet-
+    // promoted slice is invisible here, so ensureSplitTxSlice() promoting an
+    // existing locked slice still answers RPRT 0 and the seam drops the tune.
     if (auto* tx = findTxSlice(/*promote=*/false); tx && tx->isLocked()) {
         notifyLockBlocked(tx);
         return rprt(-1);
@@ -1406,8 +1447,15 @@ QString RigctlProtocol::cmdGetLevel(const QString& arg)
         return makeResponse(formatRigLevelValue(af));
     }
     if (level == "RF") {
-        const double rf = qBound(0.0f, slice->rfGain(), 100.0f) / 100.0;
-        return makeResponse(formatRigLevelValue(rf));
+        if (m_model->hasCommandPlane()) {
+            const double rf = qBound(0.0f, slice->rfGain(), 100.0f) / 100.0;
+            return makeResponse(formatRigLevelValue(rf));
+        }
+        // No command plane: the pan's gain, which is what the slider shows.
+        const auto* pan = rfGainPanFor(m_model, slice);
+        if (!pan || !rfGainRangeKnown(*pan)) return rprt(-11);  // RIG_ENAVAIL
+        return makeResponse(formatRigLevelValue(panGainToRfLevel(
+            pan->rfGain(), pan->rfGainLow(), pan->rfGainHigh())));
     }
     if (level == "SQL") {
         const double sql = qBound(0, slice->squelchLevel(), 100) / 100.0;
@@ -1426,9 +1474,16 @@ QString RigctlProtocol::cmdGetLevel(const QString& arg)
         return makeResponse(formatRigLevelValue(nb));
     }
     if (level == "STRENGTH") {
-        // S-meter in dBm; STRENGTH is dB relative to S9 (-73 dBm on HF)
-        const double strength = m_model->meterModel().sLevel() - kS9Dbm;
-        return makeResponse(formatRigLevelValue(strength));
+        // STRENGTH = dB relative to S9 (-73 dBm on HF), from the addressed slice's
+        // meter (#5499). No reading returns RIG_ENAVAIL: hamlib has no "unknown" level
+        // and any number would look like a measurement. sLevelForSlice() is keyed by
+        // MeterDef::sourceIndex, which every backend sets to the slice id (Flex from
+        // the manifest `num`; HL2/Icom declare one S-meter at 0; HL2 RX2: #5852).
+        const auto dbm = m_model->meterModel().sLevelForSlice(slice->sliceId());
+        if (!dbm) {
+            return rprt(-11);   // RIG_ENAVAIL: no S-meter sample for this slice
+        }
+        return makeResponse(formatRigLevelValue(*dbm - kS9Dbm));
     }
 
     // TX/radio-wide levels (no slice dependency)
@@ -1592,9 +1647,23 @@ QString RigctlProtocol::cmdSetLevel(const QString& args)
         return rprt(0);
     }
     if (level == "RF") {
-        const float gain = static_cast<float>(qBound(0.0, val * 100.0, 100.0));
-        QMetaObject::invokeMethod(slice, [slice, gain]() {
-            slice->setRfGain(gain);
+        if (m_model->hasCommandPlane()) {
+            const float gain = static_cast<float>(qBound(0.0, val * 100.0, 100.0));
+            QMetaObject::invokeMethod(slice, [slice, gain]() {
+                slice->setRfGain(gain);
+            }, Qt::QueuedConnection);
+            return rprt(0);
+        }
+        // No command plane: through the pan via IRadioBackend::setPanRfGain (the
+        // HL2's LNA is reachable only that way). Nothing to address, or no
+        // published range, is refused rather than acknowledged as a no-op.
+        const auto* pan = rfGainPanFor(m_model, slice);
+        if (!pan || !rfGainRangeKnown(*pan)) return rprt(-11);  // RIG_ENAVAIL
+        const int gain = rfLevelToPanGain(val, pan->rfGainLow(),
+                                          pan->rfGainHigh(), pan->rfGainStep());
+        const QString panId = slice->panId();
+        QMetaObject::invokeMethod(m_model, [model = m_model, panId, gain]() {
+            model->setPanRfGainFor(panId, gain);
         }, Qt::QueuedConnection);
         return rprt(0);
     }
@@ -1722,13 +1791,22 @@ QString RigctlProtocol::cmdSendMorse(const QString& text)
     // went out. RIG_ENAVAIL is the file's established answer for a control this
     // radio does not have. Direct read, on the CAT thread — the same posture as
     // the isConnected() checks above; only the MUTATION needs the queued hop.
-    if (!m_model->hasRadioSideCwKeyer()) return rprt(-11);
+    if (!m_model->hasRadioSideCwKeyer()) {
+        return rprt(-11);
+    }
+    if (!m_model->cwTextValidationError(text).isEmpty()) {
+        return rprt(-1);
+    }
     // Route through CwxModel so the local sidetone keyer (driven by
     // CwxModel::transmissionRequested) fires alongside the radio command.
     // Going through sendCmdPublic directly would silently bypass the
     // sidetone path used by the MIDI key and CWX panel. (#2909)
-    QMetaObject::invokeMethod(m_model, [model = m_model, text]() {
-        model->cwxModel().send(text);
+    if (!m_cwxRequest.valid()) {
+        m_cwxRequest = m_txProducer.request();
+    }
+    const TxCoordinator::Request request = m_cwxRequest;
+    QMetaObject::invokeMethod(m_model, [model = m_model, text, request]() {
+        model->requestProducerCwx(request, text);
     }, Qt::QueuedConnection);
     return rprt(0);
 }
@@ -1742,8 +1820,10 @@ QString RigctlProtocol::cmdStopMorse()
     if (!m_model->hasRadioSideCwKeyer()) return rprt(-11);
     // CwxModel::clearBuffer emits transmissionCancelled, which cuts any
     // in-flight local sidetone in addition to sending "cwx clear". (#2909)
-    QMetaObject::invokeMethod(m_model, [model = m_model]() {
-        model->cwxModel().clearBuffer();
+    const TxCoordinator::Request request = m_cwxRequest;
+    m_cwxRequest = {};
+    QMetaObject::invokeMethod(m_model, [model = m_model, request]() {
+        model->abortProducerCwx(request);
     }, Qt::QueuedConnection);
     return rprt(0);
 }
@@ -1753,10 +1833,11 @@ QString RigctlProtocol::cmdSetKeySpeed(const QString& arg)
     if (!m_model) return rprt(-1);
     bool ok = false;
     int wpm = arg.toInt(&ok);
-    if (!ok || wpm < 5 || wpm > 100) return rprt(-1);
-    QString cmd = QString("cw wpm %1").arg(wpm);
-    QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
-        model->sendCmdPublic(cmd, nullptr);
+    if (!ok || wpm < m_model->cwTextMinWpm() || wpm > m_model->cwTextMaxWpm()) {
+        return rprt(-1);
+    }
+    QMetaObject::invokeMethod(m_model, [model = m_model, wpm]() {
+        model->transmitModel().setCwSpeed(wpm);
     }, Qt::QueuedConnection);
     return rprt(0);
 }
@@ -1880,11 +1961,18 @@ QString RigctlProtocol::cmdSetFunc(const QString& args)
         QMetaObject::invokeMethod(slice, [slice, on]() { slice->setNb(on); }, Qt::QueuedConnection);
         return rprt(0);
     }
+    // A radio with no radio-side NR / ANF (HL2, ANAN) cannot turn them ON;
+    // the model flag alone would read back as a phantom "on" through get_func.
+    // OFF is already true there and is accepted.
     if (func == "NR") {
+        if (on && m_model && !m_model->radioSideNoiseReductionAvailable())
+            return rprt(-11);   // RIG_ENAVAIL
         QMetaObject::invokeMethod(slice, [slice, on]() { slice->setNr(on); }, Qt::QueuedConnection);
         return rprt(0);
     }
     if (func == "ANF") {
+        if (on && m_model && !m_model->radioSideAutoNotchAvailable())
+            return rprt(-11);   // RIG_ENAVAIL
         QMetaObject::invokeMethod(slice, [slice, on]() { slice->setAnf(on); }, Qt::QueuedConnection);
         return rprt(0);
     }
@@ -1996,7 +2084,9 @@ QString RigctlProtocol::cmdSetTs(const QString& arg)
     if (!slice) return rprt(-8);
     const QString a = parts.isEmpty() ? QString{} : parts[0];
     if (a == "?") {
-        // Common tuning steps in Hz; 0 = any step accepted.
+        // Common tuning steps in Hz. The trailing 0 is Hamlib's RIG_TS_ANY
+        // marker (any positive step is accepted), not a step: set_ts 0 is
+        // refused below.
         static const QString kSteps = QStringLiteral("1 10 100 500 1000 5000 9000 10000 12500 100000 500000 0");
         if (m_extended)
             return QStringLiteral("set_ts:\nTuning Steps: %1\n").arg(kSteps) + rprt(0);
@@ -2004,10 +2094,16 @@ QString RigctlProtocol::cmdSetTs(const QString& arg)
     }
     bool ok;
     const int hz = a.toInt(&ok);
-    if (a.isEmpty() || !ok || hz < 0) return rprt(-1);
+    // A step of 0 Hz tunes nowhere: RIG_EINVAL.
+    if (a.isEmpty() || !ok || hz <= 0) return rprt(-1);
     const int id = slice->sliceId();
     const QString cmd = QStringLiteral("slice set %1 step=%2").arg(id).arg(hz);
-    QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
+    QMetaObject::invokeMethod(m_model, [model = m_model, cmd, id, hz]() {
+        // Without a command plane the step is the client-side quantity the
+        // tuning wheel reads, and the wire text below would be dropped.
+        if (model->applyClientOwnedSliceStep(id, hz)) {
+            return;
+        }
         model->sendCmdPublic(cmd, nullptr);
     }, Qt::QueuedConnection);
     return rprt(0);

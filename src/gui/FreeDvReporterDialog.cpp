@@ -41,30 +41,18 @@ public:
     // bands: empty vector = "All"; non-empty = OR of all ranges
     void setBandFilters(const QVector<QPair<double,double>>& bands)
     {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
         beginFilterChange();
-#endif
         m_mode  = Band;
         m_bands = bands;
-#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
         endFilterChange(QSortFilterProxyModel::Direction::Rows);
-#else
-        invalidateFilter();
-#endif
     }
 
     void setFreqFilter(double hz)
     {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
         beginFilterChange();
-#endif
         m_mode   = Freq;
         m_freqHz = hz;
-#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
         endFilterChange(QSortFilterProxyModel::Direction::Rows);
-#else
-        invalidateFilter();
-#endif
     }
 
 protected:
@@ -234,6 +222,14 @@ void FreeDvReporterDialog::buildBody()
     m_table->horizontalHeader()->setSortIndicatorShown(true);
     m_table->setShowGrid(true);
     m_table->sortByColumn(FreeDvReporterModel::MHz, Qt::AscendingOrder);
+
+    // Double-click to tune + force RADE (#4125).
+    connect(m_table, &QTableView::doubleClicked, this, [this](const QModelIndex& idx) {
+        const QModelIndex src = m_proxy->mapToSource(idx);
+        const QModelIndex mhzIdx = m_model->index(src.row(), FreeDvReporterModel::MHz);
+        const double mhz = m_model->data(mhzIdx, Qt::UserRole).toDouble();
+        if (mhz > 0.0) emit tuneRequested(mhz);
+    });
 
     ThemeManager::instance().applyStyleSheet(m_table,
         "QTableView {"

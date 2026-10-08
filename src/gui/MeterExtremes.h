@@ -10,28 +10,36 @@
 
 namespace AetherSDR {
 
-// Sliding-window min/max envelope tracker for the SmartMTR "extremes" markers.
-//
-// Sits alongside the bar's MeterSmoother but moves differently on purpose: the
-// bar uses an asymmetric exponential ballistic (the analog-meter feel), while the
-// extremes glide at a CONSTANT linear slew over the recent-signal envelope, so
-// they read as separate sweep markers rather than a second needle.
-//
-// History is kept in RAW signal units (dBm for RX, dBFS for TX), not in scale
-// UNITS: the fade rules are dB-based and the dBm->UNIT mapping is piecewise
-// non-linear, so min/max/avg are computed in raw space and mapped to UNITS only
-// for drawing. The slewed display positions live in scale UNITS.
-//
-// Drive it once per physics tick (any rate, even irregular) from the same timer
-// that ticks the bar; pass the monotonic clock and the elapsed dt.
+// Sliding-window min/max tracker for the SmartMTR extremes markers. Unlike the
+// bar's exponential MeterSmoother, markers glide at a constant linear slew.
+// History is kept in raw units (dBm RX, dBFS TX) because fades are dB-based and
+// the dBm→unit map is non-linear; only display positions are in scale units.
+// Tick once per physics tick (any rate) with the monotonic clock and dt.
 class MeterExtremes {
 public:
     struct Tuning {
         double windowSeconds = SmartMtrExtremes::kWindowMediumSec;
         double slewUnitsPerSec = SmartMtrExtremes::kSlewUnitsPerSec;
+        // The scale this engine works in. Defaults to SmartMTR's own UNIT
+        // span so the VFO flag is unaffected; HGauge passes its gauge range
+        // in watts instead. One engine, two scales -- duplicating it is how
+        // meter behaviour drifts apart in the first place.
+        double scaleMin = SmartMtrUnits::kScaleMin;
+        double scaleMax = SmartMtrUnits::kScaleMax;
     };
 
-    void setTuning(const Tuning& t) { m_tuning = t; }
+    void setTuning(const Tuning& t)
+    {
+        const bool scaleChanged = t.scaleMin != m_tuning.scaleMin
+                                  || t.scaleMax != m_tuning.scaleMax;
+        m_tuning = t;
+        // A scale change invalidates the marker positions: they are stored in
+        // the old scale's units and would otherwise sit off the new bar.
+        if (scaleChanged || !m_hasData) {
+            m_minPos = floorPos();
+            m_maxPos = floorPos();
+        }
+    }
     const Tuning& tuning() const { return m_tuning; }
 
     // Reversed (gain-reduction) meters fill from the high end of the scale, so the
@@ -41,7 +49,7 @@ public:
     void setReversed(bool r) { m_reversed = r; }
     double floorPos() const
     {
-        return m_reversed ? SmartMtrUnits::kScaleMax : SmartMtrUnits::kScaleMin;
+        return m_reversed ? m_tuning.scaleMax : m_tuning.scaleMin;
     }
 
     // Clear the window and snap both markers to the floor (rest position). Used on
@@ -146,26 +154,16 @@ public:
         // 4) Ordering / floor clamps: min <= needle <= max, nothing below floor.
         if (m_maxPos < needlePosUnits) m_maxPos = needlePosUnits;
         if (m_minPos > needlePosUnits) m_minPos = needlePosUnits;
-        if (m_minPos < SmartMtrUnits::kScaleMin) m_minPos = SmartMtrUnits::kScaleMin;
-        if (m_maxPos < SmartMtrUnits::kScaleMin) m_maxPos = SmartMtrUnits::kScaleMin;
+        if (m_minPos < m_tuning.scaleMin) m_minPos = m_tuning.scaleMin;
+        if (m_maxPos < m_tuning.scaleMin) m_maxPos = m_tuning.scaleMin;
         if (m_minPos > m_maxPos) m_minPos = m_maxPos;
 
-        // Keep animating while a marker is mid-slew OR has not yet collapsed onto
-        // the needle (a peak/trough is still standing off it). The latter keeps
-        // the timer running through the whole hold->return so the window prunes
-        // and the markers slew at the timer rate — matching the original app's
-        // steady loop and avoiding a staircase clocked by the irregular packet
-        // feed. It self-terminates once min ~= max ~= needle (markers collapsed),
-        // so an idle meter still settles rather than pinning the repaint timer at
-        // full rate forever (each meter repaint over the GPU panadapter forces a
-        // costly recomposite that starves input).
-        // In external-peak (mic) mode the MAX marker is a held radio stat that
-        // sits above the needle by design, so it would "stand off" forever and
-        // pin the timer for the entire TX. Each mic packet re-arms the timer via
-        // setMeterInput (setExternalPeak keeps hasData() true), so here we only
-        // need to keep animating while a marker is actually slewing — drop the
-        // standing-off keep-alive for this mode so the meter settles between
-        // packets instead of repainting at full rate over the GPU panadapter.
+        // Keep animating while a marker is slewing or still standing off the
+        // needle, so pruning and slew run at the timer rate rather than the
+        // irregular packet rate; stop once min ≈ max ≈ needle, since every repaint
+        // over the GPU panadapter is costly. In external-peak (mic) mode the max
+        // stands off by design and each packet re-arms the timer, so only
+        // slewing keeps it alive.
         if (m_useExtPeak)
             return moving;
         const bool standingOff = (m_maxPos > needlePosUnits + kConvergeEps)
@@ -209,7 +207,7 @@ private:
     double m_sumRaw = 0.0;
     double m_minRaw = 0.0;
     double m_maxRaw = 0.0;
-    double m_minPos = SmartMtrUnits::kScaleMin;
+    double m_minPos = SmartMtrUnits::kScaleMin;   // re-seeded by setTuning()
     double m_maxPos = SmartMtrUnits::kScaleMin;
     bool m_hasData = false;
 
